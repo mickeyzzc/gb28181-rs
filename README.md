@@ -1,8 +1,15 @@
 # gb28181-rs
 
+**English** | [中文](README.zh-CN.md)
+
+[![CI](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
+![Tests](https://img.shields.io/badge/tests-67%20passing-brightgreen.svg)
+
 GB/T 28181-2016/2022 **device-side (UAC)** library for Rust — register a camera or media source with a GB28181 SIP platform and stream to it.
 
-Hand-written SIP (no SIP framework), MANSCDP XML codec, RTP/PS media push, and a full device server with live streaming, playback, and download. Extracted verbatim from the production implementation in [mibee-eye-raspi-rs](https://github.com/Mi-Bee-Studio), where it has been hardened against real GB28181 platforms (digest-auth URI matching, Via branch uniqueness, local-IP detection, MANSCDP attribute/element dual forms, TCP transport, playback control).
+Hand-written SIP (no SIP framework), MANSCDP XML codec, RTP/PS media push, and a full device server with live streaming, playback, and download. Extracted verbatim from the production implementation in [mibee-eye-raspi-rs](https://github.com/Mi-Bee-Studio), hardened against real GB28181 platforms (digest-auth URI matching, Via branch uniqueness, local-IP detection, MANSCDP attribute/element dual forms, TCP transport, playback control).
 
 ## Features
 
@@ -57,6 +64,10 @@ async fn main() -> anyhow::Result<()> {
 While local recording runs, call `set_record_active(true)` so DeviceStatus reports `<Record>ON</Record>`.
 
 A ready-made [`MockFrameHub`](src/mock.rs) implements `FrameSource` with bounded-channel, drop-on-full semantics for tests.
+
+## Development
+
+This project follows strict **TDD** — see [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `rustfmt`, `clippy -D warnings`, and the full test suite (67 tests); `main` is protected (PR-only merges, CI required).
 
 ## Status
 
