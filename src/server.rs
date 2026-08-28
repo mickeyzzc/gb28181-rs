@@ -1208,10 +1208,13 @@ pub(super) fn build_rtp_packet_raw(
 
 /// Frame an RTP packet with GB28181 Annex C.2 $-framing.
 ///
-/// Wire format: `[0x24 '$'] [2-byte big-endian length] [RTP packet bytes]`.
+/// Wire format (RTSP-interleaved style, as consumed by GB28181 platforms
+/// and ZLMediaKit/wvp-class receivers): `[0x24 '$'] [channel: 0x00]
+/// [2-byte big-endian length] [RTP packet bytes]` — a 4-byte header.
 pub(super) fn frame_rtp_over_tcp(rtp_packet: &[u8]) -> Vec<u8> {
-    let mut frame = Vec::with_capacity(3 + rtp_packet.len());
+    let mut frame = Vec::with_capacity(4 + rtp_packet.len());
     frame.push(0x24); // '$'
+    frame.push(0x00); // channel
     frame.push((rtp_packet.len() >> 8) as u8);
     frame.push(rtp_packet.len() as u8);
     frame.extend_from_slice(rtp_packet);
@@ -1485,17 +1488,20 @@ mod tests {
         assert!(sdp.contains("y=12345"));
     }
 
-    /// GB/T 28181 Annex C.2 $-framing: `[0x24] [len BE] [payload]`.
+    /// GB/T 28181 Annex C.2 $-framing (RTSP-interleaved style):
+    /// `[0x24] [channel 0x00] [len BE16] [payload]` — 4-byte header, the
+    /// format GB28181 platforms actually demux (issue #14 regression).
     #[test]
     fn test_frame_rtp_over_tcp() {
         let rtp_packet = vec![0x80, 0x60, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01];
         let frame = frame_rtp_over_tcp(&rtp_packet);
-        assert_eq!(frame.len(), 3 + rtp_packet.len());
+        assert_eq!(frame.len(), 4 + rtp_packet.len());
         assert_eq!(frame[0], 0x24, "framing byte must be '$'");
-        let len = usize::from(frame[1]) << 8 | usize::from(frame[2]);
+        assert_eq!(frame[1], 0x00, "channel byte");
+        let len = usize::from(frame[2]) << 8 | usize::from(frame[3]);
         assert_eq!(len, rtp_packet.len(), "big-endian length prefix");
         assert_eq!(
-            &frame[3..],
+            &frame[4..],
             rtp_packet.as_slice(),
             "RTP payload after prefix"
         );
@@ -2130,19 +2136,21 @@ mod tcp_media_tests {
             timestamp: std::time::Instant::now(),
             is_key_frame: true,
         });
-        // GB28181 Annex C.2 $-framing: '$' + 2-byte BE length + RTP.
-        let mut head = [0u8; 4];
+        // GB28181 Annex C.2 $-framing (RTSP-interleaved style, 4-byte
+        // header): '$' + channel byte + 2-byte BE length + RTP.
+        let mut head = [0u8; 5];
         tokio::time::timeout(Duration::from_secs(3), media_conn.read_exact(&mut head))
             .await
             .expect("no framed RTP received")
             .expect("read failed");
         assert_eq!(head[0], 0x24, "framing byte, got {:#x}", head[0]);
-        let frame_len = u16::from_be_bytes([head[1], head[2]]) as usize;
+        assert_eq!(head[1], 0x00, "channel byte, got {:#x}", head[1]);
+        let frame_len = u16::from_be_bytes([head[2], head[3]]) as usize;
         assert!(
             frame_len >= 12,
             "frame len {frame_len} — smaller than an RTP header"
         );
-        assert_eq!(head[3] & 0xc0, 0x80, "RTP version bits, got {:b}", head[3]);
+        assert_eq!(head[4] & 0xc0, 0x80, "RTP version bits, got {:b}", head[4]);
     }
 
     /// setup:active offers (platform dials the device) are refused with 488
