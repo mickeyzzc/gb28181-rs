@@ -1,0 +1,24 @@
+[package]
+name = "gb28181-rs"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "GB/T 28181-2016/2022 device-side (UAC) library for Rust: SIP signaling, MANSCDP XML, RTP/PS media push, playback"
+license = "MIT"
+repository = "https://github.com/mickeyzzc/gb28181-rs"
+keywords = ["gb28181", "sip", "cctv", "video-surveillance", "rtp"]
+categories = ["multimedia", "network-programming"]
+
+[dependencies]
+anyhow = "1"
+hex = "0.4"
+libc = "0.2"
+md-5 = "0.10"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde-xml-rs = "0.6"
+sha2 = "0.10"
+tokio = { version = "1", features = ["sync", "rt", "macros", "net", "time", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
