@@ -84,3 +84,48 @@ fn default_gb28181_heartbeat_interval_secs() -> u64 {
 fn default_gb28181_heartbeat_timeout_count() -> u32 {
     3
 }
+
+impl Default for Gb28181Config {
+    fn default() -> Self {
+        Self {
+            enabled: default_gb28181_enabled(),
+            platform_sip_address: default_gb28181_platform_sip_address(),
+            platform_sip_port: default_gb28181_platform_sip_port(),
+            device_id: default_gb28181_device_id(),
+            channel_id: default_gb28181_channel_id(),
+            sip_domain: default_gb28181_sip_domain(),
+            password: default_gb28181_password(),
+            local_sip_port: default_gb28181_local_sip_port(),
+            register_interval_secs: default_gb28181_register_interval_secs(),
+            heartbeat_interval_secs: default_gb28181_heartbeat_interval_secs(),
+            heartbeat_timeout_count: default_gb28181_heartbeat_timeout_count(),
+            transport: Transport::default(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Default` must stay in lockstep with the serde defaults so hosts that
+    /// construct `Gb28181Config::default()` and hosts that deserialize an
+    /// empty `[gb28181]` section see the same values.
+    #[test]
+    fn default_matches_serde_defaults() {
+        let d = Gb28181Config::default();
+        let s: Gb28181Config = toml::from_str("").expect("empty config deserializes");
+        assert_eq!(d.enabled, s.enabled);
+        assert_eq!(d.platform_sip_address, s.platform_sip_address);
+        assert_eq!(d.platform_sip_port, s.platform_sip_port);
+        assert_eq!(d.device_id, s.device_id);
+        assert_eq!(d.channel_id, s.channel_id);
+        assert_eq!(d.sip_domain, s.sip_domain);
+        assert_eq!(d.password, s.password);
+        assert_eq!(d.local_sip_port, s.local_sip_port);
+        assert_eq!(d.register_interval_secs, s.register_interval_secs);
+        assert_eq!(d.heartbeat_interval_secs, s.heartbeat_interval_secs);
+        assert_eq!(d.heartbeat_timeout_count, s.heartbeat_timeout_count);
+        assert!(matches!(d.transport, Transport::Udp));
+    }
+}

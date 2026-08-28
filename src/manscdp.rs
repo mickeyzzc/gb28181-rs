@@ -304,7 +304,7 @@ pub(crate) fn parse_gb_time_ms_with(s: &str, local_offset_secs: i64) -> Option<u
 
 /// Device-local UTC offset in seconds for "now", honoring /etc/localtime
 /// via libc (same source Go's `time.Local` uses). Falls back to 0 (UTC).
-pub(crate) fn device_local_offset_secs() -> i64 {
+pub fn device_local_offset_secs() -> i64 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as libc::time_t)
