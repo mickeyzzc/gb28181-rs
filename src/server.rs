@@ -404,10 +404,16 @@ impl Gb28181Server {
     ) -> Result<()> {
         // Step 1: Send initial REGISTER
         let register = client.build_register();
+        let initial_cseq = client.cseq;
         self.send_sip_message(&register, platform_addr).await?;
 
-        // Step 2: Wait for 401 challenge
-        let msg = self.receive_with_timeout(Duration::from_secs(5)).await?;
+        // Step 2: Wait for the 401 challenge OF THIS REQUEST. A late
+        // response from a previous cycle (stale 200 OK / old-nonce 401)
+        // must be skipped, not consumed — otherwise cycles go one-off
+        // (issue #11).
+        let msg = self
+            .receive_register_response(initial_cseq, Duration::from_secs(5))
+            .await?;
         if msg.status_code != Some(SipStatusCode::Unauthorized) {
             bail!("Expected 401 Unauthorized, got {:?}", msg.status_code);
         }
@@ -415,12 +421,15 @@ impl Gb28181Server {
         // Step 3: Parse challenge and send authenticated REGISTER
         let auth = parse_401_challenge(&msg)?;
         client.inc_cseq();
+        let authed_cseq = client.cseq;
         let authed_register = client.build_register_with_auth(&auth);
         self.send_sip_message(&authed_register, platform_addr)
             .await?;
 
-        // Step 4: Wait for 200 OK
-        let msg = self.receive_with_timeout(Duration::from_secs(5)).await?;
+        // Step 4: Wait for the 200 OK OF THIS REQUEST (skip stale).
+        let msg = self
+            .receive_register_response(authed_cseq, Duration::from_secs(5))
+            .await?;
         if msg.status_code != Some(SipStatusCode::Ok) {
             bail!("Expected 200 OK, got {:?}", msg.status_code);
         }
@@ -996,15 +1005,49 @@ impl Gb28181Server {
         Ok(())
     }
 
+    /// Receive the REGISTER response whose CSeq matches `expected_cseq`,
+    /// skipping stale responses from previous cycles (issue #11).
+    ///
+    /// The timeout bounds the TOTAL wait, not per-skipped-message.
+    async fn receive_register_response(
+        &self,
+        expected_cseq: u32,
+        timeout: Duration,
+    ) -> Result<SipMessage> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let remain = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remain.is_zero() {
+                bail!("gb28181: register response timeout (cseq {expected_cseq})");
+            }
+            let msg = self.receive_with_timeout(remain).await?;
+            // A REGISTER response echoes "CSeq: <n> REGISTER". Only an exact
+            // CSeq match belongs to this attempt; anything else (late 200 of
+            // the previous cycle, an old-nonce 401, mid-dialog traffic) is
+            // stale or unrelated — skip it.
+            let cseq_matches = msg
+                .get_header("CSeq")
+                .and_then(|v| v.split_whitespace().next())
+                .and_then(|n| n.parse::<u32>().ok())
+                .is_some_and(|n| n == expected_cseq);
+            let is_register_response = msg
+                .get_header("CSeq")
+                .is_some_and(|v| v.contains("REGISTER"));
+            if cseq_matches && is_register_response && msg.status_code.is_some() {
+                return Ok(msg);
+            }
+        }
+    }
+
     /// Receive a SIP message with timeout.
     async fn receive_with_timeout(&self, timeout: Duration) -> Result<SipMessage> {
         let mut buf = vec![0u8; MAX_SIP_PACKET_SIZE];
-        tokio::time::timeout(timeout, self.sip_socket.recv_from(&mut buf))
+        let (len, _) = tokio::time::timeout(timeout, self.sip_socket.recv_from(&mut buf))
             .await
             .context("gb28181: receive timeout")?
             .context("gb28181: recv_from failed")?;
 
-        let data_str = std::str::from_utf8(&buf)
+        let data_str = std::str::from_utf8(&buf[..len])
             .map_err(|e| anyhow::anyhow!("gb28181: invalid UTF-8: {e}"))?;
         SipMessage::parse(data_str).context("gb28181: parse failed")
     }
@@ -2226,5 +2269,95 @@ mod tcp_media_tests {
         let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
             .expect("parse response");
         assert!(resp.start_line.contains("488"), "got {}", resp.start_line);
+    }
+
+    /// Stale responses from a previous register cycle (late 200 OK / old-nonce
+    /// 401) must be skipped: perform_register matches responses by CSeq so a
+    /// one-cycle-off response never poisons the current attempt (issue #11).
+    #[tokio::test]
+    async fn test_perform_register_skips_stale_responses() {
+        use crate::client::SipDeviceClient;
+
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config: Gb28181Config {
+                enabled: true,
+                platform_sip_address: "127.0.0.1".to_string(),
+                platform_sip_port: 5060,
+                device_id: "34020000001320000001".to_string(),
+                channel_id: "34020000001320000001".to_string(),
+                sip_domain: "3402000000".to_string(),
+                password: "12345678".to_string(),
+                local_sip_port: 5060,
+                register_interval_secs: 60,
+                heartbeat_interval_secs: 60,
+                heartbeat_timeout_count: 3,
+                transport: Transport::Udp,
+            },
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket,
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+        };
+
+        // Fake platform: sends a STALE 200 OK (wrong CSeq) before the real 401,
+        // then a STALE 401 (wrong CSeq) before the real 200 OK.
+        let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
+        let platform_addr = platform.local_addr().expect("addr");
+        let server_addr = server.sip_socket.local_addr().expect("server addr");
+
+        let stale_200 =
+            "SIP/2.0 200 OK\r\nCSeq: 999 REGISTER\r\nCall-ID: stale\r\nContent-Length: 0\r\n\r\n";
+        let stale_401 = "SIP/2.0 401 Unauthorized\r\nCSeq: 999 REGISTER\r\nCall-ID: stale\r\nContent-Length: 0\r\n\r\n";
+        let fresh_401 = "SIP/2.0 401 Unauthorized\r\nCSeq: 1 REGISTER\r\nCall-ID: fresh\r\nWWW-Authenticate: Digest realm=\"3402000000\", nonce=\"abc\", algorithm=MD5\r\nContent-Length: 0\r\n\r\n";
+        let fresh_200 =
+            "SIP/2.0 200 OK\r\nCSeq: 2 REGISTER\r\nCall-ID: fresh\r\nContent-Length: 0\r\n\r\n";
+
+        let sender = tokio::spawn(async move {
+            let platform = platform;
+            // Wait for the initial REGISTER, then stale-200, stale-401... no:
+            // reply sequence interleaves stale before fresh.
+            let mut buf = vec![0u8; 2048];
+            let (_n, _) = platform.recv_from(&mut buf).await.expect("recv REGISTER 1");
+            platform
+                .send_to(stale_200.as_bytes(), server_addr)
+                .await
+                .unwrap();
+            platform
+                .send_to(fresh_401.as_bytes(), server_addr)
+                .await
+                .unwrap();
+            let (_n, _) = platform.recv_from(&mut buf).await.expect("recv REGISTER 2");
+            platform
+                .send_to(stale_401.as_bytes(), server_addr)
+                .await
+                .unwrap();
+            platform
+                .send_to(fresh_200.as_bytes(), server_addr)
+                .await
+                .unwrap();
+        });
+
+        let mut client = SipDeviceClient::new(
+            "34020000001320000001",
+            platform_addr,
+            "127.0.0.1",
+            5060,
+            "3402000000",
+            "12345678",
+            3600,
+        );
+        server
+            .perform_register(&mut client, platform_addr)
+            .await
+            .expect("register must succeed despite stale interleaved responses");
+        sender.await.unwrap();
     }
 }
