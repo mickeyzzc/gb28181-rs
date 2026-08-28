@@ -22,7 +22,7 @@ use crate::frame::{AccessUnit, FrameSource};
 
 use super::client::{
     build_catalog_response, build_device_info_response, build_keepalive_notify,
-    parse_401_challenge, parse_invite, SipDeviceClient,
+    parse_401_challenge, parse_invite, MediaTransport, SipDeviceClient,
 };
 use super::manscdp::{ChannelItem, DeviceItem};
 use super::playback::{parse_playback_control, run_playback_task, PlaybackControl};
@@ -669,6 +669,17 @@ impl Gb28181Server {
             invite_info.media_address, invite_info.media_port, invite_info.ssrc
         );
 
+        // TCP media where the platform dials the device (a=setup:active in
+        // the offer) is not supported — this device has no media listener.
+        // Refuse with 488 instead of answering a mismatched transport and
+        // streaming into a black hole (issue #14).
+        if invite_info.media_transport == MediaTransport::TcpListen {
+            eprintln!("gb28181: TCP media with setup:active unsupported — 488");
+            let resp = build_error_response(msg, 488, "Not Acceptable Here");
+            self.send_sip_message(&resp, peer_addr).await?;
+            return Ok(());
+        }
+
         // Bind local UDP for media (ephemeral port)
         let media_socket = UdpSocket::bind("0.0.0.0:0")
             .await
@@ -718,11 +729,19 @@ impl Gb28181Server {
             }
         };
 
+        // The answer's m= transport mirrors the offer (RFC 3264): TCP media
+        // is offered via TCP/RTP/AVP in the SDP regardless of the SIP
+        // signaling transport (issue #14).
+        let media_is_tcp = invite_info.media_transport == MediaTransport::TcpConnect;
         let sdp = build_device_sdp_answer(
             media_port,
             invite_info.ssrc,
             &device_ip,
-            self.config.transport,
+            if media_is_tcp {
+                Transport::Tcp
+            } else {
+                Transport::Udp
+            },
             invite_info.session_type,
         );
         let response = build_invite_response(
@@ -737,9 +756,10 @@ impl Gb28181Server {
 
         self.send_sip_message(&response, peer_addr).await?;
 
-        // For TCP transport, actively connect to the platform's media port
-        // (device connects TO platform — active mode per GB/T 28181).
-        let media_tcp_conn = if self.config.transport == Transport::Tcp {
+        // For TCP media (offer said TCP/RTP/AVP with setup:passive/actpass),
+        // actively connect to the platform's media port — the device is the
+        // active side per GB/T 28181 Annex C / RFC 4145 (issue #14).
+        let media_tcp_conn = if media_is_tcp {
             let conn = TcpStream::connect(media_dest)
                 .await
                 .context("gb28181: failed to connect to TCP media port")?;
@@ -1994,4 +2014,209 @@ async fn test_info_playback_control_live_session_noop() {
         "expected 200 OK, got {}",
         resp.start_line
     );
+}
+
+#[cfg(test)]
+mod tcp_media_tests {
+    use super::*;
+    /// A tcp-passive offer (TCP/RTP/AVP + a=setup:passive, the MiBeeNvr
+    /// v0.11 default) must be answered with a TCP SDP declaring
+    /// a=setup:active, and the device must CONNECT to the offered media
+    /// port and send RFC 4571-framed RTP (2-byte length prefix). Issue #14.
+    #[tokio::test]
+    async fn test_invite_tcp_passive_connects_and_frames() {
+        use tokio::io::AsyncReadExt;
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp, // SIP over UDP + TCP MEDIA — the #14 scenario
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let hub = Arc::new(crate::mock::MockFrameHub::new());
+        let mut server = Gb28181Server {
+            config,
+            au_hub: hub.clone(),
+            sip_socket,
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+        };
+
+        // Platform stand-in: TCP listener on an ephemeral port.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listen");
+        let media_port = listener.local_addr().expect("addr").port();
+
+        let body = format!(
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video {port} TCP/RTP/AVP 96\r\na=setup:passive\r\na=connection:new\r\ny=2000000001\r\n",
+        port = media_port
+    );
+        let msg = SipMessage {
+            start_line: "INVITE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Invite),
+            status_code: None,
+            uri: Some("sip:34020000001320000001@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), "tcp-passive-1".to_string()),
+                (
+                    "From".to_string(),
+                    "<sip:34020000002000000001@3402000000>;tag=plat".to_string(),
+                ),
+                (
+                    "To".to_string(),
+                    "<sip:34020000001320000001@3402000000>".to_string(),
+                ),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "Via".to_string(),
+                    "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKmt".to_string(),
+                ),
+            ],
+            body,
+        };
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        server
+            .handle_invite(&msg, peer_addr)
+            .await
+            .expect("handle_invite");
+
+        // 200 OK SDP must echo TCP transport and declare setup:active.
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 200 OK")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert!(resp.start_line.contains("200"), "got {}", resp.start_line);
+        assert!(resp.body.contains("TCP/RTP/AVP 96"), "body: {}", resp.body);
+        assert!(resp.body.contains("a=setup:active"), "body: {}", resp.body);
+
+        // The device must dial the offered media port.
+        let (mut media_conn, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .expect("device never connected TCP media")
+            .expect("accept failed");
+
+        // Feed one keyframe; expect RFC 4571 framing: 2-byte BE length then RTP.
+        hub.write(crate::frame::AccessUnit {
+            nalus: vec![crate::frame::Nalu {
+                nalu_type: 5,
+                data: vec![0x65, 0x88, 0x84, 0x21, 0xa0],
+                is_idr: true,
+                is_sps: false,
+                is_pps: false,
+                is_aud: false,
+            }],
+            timestamp: std::time::Instant::now(),
+            is_key_frame: true,
+        });
+        // GB28181 Annex C.2 $-framing: '$' + 2-byte BE length + RTP.
+        let mut head = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(3), media_conn.read_exact(&mut head))
+            .await
+            .expect("no framed RTP received")
+            .expect("read failed");
+        assert_eq!(head[0], 0x24, "framing byte, got {:#x}", head[0]);
+        let frame_len = u16::from_be_bytes([head[1], head[2]]) as usize;
+        assert!(
+            frame_len >= 12,
+            "frame len {frame_len} — smaller than an RTP header"
+        );
+        assert_eq!(head[3] & 0xc0, 0x80, "RTP version bits, got {:b}", head[3]);
+    }
+
+    /// setup:active offers (platform dials the device) are refused with 488
+    /// instead of silently answering a mismatched transport. Issue #14.
+    #[tokio::test]
+    async fn test_invite_tcp_setup_active_returns_488() {
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket,
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+        };
+
+        let body = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 9 TCP/RTP/AVP 96\r\na=setup:active\r\ny=2000000001\r\n";
+        let msg = SipMessage {
+            start_line: "INVITE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Invite),
+            status_code: None,
+            uri: Some("sip:34020000001320000001@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), "tcp-active-1".to_string()),
+                (
+                    "From".to_string(),
+                    "<sip:34020000002000000001@3402000000>;tag=plat".to_string(),
+                ),
+                (
+                    "To".to_string(),
+                    "<sip:34020000001320000001@3402000000>".to_string(),
+                ),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "Via".to_string(),
+                    "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKmt2".to_string(),
+                ),
+            ],
+            body: body.to_string(),
+        };
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        server
+            .handle_invite(&msg, peer.local_addr().expect("addr"))
+            .await
+            .expect("handle_invite");
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 488")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert!(resp.start_line.contains("488"), "got {}", resp.start_line);
+    }
 }

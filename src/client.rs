@@ -145,10 +145,30 @@ pub fn parse_401_challenge(msg: &SipMessage) -> Result<DigestAuthParams> {
 }
 
 /// Information extracted from a received SIP INVITE request.
+/// Media transport negotiated from the INVITE SDP offer.
+///
+/// Derived from the `m=` line protocol and the RFC 4145 `a=setup:` value:
+/// `TCP/RTP/AVP` + `setup:passive` (or `actpass`) means the platform
+/// listens and the **device connects** ([`MediaTransport::TcpConnect`]);
+/// `setup:active` means the platform will dial the device
+/// ([`MediaTransport::TcpListen`], unsupported by this device and refused
+/// with 488). Plain `RTP/AVP` is [`MediaTransport::Udp`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaTransport {
+    /// Classic UDP media (`RTP/AVP`).
+    Udp,
+    /// TCP media, device actively connects to the offered media port.
+    TcpConnect,
+    /// TCP media, platform dials the device (device would have to listen).
+    TcpListen,
+}
+
 #[derive(Debug, Clone)]
 pub struct InviteInfo {
     /// Call-ID from the INVITE
     pub call_id: String,
+    /// Media transport negotiated from the SDP offer
+    pub media_transport: MediaTransport,
     /// Media address (IP) extracted from SDP
     pub media_address: String,
     /// Media port from SDP m= line
@@ -209,8 +229,22 @@ pub fn parse_invite(msg: &SipMessage) -> Result<InviteInfo> {
         "Download" => SessionType::Download,
         _ => SessionType::Play,
     };
+    // Media transport: TCP when the m= line says so; setup then decides
+    // which side connects (RFC 4145). actpass lets the answerer choose —
+    // this device chooses to connect (matching the SDP answer's
+    // a=setup:active).
+    let media_transport = if media.proto.contains("TCP") {
+        match media.get_attr("setup") {
+            Some("active") => MediaTransport::TcpListen,
+            Some("passive") | Some("actpass") | None => MediaTransport::TcpConnect,
+            Some(_) => MediaTransport::TcpConnect,
+        }
+    } else {
+        MediaTransport::Udp
+    };
     Ok(InviteInfo {
         call_id,
+        media_transport,
         media_address: ip,
         media_port: media.port,
         ssrc,
@@ -1106,4 +1140,66 @@ fn test_recordinfo_response_with_items() {
     assert!(resp.body.contains("<Type>time</Type>"));
     // Exactly two Item elements.
     assert_eq!(resp.body.matches("<Item>").count(), 2);
+}
+
+#[cfg(test)]
+mod media_transport_tests {
+    use super::*;
+
+    fn invite_with_sdp(call_id: &str, body: &str) -> SipMessage {
+        SipMessage {
+            start_line: "INVITE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Invite),
+            status_code: None,
+            uri: Some("sip:34020000001320000001@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+            ],
+            body: body.to_string(),
+        }
+    }
+
+    #[test]
+    fn udp_offer_is_udp_media() {
+        let msg = invite_with_sdp(
+            "mt-udp",
+            "v=0\r\no=- 0 0 IN IP4 192.168.1.10\r\ns=Play\r\nc=IN IP4 192.168.1.10\r\nt=0 0\r\nm=video 30000 RTP/AVP 96\r\ny=2000000001\r\n",
+        );
+        let info = parse_invite(&msg).expect("parse");
+        assert_eq!(info.media_transport, MediaTransport::Udp);
+        assert_eq!(info.media_port, 30000);
+    }
+
+    #[test]
+    fn tcp_passive_offer_means_device_connects() {
+        // tcp-passive platform offer (MiBeeNvr v0.11 default).
+        let msg = invite_with_sdp(
+            "mt-tcp-passive",
+            "v=0\r\no=- 0 0 IN IP4 192.168.1.10\r\ns=Play\r\nc=IN IP4 192.168.1.10\r\nt=0 0\r\nm=video 30000 TCP/RTP/AVP 96\r\na=recvonly\r\na=setup:passive\r\na=connection:new\r\na=rtpmap:96 PS/90000\r\ny=2000000001\r\n",
+        );
+        let info = parse_invite(&msg).expect("parse");
+        assert_eq!(info.media_transport, MediaTransport::TcpConnect);
+    }
+
+    #[test]
+    fn tcp_actpass_offer_device_chooses_to_connect() {
+        let msg = invite_with_sdp(
+            "mt-tcp-actpass",
+            "v=0\r\no=- 0 0 IN IP4 192.168.1.10\r\ns=Play\r\nc=IN IP4 192.168.1.10\r\nt=0 0\r\nm=video 30000 TCP/RTP/AVP 96\r\na=setup:actpass\r\ny=2000000001\r\n",
+        );
+        let info = parse_invite(&msg).expect("parse");
+        assert_eq!(info.media_transport, MediaTransport::TcpConnect);
+    }
+
+    #[test]
+    fn tcp_setup_active_offer_means_platform_dials() {
+        let msg = invite_with_sdp(
+            "mt-tcp-active",
+            "v=0\r\no=- 0 0 IN IP4 192.168.1.10\r\ns=Play\r\nc=IN IP4 192.168.1.10\r\nt=0 0\r\nm=video 9 TCP/RTP/AVP 96\r\na=setup:active\r\ny=2000000001\r\n",
+        );
+        let info = parse_invite(&msg).expect("parse");
+        assert_eq!(info.media_transport, MediaTransport::TcpListen);
+    }
 }
