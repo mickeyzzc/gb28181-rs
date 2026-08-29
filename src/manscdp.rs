@@ -304,20 +304,31 @@ pub(crate) fn parse_gb_time_ms_with(s: &str, local_offset_secs: i64) -> Option<u
 
 /// Device-local UTC offset in seconds for "now", honoring /etc/localtime
 /// via libc (same source Go's `time.Local` uses). Falls back to 0 (UTC).
+///
+/// The libc `localtime_r` path is POSIX-only; non-Unix targets report UTC
+/// (offset 0) — std has no portable local-offset API, and the offset only
+/// decorates MANSCDP DeviceInfo/Keepalive timestamps.
 pub fn device_local_offset_secs() -> i64 {
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as libc::time_t)
-        .unwrap_or(0);
-    // SAFETY: `tm` is a plain struct and `localtime_r` writes it without
-    // retaining the pointer; a NULL return leaves the zeroed fallback.
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&now, &mut tm).is_null() {
-            0
-        } else {
-            tm.tm_gmtoff
+    #[cfg(unix)]
+    {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as libc::time_t)
+            .unwrap_or(0);
+        // SAFETY: `tm` is a plain struct and `localtime_r` writes it without
+        // retaining the pointer; a NULL return leaves the zeroed fallback.
+        unsafe {
+            let mut tm: libc::tm = std::mem::zeroed();
+            if libc::localtime_r(&now, &mut tm).is_null() {
+                0
+            } else {
+                tm.tm_gmtoff
+            }
         }
+    }
+    #[cfg(not(unix))]
+    {
+        0
     }
 }
 

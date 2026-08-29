@@ -26,7 +26,7 @@ Not included (by design): platform/UAS role, SIP over TLS/WebSocket, H.265 media
 
 ```toml
 [dependencies]
-gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git" }
+gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.2.0" }
 ```
 
 The crate is transport- and storage-agnostic. Your host injects two seams:
