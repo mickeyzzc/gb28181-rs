@@ -77,3 +77,83 @@ pub mod device_types {
     /// Audio device
     pub const AUDIO: u8 = 134;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn format_golden() {
+        // The default device/channel ID used across this workspace:
+        // region 34020000, industry 00, type 132, serial 0000001.
+        assert_eq!(
+            format_device_id("34020000", 0, 132, 1),
+            "34020000001320000001"
+        );
+    }
+
+    #[test]
+    fn format_zero_pads_each_field() {
+        assert_eq!(
+            format_device_id("11000000", 6, 5, 42),
+            "11000000060050000042"
+        );
+    }
+
+    #[test]
+    fn format_then_parse_roundtrip() {
+        for (industry, dev_type, serial) in
+            [(0u8, 132u16, 2000001u32), (0, 111, 7), (6, 118, 9999999)]
+        {
+            let id = format_device_id("34020000", industry, dev_type, serial);
+            let parts = parse_device_id(&id).expect("roundtrip parses");
+            assert_eq!(parts.region_code, "34020000");
+            assert_eq!(parts.industry_type, industry);
+            assert_eq!(parts.device_type, dev_type);
+            assert_eq!(parts.serial, serial);
+        }
+    }
+
+    #[test]
+    fn format_with_ipc_type_code() {
+        let id = format_device_id("34020000", 0, u16::from(device_types::IPC), 1);
+        assert_eq!(id, "34020000001110000001");
+        assert_eq!(
+            parse_device_id(&id).unwrap().device_type,
+            u16::from(device_types::IPC)
+        );
+    }
+
+    #[test]
+    fn parse_golden() {
+        let parts = parse_device_id("34020000001320000001").unwrap();
+        assert_eq!(
+            parts,
+            DeviceIdParts {
+                region_code: "34020000".to_string(),
+                industry_type: 0,
+                device_type: 132,
+                serial: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn parse_rejects_wrong_length() {
+        assert!(parse_device_id("3402000000132000000").is_err()); // 19 digits
+        assert!(parse_device_id("340200000013200000011").is_err()); // 21 digits
+        assert!(parse_device_id("").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_non_digits() {
+        assert!(parse_device_id("3402000000132000000a").is_err());
+        assert!(parse_device_id("3402000A0013200000001").is_err());
+    }
+
+    #[test]
+    #[should_panic(expected = "center_code must be 8 digits")]
+    fn format_panics_on_short_center_code() {
+        let _ = format_device_id("3402000", 0, 132, 1);
+    }
+}
