@@ -507,10 +507,17 @@ pub fn build_pes_packet(
         optional_header_len += 5;
     }
 
-    // Packet length = optional header (3 + optional_header_len) + payload
-    // Use 0 if length would exceed 65535 (unbounded)
-    let packet_len = if optional_header_len > 0 || !payload.is_empty() {
-        3 + optional_header_len as u16 + payload.len() as u16
+    // Packet length = 3 header bytes (flags + hdrlen + gap) + optional fields
+    // + payload, computed wide so a >64KB payload can never wrap mod 65536:
+    // fall back to unbounded (0) only past the 16-bit field's cap.
+    // mux_h264_to_ps splits large access units, so its PES stay bounded.
+    let packet_len: u16 = if optional_header_len > 0 || !payload.is_empty() {
+        let declared = 3u32 + optional_header_len as u32 + payload.len() as u32;
+        if declared <= 65535 {
+            declared as u16
+        } else {
+            0
+        }
     } else {
         0
     };
@@ -552,6 +559,13 @@ pub fn build_pes_packet(
     pes
 }
 
+/// Bounds the elementary-stream bytes carried by one PES packet.
+/// PES_packet_length is a 16-bit field counting 3 header bytes + optional
+/// fields + payload (≤ 65535), so an access unit larger than ~64KB MUST be
+/// split across continuation PES packets — receivers accumulate the ES of one
+/// access unit across its PES packets. 65000 leaves headroom below the cap.
+pub const MAX_PES_CHUNK_BYTES: usize = 65000;
+
 /// Multiplex H.264 NAL units into an MPEG-PS packet.
 ///
 /// Returns a complete PS pack including pack header, optional PSM, and PES packet.
@@ -565,7 +579,11 @@ pub fn build_pes_packet(
 /// # Format
 /// - Pack header (always)
 /// - PSM (on keyframe only)
-/// - PES packet with concatenated NAL units (Annex-B start code 0x00 0x00 0x00 0x01)
+/// - PES packets with the concatenated NAL units (Annex-B start code
+///   0x00 0x00 0x00 0x01), split so every PES stays bounded: the first
+///   carries PTS/DTS, continuation PES packets (access units larger than
+///   MAX_PES_CHUNK_BYTES) carry none — the ES is continuous across the
+///   PES packets of one access unit.
 pub fn mux_h264_to_ps(nalus: &[&[u8]], is_key_frame: bool, pts: u64, dts: u64) -> Vec<u8> {
     let mut ps = Vec::new();
 
@@ -592,8 +610,24 @@ pub fn mux_h264_to_ps(nalus: &[&[u8]], is_key_frame: bool, pts: u64, dts: u64) -
         payload.extend_from_slice(nalu);
     }
 
-    // Add PES packet
-    ps.extend_from_slice(&build_pes_packet(0xE0, &payload, Some(pts), Some(dts)));
+    // Add PES packets: split the ES into bounded chunks. Only the first PES
+    // carries PTS/DTS; a 16-bit PES_packet_length cannot describe an access
+    // unit larger than ~64KB in one packet, and letting the field wrap
+    // truncates every large IDR (issue #11).
+    let mut start = 0usize;
+    loop {
+        let end = (start + MAX_PES_CHUNK_BYTES).min(payload.len());
+        let chunk = &payload[start..end];
+        if start == 0 {
+            ps.extend_from_slice(&build_pes_packet(0xE0, chunk, Some(pts), Some(dts)));
+        } else {
+            ps.extend_from_slice(&build_pes_packet(0xE0, chunk, None, None));
+        }
+        if end == payload.len() {
+            break;
+        }
+        start = end;
+    }
 
     ps
 }
@@ -666,5 +700,193 @@ mod tests {
         assert!(!ps_data.is_empty());
         // Should at least have pack header
         assert!(ps_data.starts_with(&[0x00, 0x00, 0x01, 0xBA]));
+    }
+
+    // Deterministic filler with no zero bytes: the elementary stream can
+    // never fake an Annex-B or PS start code inside the payload.
+    fn lcg_fill(n: usize) -> Vec<u8> {
+        let mut b = Vec::with_capacity(n);
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..n {
+            x = x.wrapping_mul(1664525).wrapping_add(1013904223);
+            b.push(1 + ((x >> 16) % 255) as u8);
+        }
+        b
+    }
+
+    fn nal(head: u8, n: usize) -> Vec<u8> {
+        let mut v = vec![head];
+        v.extend_from_slice(&lcg_fill(n - 1));
+        v
+    }
+
+    /// One walked PES packet of a muxed PS burst.
+    struct WalkedPes {
+        offset: usize,
+        declared: usize,
+        actual: usize,
+        has_ts: bool,
+        header_len: usize,
+    }
+
+    /// Walk a PS burst the way a strict receiver does: advance by each PES's
+    /// declared length instead of scanning to the end of data.
+    fn walk_pes_packets(ps: &[u8]) -> Vec<WalkedPes> {
+        let mut out = Vec::new();
+        let mut pos = 0usize;
+        while pos + 9 <= ps.len() {
+            if ps[pos] != 0 || ps[pos + 1] != 0 || ps[pos + 2] != 1 || ps[pos + 3] != 0xE0 {
+                pos += 1;
+                continue;
+            }
+            let declared = ((ps[pos + 4] as usize) << 8) | ps[pos + 5] as usize;
+            let pkt = WalkedPes {
+                offset: pos,
+                declared,
+                actual: ps.len() - pos - 6,
+                has_ts: ps[pos + 6] & 0xC0 != 0,
+                header_len: ps[pos + 7] as usize,
+            };
+            if declared == 0 {
+                panic!(
+                    "PES at {} is unbounded (length=0) — mux must never emit these",
+                    pos
+                );
+            }
+            let done = declared > pkt.actual;
+            let actual = declared.min(pkt.actual);
+            out.push(WalkedPes { actual, ..pkt });
+            if done {
+                // Strict receiver: pending PES at end of burst (issue #11
+                // failure signature when the wrapped length over-declares).
+                break;
+            }
+            pos += 6 + declared;
+        }
+        out
+    }
+
+    /// PES_packet_length must equal the bytes actually written after it — the
+    /// gap byte makes the timestamped layout balance (contract pin; the Go
+    /// twin's pre-fix off-by-one is the cautionary tale, mibee-eye-raspi #15).
+    #[test]
+    fn test_pes_packet_length_balanced() {
+        let payload = [0x00u8, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84];
+        for (pts, dts) in [
+            (Some(90000u64), Some(90000)),
+            (Some(90000), None),
+            (None, None),
+        ] {
+            let pes = build_pes_packet(0xE0, &payload, pts, dts);
+            let declared = ((pes[4] as usize) << 8) | pes[5] as usize;
+            assert!(declared > 0, "expected bounded PES");
+            assert_eq!(
+                pes.len(),
+                6 + declared,
+                "PES_packet_length={declared} must match written bytes (pts={pts:?})"
+            );
+        }
+    }
+
+    /// Access units larger than the 16-bit PES_packet_length cap MUST be split
+    /// across bounded continuation PES packets: first carries PTS/DTS,
+    /// continuations carry none, ES is continuous across the chunks. The
+    /// pre-fix code wrapped the length computation mod 65536, truncating every
+    /// large IDR and smearing ~64KB of residual ES into the next AU (issue #11).
+    #[test]
+    fn test_mux_large_au_splits_into_bounded_pes() {
+        let sps = nal(0x67, 12);
+        let idr = nal(0x65, 199_999); // 200000-byte ES → 4 PES chunks
+        let nalus: Vec<&[u8]> = vec![&sps, &idr];
+
+        let ps_data = mux_h264_to_ps(&nalus, true, 90_000, 90_000);
+        let pkts = walk_pes_packets(&ps_data);
+
+        assert_eq!(pkts.len(), 4, "expected 4 PES packets for a 200KB ES");
+
+        let mut es: Vec<u8> = Vec::new();
+        for (i, pkt) in pkts.iter().enumerate() {
+            assert_eq!(pkt.declared, pkt.actual, "PES {i} over-declares its bytes");
+            if i == 0 {
+                assert!(
+                    pkt.has_ts && pkt.header_len == 10,
+                    "first PES must carry PTS+DTS"
+                );
+            } else {
+                assert!(
+                    !pkt.has_ts && pkt.header_len == 0,
+                    "continuation PES {i} must not carry timestamps"
+                );
+            }
+            let start = pkt.offset + 9 + pkt.header_len; // prefix(6)+flags(1)+hdrlen(1)+gap(1)+optional
+            let end = pkt.offset + 6 + pkt.declared;
+            es.extend_from_slice(&ps_data[start..end]);
+        }
+
+        let mut want_es = vec![0x00, 0x00, 0x00, 0x01];
+        want_es.extend_from_slice(&sps);
+        want_es.extend_from_slice(&[0x00, 0x00, 0x01]);
+        want_es.extend_from_slice(&idr);
+        assert_eq!(
+            es.len(),
+            want_es.len(),
+            "split ES must reassemble to the full ES"
+        );
+        assert_eq!(es, want_es, "split ES content must match byte-for-byte");
+    }
+
+    /// A continuation PES has no optional fields: flags 0x00, header_data_length
+    /// 0x00, then the gap byte — so a standard-layout receiver reads
+    /// PES_header_data_length 0 at byte 8 and locates the payload at 9.
+    #[test]
+    fn test_mux_continuation_pes_shape() {
+        let idr = nal(0x65, 70_000); // 70000-byte ES → 65000 + 5000
+        let nalus: Vec<&[u8]> = vec![&idr];
+        let ps_data = mux_h264_to_ps(&nalus, false, 90_000, 90_000);
+        let pkts = walk_pes_packets(&ps_data);
+
+        assert_eq!(pkts.len(), 2);
+        let second = &pkts[1];
+        // ES = 4-byte start code + 70000 = 70004; chunk 2 = 5004 payload bytes
+        // → PES_packet_length = 3 + 0 + 5004 = 0x138F.
+        // 00 00 01 E0 | 13 8F | 00 00 00 | payload...
+        let head = &ps_data[second.offset..second.offset + 9];
+        let want = [0x00, 0x00, 0x01, 0xE0, 0x13, 0x8F, 0x00, 0x00, 0x00];
+        assert_eq!(head, want, "continuation PES header shape");
+        // ...and its payload continues the ES mid-NAL, exactly where chunk 1
+        // ended: ES = start code(4) + idr, chunk 2 starts at ES byte 65000 →
+        // idr byte 64996.
+        assert_eq!(
+            &ps_data[second.offset + 9..second.offset + 9 + 4],
+            &idr[64_996..65_000]
+        );
+    }
+
+    /// The issue #11 wire contract end to end: walking the muxed burst by
+    /// declared lengths must consume the whole access unit with no pending
+    /// PES — for normal frames and for >64KB split frames alike.
+    #[test]
+    fn test_mux_strict_receiver_walks_full_au() {
+        for size in [16_000usize, 70_000, 200_000] {
+            let n = nal(0x65, size);
+            let nalus: Vec<&[u8]> = vec![&n];
+            let ps_data = mux_h264_to_ps(&nalus, true, 90_000, 90_000);
+            let pkts = walk_pes_packets(&ps_data);
+
+            for (i, p) in pkts.iter().enumerate() {
+                assert!(
+                    p.declared <= p.actual,
+                    "size {size}: PES {i} declares {} bytes but {} arrived",
+                    p.declared,
+                    p.actual
+                );
+            }
+            let last = pkts.last().unwrap();
+            assert_eq!(
+                last.offset + 6 + last.declared,
+                ps_data.len(),
+                "size {size}: strict walk must consume the full AU"
+            );
+        }
     }
 }
