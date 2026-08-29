@@ -72,13 +72,16 @@ pub struct Gb28181Server {
 #[derive(Debug, Clone)]
 struct InviteDialog {
     /// Call-ID of the dialog
-    _call_id: String,
+    call_id: String,
     /// Remote tag from From header
     _remote_tag: String,
     /// Local tag we generated
     _local_tag: u32,
-    /// CSeq from INVITE
-    _cseq: u32,
+    /// CSeq of the INVITE that established (or last re-negotiated) the dialog
+    cseq: u32,
+    /// The 200 OK sent for that INVITE — re-sent verbatim on retransmission
+    /// (RFC 3261 §13.3.1.4, issue #18).
+    invite_response: Option<SipMessage>,
     /// Remote platform address for SIP signaling
     _remote_addr: SocketAddr,
     /// SSRC from INVITE SDP (y= field)
@@ -322,7 +325,12 @@ impl Gb28181Server {
         let mut buf = vec![0u8; MAX_SIP_PACKET_SIZE];
         let mut keepalive_failures = 0u32;
 
-        let mut re_register_interval = tokio::time::interval(Duration::from_secs(60));
+        // Refresh the registration at half the negotiated expiry (RFC 3261
+        // §10.2) so a platform restart recovers without waiting for keepalive
+        // timeouts (issue #19).
+        let mut re_register_interval = tokio::time::interval(Duration::from_secs(
+            registration_refresh_interval_secs(self.config.register_interval_secs),
+        ));
         re_register_interval.tick().await; // skip immediate first tick
 
         loop {
@@ -357,7 +365,27 @@ impl Gb28181Server {
                     }
                 }
                 _ = re_register_interval.tick() => {
-                    if !registered {
+                    if registered {
+                        // Registration refresh (issue #19): re-REGISTER before
+                        // the negotiated expiry. A restarted platform has an
+                        // empty registration table while we still believe we
+                        // are registered — refreshing recovers immediately
+                        // instead of deadlocking until keepalive timeouts.
+                        if let Err(e) = self
+                            .perform_register(&mut sip_client, platform_sip_addr)
+                            .await
+                        {
+                            eprintln!(
+                                "gb28181: registration refresh failed: {e} — marking unregistered, will retry"
+                            );
+                            registered = false;
+                        } else {
+                            println!(
+                                "gb28181: registration refreshed with platform {}",
+                                platform_sip_addr
+                            );
+                        }
+                    } else {
                         eprintln!("gb28181: periodic re-registration attempt");
                         match self.perform_register(&mut sip_client, platform_sip_addr).await {
                             Ok(()) => {
@@ -636,41 +664,63 @@ impl Gb28181Server {
 
         // Check if we already have an active session
         if self.media_task.is_some() {
-            let stale_dialog = self
-                .invite_info
-                .as_ref()
-                .map(|d| d._call_id != invite_info.call_id)
-                .unwrap_or(true);
-            if stale_dialog {
-                // Different Call-ID = a NEW dialog (platform restarted and lost the
-                // old one, or the previous BYE never reached us). Recycling the
-                // stale session instead of 486-ing forever (issue #6).
-                let old = self
-                    .invite_info
-                    .as_ref()
-                    .map(|d| d._call_id.clone())
-                    .unwrap_or_default();
-                eprintln!(
-                    "gb28181: INVITE for new dialog {} — recycling stale session {}",
-                    invite_info.call_id, old
-                );
-                if let Some(subscriber_id) = self.subscriber_id.take() {
-                    self.au_hub.unsubscribe(subscriber_id);
+            // CSeq of the incoming INVITE (needed to tell a retransmission of
+            // the establishing INVITE from a same-dialog re-INVITE).
+            let incoming_cseq = msg
+                .get_header("CSeq")
+                .and_then(|c| c.split_whitespace().next())
+                .and_then(|c| c.parse::<u32>().ok())
+                .unwrap_or(1);
+            let existing = self.invite_info.as_ref();
+            let same_dialog = existing
+                .map(|d| d.call_id == invite_info.call_id)
+                .unwrap_or(false);
+            if let Some(dialog) = existing {
+                if same_dialog && dialog.cseq == incoming_cseq {
+                    // Retransmission of the INVITE that established this
+                    // dialog: the 200 OK was lost. RFC 3261 §13.3.1.4 —
+                    // re-send the SAME 200 OK, never 486 (issue #18: the
+                    // platform aborts the session on 486 and the stream
+                    // deadlocks until a dialog reset).
+                    eprintln!(
+                        "gb28181: INVITE retransmission for dialog {} — re-sending cached 200 OK",
+                        dialog.call_id
+                    );
+                    if let Some(resp) = dialog.invite_response.clone() {
+                        self.send_sip_message(&resp, peer_addr).await?;
+                    }
+                    return Ok(());
                 }
-                if let Some(task) = self.media_task.take() {
-                    task.abort();
+                if same_dialog {
+                    eprintln!(
+                        "gb28181: re-INVITE on dialog {} (CSeq {} → {}) — recycling media session",
+                        dialog.call_id, dialog.cseq, incoming_cseq
+                    );
+                } else {
+                    // Different Call-ID = a NEW dialog (platform restarted and
+                    // lost the old one, or the previous BYE never reached us).
+                    // Recycling the stale session instead of 486-ing forever
+                    // (issue #6).
+                    eprintln!(
+                        "gb28181: INVITE for new dialog {} — recycling stale session {}",
+                        invite_info.call_id, dialog.call_id
+                    );
                 }
-                self.media_socket = None;
-                self.media_tcp_conn = None;
-                self.invite_info = None;
-                self.playback_ctl = None;
             } else {
-                eprintln!("gb28181: ignoring INVITE retransmission - media already active");
-                // Send 486 Busy Here
-                let busy_response = build_error_response(msg, 486, "Busy Here");
-                self.send_sip_message(&busy_response, peer_addr).await?;
-                return Ok(());
+                eprintln!(
+                    "gb28181: INVITE with no dialog tracked — recycling orphaned media session"
+                );
             }
+            if let Some(subscriber_id) = self.subscriber_id.take() {
+                self.au_hub.unsubscribe(subscriber_id);
+            }
+            if let Some(task) = self.media_task.take() {
+                task.abort();
+            }
+            self.media_socket = None;
+            self.media_tcp_conn = None;
+            self.invite_info = None;
+            self.playback_ctl = None;
         }
 
         println!(
@@ -790,10 +840,11 @@ impl Gb28181Server {
         let call_id = msg.get_header("Call-ID").unwrap_or("unknown").to_string();
 
         self.invite_info = Some(InviteDialog {
-            _call_id: call_id.clone(),
+            call_id: call_id.clone(),
             _remote_tag: remote_tag,
             _local_tag: local_tag,
-            _cseq: cseq,
+            cseq,
+            invite_response: Some(response),
             _remote_addr: peer_addr,
             _ssrc: invite_info.ssrc,
             _media_addr: invite_info.media_address,
@@ -890,7 +941,7 @@ impl Gb28181Server {
         let matches_dialog = self
             .invite_info
             .as_ref()
-            .map(|d| d._call_id == call_id)
+            .map(|d| d.call_id == call_id)
             .unwrap_or(false);
         if self.media_task.is_none() || !matches_dialog {
             eprintln!(
@@ -1051,6 +1102,12 @@ impl Gb28181Server {
             .map_err(|e| anyhow::anyhow!("gb28181: invalid UTF-8: {e}"))?;
         SipMessage::parse(data_str).context("gb28181: parse failed")
     }
+}
+
+/// Registration refresh deadline: half the negotiated expiry, never below 1s
+/// (RFC 3261 §10.2 — clients commonly refresh at 50% of the expiry window).
+fn registration_refresh_interval_secs(expires_secs: u64) -> u64 {
+    (expires_secs / 2).max(1)
 }
 
 /// Build a device SDP answer for INVITE response.
@@ -1984,6 +2041,151 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         resp.body
     );
 }
+
+/// Helper: a live-session server wired to a bound SIP socket + peer socket.
+#[cfg(test)]
+async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
+    let config = Gb28181Config {
+        enabled: true,
+        platform_sip_address: "127.0.0.1".to_string(),
+        platform_sip_port: 5060,
+        device_id: "34020000001320000001".to_string(),
+        channel_id: "34020000001320000001".to_string(),
+        sip_domain: "3402000000".to_string(),
+        password: "12345678".to_string(),
+        local_sip_port: 5060,
+        register_interval_secs: 60,
+        heartbeat_interval_secs: 60,
+        heartbeat_timeout_count: 3,
+        transport: Transport::Udp,
+    };
+    let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+    let server = Gb28181Server {
+        config,
+        au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        sip_socket,
+        tcp_conn: None,
+        media_socket: None,
+        media_tcp_conn: None,
+        media_task: None,
+        subscriber_id: None,
+        invite_info: None,
+        local_ip: "192.168.62.104".to_string(),
+        recording_index: None,
+        playback_ctl: None,
+    };
+    let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+    let peer_addr = peer.local_addr().expect("peer addr");
+    (server, peer, peer_addr)
+}
+
+#[cfg(test)]
+fn live_invite_msg(call_id: &str, cseq: u32, media_port: u16) -> SipMessage {
+    let body = format!(
+        "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video {media_port} RTP/AVP 96\r\ny=12345\r\n"
+    );
+    SipMessage {
+        start_line: "INVITE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+        method: Some(SipMethod::Invite),
+        status_code: None,
+        uri: Some("sip:34020000001320000001@3402000000".to_string()),
+        version: "SIP/2.0".to_string(),
+        headers: vec![
+            ("Call-ID".to_string(), call_id.to_string()),
+            (
+                "From".to_string(),
+                "<sip:34020000002000000001@3402000000>;tag=plat".to_string(),
+            ),
+            (
+                "To".to_string(),
+                "<sip:34020000001320000001@3402000000>".to_string(),
+            ),
+            ("CSeq".to_string(), format!("{cseq} INVITE")),
+            (
+                "Via".to_string(),
+                "SIP/2.0/UDP 192.168.63.197:5060;branch=z9hG4bKtest".to_string(),
+            ),
+        ],
+        body,
+    }
+}
+
+#[cfg(test)]
+async fn recv_sip(peer: &UdpSocket) -> SipMessage {
+    let mut buf = vec![0u8; 65535];
+    let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+        .await
+        .expect("timed out waiting for SIP response")
+        .expect("recv failed");
+    SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8")).expect("parse response")
+}
+
+/// Issue #18 regression: a retransmitted INVITE (same Call-ID, same CSeq —
+/// the platform never saw the 200 OK) must be answered with the SAME 200 OK
+/// again, not 486. RFC 3261 §13.3.1.4.
+#[tokio::test]
+async fn test_invite_retransmission_resends_cached_200() {
+    let (mut server, peer, peer_addr) = live_invite_server().await;
+    let invite = live_invite_msg("retrans-1", 1, 30000);
+    server
+        .handle_invite(&invite, peer_addr)
+        .await
+        .expect("first INVITE");
+    let first = recv_sip(&peer).await;
+    assert!(first.start_line.contains("200"), "got {}", first.start_line);
+
+    // Retransmission of the same transaction.
+    server
+        .handle_invite(&invite, peer_addr)
+        .await
+        .expect("retransmitted INVITE");
+    let second = recv_sip(&peer).await;
+    assert!(
+        second.start_line.contains("200"),
+        "retransmission must re-receive 200 OK, got {}",
+        second.start_line
+    );
+    // Same dialog → same local To tag.
+    let tag_of = |m: &SipMessage| {
+        m.get_header("To")
+            .and_then(|t| t.split("tag=").nth(1).map(|s| s.to_string()))
+    };
+    assert_eq!(tag_of(&first), tag_of(&second), "To tag must be stable");
+}
+
+/// A same-dialog re-INVITE (same Call-ID, NEW CSeq — e.g. the platform
+/// re-negotiating the media port) must be answered 200 with fresh SDP, not
+/// rejected 486 (issue #18 family).
+#[tokio::test]
+async fn test_reinvite_new_cseq_recycles_session_and_answers_200() {
+    let (mut server, peer, peer_addr) = live_invite_server().await;
+    server
+        .handle_invite(&live_invite_msg("reinvite-1", 1, 30000), peer_addr)
+        .await
+        .expect("initial INVITE");
+    assert!(recv_sip(&peer).await.start_line.contains("200"));
+
+    server
+        .handle_invite(&live_invite_msg("reinvite-1", 2, 30001), peer_addr)
+        .await
+        .expect("re-INVITE");
+    let resp = recv_sip(&peer).await;
+    assert!(
+        resp.start_line.contains("200"),
+        "re-INVITE must get 200 OK, got {}",
+        resp.start_line
+    );
+}
+
+/// Issue #19: the registration refresh deadline is half the negotiated
+/// expires so a platform restart recovers without keepalive-timeout delay.
+#[test]
+fn test_registration_refresh_interval_is_half_of_expires() {
+    assert_eq!(registration_refresh_interval_secs(60), 30);
+    assert_eq!(registration_refresh_interval_secs(3600), 1800);
+    assert_eq!(registration_refresh_interval_secs(1), 1, "never below 1s");
+}
+
 /// A live (or no) session receiving SIP INFO PlaybackControl must get a
 /// 200 OK and no crash — the control is a logged no-op.
 #[tokio::test]
