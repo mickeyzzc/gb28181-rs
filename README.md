@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-104%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-107%20passing-brightgreen.svg)
 
 GB/T 28181-2016/2022 **device-side (UAC)** library for Rust — register a camera or media source with a GB28181 SIP platform and stream to it.
 
@@ -26,7 +26,7 @@ Not included (by design): platform/UAS role, SIP over TLS/WebSocket.
 
 ```toml
 [dependencies]
-gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.4.0" }
+gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.5.0" }
 ```
 
 The crate is transport- and storage-agnostic. Your host injects two seams:
@@ -85,7 +85,7 @@ cargo run --example device_demo
 
 ## Development
 
-This project follows strict **TDD** — see [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `rustfmt`, `clippy -D warnings` (which also compiles the examples), and the full test suite (104 tests); `main` is protected (PR-only merges, CI required).
+This project follows strict **TDD** — see [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `rustfmt`, `clippy -D warnings` (which also compiles the examples), and the full test suite (107 tests); `main` is protected (PR-only merges, CI required).
 
 ## Status
 
