@@ -90,8 +90,10 @@ fn synth_au(frame_no: u64) -> AccessUnit {
 }
 
 async fn produce_frames(hub: Arc<MockFrameHub>) {
-    for frame_no in 0.. {
+    let mut frame_no: u64 = 0;
+    loop {
         hub.write(synth_au(frame_no));
+        frame_no = frame_no.wrapping_add(1);
         tokio::time::sleep(Duration::from_millis(40)).await; // 25 fps
     }
 }
