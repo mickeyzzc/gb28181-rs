@@ -78,9 +78,18 @@ cargo run --example ps_mux
 # 设备服务端、查询目录、INVITE 拉流、把 RTP/PS 还原为 NAL 单元、BYE 挂断
 # —— 摘要应答在平台侧重新计算并校验。全部通过后以 0 退出。
 cargo run --example device_demo
+
+# 录像回放：RecordInfo 查询、按 PTS 节奏的回放 INVITE（s=Playback、
+# t=<起> <止>）、RTP/PS 还原、PlaybackControl 暂停 / 恢复（2 倍速）、BYE
+# —— 录像文件为合成的 Annex-B + PTS 边车分片。
+cargo run --example playback_demo
+
+# 离线消息层：设备编号格式/解析往返、保活 Notify 构建与解析、
+# RecordInfo/DeviceInfo 应答、国标时间串。
+cargo run --example manscdp_demo
 ```
 
-`device_demo` 兼作整机冒烟测试（REGISTER + 401 摘要、目录、INVITE/ACK、RTP/PS 媒体、BYE），无需任何硬件。
+`device_demo` 兼作整机冒烟测试（REGISTER + 401 摘要、目录、INVITE/ACK、RTP/PS 媒体、BYE），无需任何硬件。`playback_demo` 端到端覆盖录像媒体路径（全程断言），`manscdp_demo` 覆盖纯消息层 —— 无 socket、无需硬件。
 
 ## 开发
 
