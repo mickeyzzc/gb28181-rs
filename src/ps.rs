@@ -430,6 +430,13 @@ pub fn build_ps_pack_header(scr: u64, mux_rate: u32) -> Vec<u8> {
 ///
 /// Reference: ISO/IEC 13818-1 §2.5.3.5
 pub fn build_program_stream_map() -> Vec<u8> {
+    build_program_stream_map_for(STREAM_TYPE_H264)
+}
+
+/// Build a Program Stream Map declaring the given elementary-stream type.
+/// `STREAM_TYPE_H264` (0x1B) keeps the historical wire bytes; H.265 devices
+/// declare `STREAM_TYPE_H265` (0x24, GB/T 28181-2022).
+pub fn build_program_stream_map_for(stream_type: u8) -> Vec<u8> {
     let mut psm = vec![0x00, 0x00, 0x01, 0xBB]; // program_stream_map_start_code
 
     // Length = bytes after the length field: version(1) + program_stream_info_length(2)
@@ -446,7 +453,7 @@ pub fn build_program_stream_map() -> Vec<u8> {
     psm.extend_from_slice(&4u16.to_be_bytes());
 
     // Stream entry: H.264 video
-    psm.push(0x1B); // stream_type: H.264 (MPEG-4 AVC)
+    psm.push(stream_type); // stream_type: H.264 (0x1B) / H.265 (0x24)
     psm.push(0xE0); // elementary_stream_id: video
     psm.extend_from_slice(&0x00u16.to_be_bytes()); // es_info_length = 0
 
@@ -566,6 +573,11 @@ pub fn build_pes_packet(
 /// access unit across its PES packets. 65000 leaves headroom below the cap.
 pub const MAX_PES_CHUNK_BYTES: usize = 65000;
 
+/// PSM stream_type for H.264 (MPEG-4 AVC) elementary video.
+pub const STREAM_TYPE_H264: u8 = 0x1B;
+/// PSM stream_type for H.265 (HEVC) elementary video (GB/T 28181-2022).
+pub const STREAM_TYPE_H265: u8 = 0x24;
+
 /// Multiplex H.264 NAL units into an MPEG-PS packet.
 ///
 /// Returns a complete PS pack including pack header, optional PSM, and PES packet.
@@ -585,6 +597,26 @@ pub const MAX_PES_CHUNK_BYTES: usize = 65000;
 ///   MAX_PES_CHUNK_BYTES) carry none — the ES is continuous across the
 ///   PES packets of one access unit.
 pub fn mux_h264_to_ps(nalus: &[&[u8]], is_key_frame: bool, pts: u64, dts: u64) -> Vec<u8> {
+    mux_nalus_to_ps(nalus, is_key_frame, pts, dts, STREAM_TYPE_H264)
+}
+
+/// Multiplex H.265 NAL units into an MPEG-PS packet (issue #7).
+///
+/// Identical framing to [`mux_h264_to_ps`] — Annex-B start-code
+/// concatenation, bounded PES splitting, PTS/DTS on the first PES only —
+/// with the PSM declaring stream_type 0x24 (GB/T 28181-2022). RTP packaging
+/// (PS-over-RTP, PT=96) is codec-agnostic and reused as-is.
+pub fn mux_h265_to_ps(nalus: &[&[u8]], is_key_frame: bool, pts: u64, dts: u64) -> Vec<u8> {
+    mux_nalus_to_ps(nalus, is_key_frame, pts, dts, STREAM_TYPE_H265)
+}
+
+fn mux_nalus_to_ps(
+    nalus: &[&[u8]],
+    is_key_frame: bool,
+    pts: u64,
+    dts: u64,
+    stream_type: u8,
+) -> Vec<u8> {
     let mut ps = Vec::new();
 
     // Add pack header
@@ -595,7 +627,7 @@ pub fn mux_h264_to_ps(nalus: &[&[u8]], is_key_frame: bool, pts: u64, dts: u64) -
 
     // Add PSM on keyframes only
     if is_key_frame {
-        ps.extend_from_slice(&build_program_stream_map());
+        ps.extend_from_slice(&build_program_stream_map_for(stream_type));
     }
 
     // Concatenate NAL units with Annex-B start codes
@@ -860,6 +892,73 @@ mod tests {
             &ps_data[second.offset + 9..second.offset + 9 + 4],
             &idr[64_996..65_000]
         );
+    }
+
+    /// H.265 PSM must declare stream_type 0x24 (GB/T 28181-2022); the H.264
+    /// builder keeps 0x1B (issue #7).
+    #[test]
+    fn test_h265_psm_declares_stream_type_0x24() {
+        let psm = build_program_stream_map_for(STREAM_TYPE_H265);
+        let stream_type_pos = 4 + 2 + 1 + 2 + 2;
+        assert_eq!(psm[stream_type_pos], 0x24);
+        assert_eq!(psm[3], 0xBB, "PSM start code unchanged");
+
+        let h264 = build_program_stream_map();
+        assert_eq!(h264[stream_type_pos], 0x1B, "H.264 PSM contract unchanged");
+        assert_eq!(h264.len(), psm.len());
+    }
+
+    /// mux_h265_to_ps carries VPS/SPS/PPS/IDR NALs with the same PES framing
+    /// as H.264: balanced bounded lengths, PSM on keyframes only, and the
+    /// >64KB split (issue #7).
+    #[test]
+    fn test_mux_h265_to_ps_framing() {
+        // H.265 NAL headers are 2 bytes; types VPS=32, SPS=33, PPS=34, IDR=19.
+        let vps: Vec<u8> = vec![0x40, 0x01, 0x01, 0x01, 0xFF];
+        let sps: Vec<u8> = vec![0x42, 0x01, 0x01, 0x01, 0x01, 0x90];
+        let pps: Vec<u8> = vec![0x44, 0x01, 0xC0, 0xF5];
+        let idr: Vec<u8> = vec![0x26, 0x01, 0xAF, 0x0E];
+
+        let ps = mux_h265_to_ps(&[&vps, &sps, &pps, &idr], true, 90_000, 90_000);
+        // PSM present on keyframe with 0x24
+        let psm_at = ps
+            .windows(4)
+            .position(|w| w == [0x00, 0x00, 0x01, 0xBB])
+            .expect("PSM on keyframe");
+        assert_eq!(ps[psm_at + 11], 0x24);
+
+        // P-frame: no PSM
+        let ps_p = mux_h265_to_ps(&[&idr], false, 180_000, 180_000);
+        assert!(!ps_p.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xBB]));
+
+        // PES lengths balanced (strict walk over both muxes)
+        for data in [&ps, &ps_p] {
+            for p in walk_pes_packets(data) {
+                assert!(p.declared <= p.actual, "H.265 PES over-declares");
+            }
+        }
+    }
+
+    #[test]
+    fn test_mux_h265_large_au_splits() {
+        let mut idr = vec![0x26u8, 0x01];
+        idr.extend(lcg_fill(199_998)); // 200000-byte ES → 4 PES chunks
+        let nalus: Vec<&[u8]> = vec![&idr];
+        let ps = mux_h265_to_ps(&nalus, true, 90_000, 90_000);
+        let pkts = walk_pes_packets(&ps);
+        assert_eq!(
+            pkts.len(),
+            4,
+            "H.265 AUs split across bounded PES like H.264"
+        );
+        for (i, p) in pkts.iter().enumerate() {
+            assert_eq!(p.declared, p.actual, "PES {i} balanced");
+            if i == 0 {
+                assert!(p.has_ts);
+            } else {
+                assert!(!p.has_ts);
+            }
+        }
     }
 
     /// The issue #11 wire contract end to end: walking the muxed burst by
