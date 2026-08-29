@@ -1,6 +1,6 @@
 [package]
 name = "gb28181-rs"
-version = "0.1.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.80"
 description = "GB/T 28181-2016/2022 device-side (UAC) library for Rust: SIP signaling, MANSCDP XML, RTP/PS media push, playback"

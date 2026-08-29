@@ -85,3 +85,80 @@ impl RtpPusher {
         self.timestamp = self.timestamp.wrapping_add(increment);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn dest() -> SocketAddr {
+        "127.0.0.1:30000".parse().unwrap()
+    }
+
+    #[test]
+    fn h264_payload_type_is_96() {
+        assert_eq!(H264_PAYLOAD_TYPE, 96);
+    }
+
+    #[test]
+    fn header_matches_rfc3550_single_nal_golden() {
+        let mut pusher = RtpPusher::new(dest(), 0x1234_5678, 96);
+        let pkt = pusher.build_rtp_packet(&[0x67, 0x42, 0x00]);
+        // V=2 P=0 X=0 CC=0 | M=0 PT=96 | seq=0 | ts=0 | SSRC | NAL payload
+        assert_eq!(
+            &pkt[..12],
+            &[0x80, 0x60, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56, 0x78][..]
+        );
+        assert_eq!(&pkt[12..], &[0x67, 0x42, 0x00][..]);
+        assert_eq!(pkt.len(), 15);
+    }
+
+    #[test]
+    fn payload_type_is_masked_to_7_bits() {
+        // A payload type > 127 must not leak into the marker bit or the
+        // version byte.
+        let mut pusher = RtpPusher::new(dest(), 1, 0xFF);
+        let pkt = pusher.build_rtp_packet(&[0x65]);
+        assert_eq!(pkt[0], 0x80);
+        assert_eq!(pkt[1], 0x7F);
+    }
+
+    #[test]
+    fn sequence_number_increments_per_packet_and_wraps() {
+        let mut pusher = RtpPusher::new(dest(), 1, 96);
+        pusher.sequence_number = 0xFFFE;
+        let a = pusher.build_rtp_packet(&[0x61]);
+        let b = pusher.build_rtp_packet(&[0x61]);
+        let c = pusher.build_rtp_packet(&[0x61]);
+        assert_eq!(&a[2..4], &[0xFF, 0xFE][..]);
+        assert_eq!(&b[2..4], &[0xFF, 0xFF][..]);
+        // RFC 3550: the sequence number wraps back to 0, it does not stick.
+        assert_eq!(&c[2..4], &[0x00, 0x00][..]);
+    }
+
+    #[test]
+    fn timestamp_carried_in_header() {
+        let mut pusher = RtpPusher::new(dest(), 1, 96);
+        pusher.timestamp = 0x0102_0304;
+        let pkt = pusher.build_rtp_packet(&[0x61]);
+        assert_eq!(&pkt[4..8], &[0x01, 0x02, 0x03, 0x04][..]);
+    }
+
+    #[test]
+    fn increment_timestamp_wraps_at_32_bits() {
+        let mut pusher = RtpPusher::new(dest(), 1, 96);
+        pusher.timestamp = u32::MAX;
+        pusher.increment_timestamp(3000);
+        assert_eq!(pusher.timestamp, 2999);
+        pusher.increment_timestamp(1);
+        assert_eq!(pusher.timestamp, 3000);
+    }
+
+    #[test]
+    fn large_nal_payload_copied_intact() {
+        let nal: Vec<u8> = (0..70_000u32).map(|i| (i % 251) as u8).collect();
+        let mut pusher = RtpPusher::new(dest(), 7, 96);
+        let pkt = pusher.build_rtp_packet(&nal);
+        assert_eq!(pkt.len(), 12 + nal.len());
+        assert_eq!(&pkt[12..], &nal[..]);
+    }
+}

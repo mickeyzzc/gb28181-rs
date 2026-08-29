@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-67%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-104%20passing-brightgreen.svg)
 
 **GB/T 28181-2016/2022 设备端（UAC）Rust 库** —— 让摄像头或媒体源以国标方式注册到 SIP 平台并向其推流。
 
@@ -16,17 +16,17 @@
 - **SIP 信令** —— 手写 GB/T 28181 子集的解析/序列化（REGISTER + 摘要认证、INVITE、MESSAGE、BYE、ACK、OPTIONS），支持 UDP 与 TCP
 - **注册生命周期** —— 401 摘要挑战（MD5 + SHA-256，qop=auth）、周期性重注册、保活心跳与超时判定
 - **MANSCDP XML** —— Catalog / DeviceInfo / DeviceStatus / RecordInfo / Keepalive，元素与属性双形式，GB2312/GBK/GB18030/UTF-8 编码
-- **媒体推送** —— H.264 NALU → MPEG-2 PS → RTP（UDP + RTP over TCP 封帧），SSRC 处理
+- **媒体推送** —— H.264/H.265 NALU → MPEG-2 PS → RTP（UDP + RTP over TCP 封帧），SSRC 处理，大帧有界 PES 分片
 - **直播 + 回放 + 下载** —— INVITE 驱动的直播会话；RecordInfo 查询与按帧节奏的回放/下载，SIP INFO 回放控制（播放/暂停/倍速）
 - **参考录像段格式** —— 裸 Annex-B H.264 + 每帧 `.ts.jsonl` 时间戳 sidecar（见 [`segment`](src/segment.rs)）
 
-设计上不包含：平台端（UAS）角色、SIP over TLS/WebSocket、H.265 媒体（宿主侧扩展点）。
+设计上不包含：平台端（UAS）角色、SIP over TLS/WebSocket。
 
 ## 使用
 
 ```toml
 [dependencies]
-gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.2.0" }
+gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.4.0" }
 ```
 
 本 crate 与采集、存储实现解耦，宿主注入两个接缝：
@@ -65,13 +65,30 @@ async fn main() -> anyhow::Result<()> {
 
 测试可使用现成的 [`MockFrameHub`](src/mock.rs)（有界通道、满则丢弃语义的 `FrameSource` 实现）。
 
+## 示例
+
+[`examples/`](examples/) 提供可运行的演示：
+
+```sh
+# 离线字节级演示：H.264/H.265 封装为 PS、解析回读、超大帧 PES 分片，
+# 确定性输出，无需网络。
+cargo run --example ps_mux
+
+# 进程内完整互通演示：手写的假平台（SIP 服务端 + RTP 接收端）注册真实
+# 设备服务端、查询目录、INVITE 拉流、把 RTP/PS 还原为 NAL 单元、BYE 挂断
+# —— 摘要应答在平台侧重新计算并校验。全部通过后以 0 退出。
+cargo run --example device_demo
+```
+
+`device_demo` 兼作整机冒烟测试（REGISTER + 401 摘要、目录、INVITE/ACK、RTP/PS 媒体、BYE），无需任何硬件。
+
 ## 开发
 
-本项目严格执行 **TDD**，见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 强制 `rustfmt`、`clippy -D warnings` 与全量测试（67 个）；`main` 分支受保护（仅 PR 合入，CI 必过）。
+本项目严格执行 **TDD**，见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 强制 `rustfmt`、`clippy -D warnings`（同时编译 examples）与全量测试（104 个）；`main` 分支受保护（仅 PR 合入，CI 必过）。
 
 ## 状态
 
-v0.1.0 —— API 面（`FrameSource`、`RecordingSource`、配置）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 国标平台生产验证。
+v0.4.0 —— API 面（`FrameSource`、`RecordingSource`、配置）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 国标平台生产验证。
 
 ## 许可
 
