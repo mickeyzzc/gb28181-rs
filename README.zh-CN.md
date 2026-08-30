@@ -26,7 +26,8 @@
 
 ```toml
 [dependencies]
-gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.5.0" }
+gb28181-rs = "0.5.0"
+# git 替代方式: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.5.0" }
 ```
 
 本 crate 与采集、存储实现解耦，宿主注入两个接缝：
