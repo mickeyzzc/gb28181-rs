@@ -32,6 +32,15 @@ CI runs exactly these three gates on every push and PR.
 
 ---
 
+## Releasing
+
+1. Merge changes to `main` through a PR (CI must pass).
+2. Bump `version` in `Cargo.toml` (semver: patch for fixes, minor for features).
+3. Tag the release commit: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+   The `release` workflow verifies the tag matches `Cargo.toml`, sits on
+   `main`, runs the tests, and publishes to crates.io automatically.
+4. Consumers bump their dependency version at their own pace.
+
 ## 中文
 
 ## 开发模式：严格 TDD
@@ -61,3 +70,13 @@ cargo test
 ```
 
 CI 在每次 push 与 PR 上精确执行以上三道门。
+
+## 发布流程
+
+1. 变更通过 PR 合入 `main`（CI 必须通过）。
+2. 在 `Cargo.toml` 中提升 `version`（语义化：修复提 patch，功能提 minor）。
+3. 给发布提交打 tag：`git tag vX.Y.Z && git push origin vX.Y.Z`。
+   `release` workflow 会校验 tag 与 `Cargo.toml` 一致、位于 `main` 上，
+   跑完测试后自动发布到 crates.io。
+4. 消费方按自己的节奏升版本。
+
