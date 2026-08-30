@@ -29,5 +29,8 @@ jobs:
       - name: Tests
         run: cargo test --quiet
 
+      - name: Drop the test-generated Cargo.lock (lockless library)
+        run: rm -f Cargo.lock
+
       - name: Publish to crates.io
         run: cargo publish --token "${{ secrets.CARGO_REGISTRY_TOKEN }}"
