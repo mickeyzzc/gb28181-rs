@@ -79,9 +79,18 @@ cargo run --example ps_mux
 # live stream, demuxes RTP/PS back to NAL units, and BYEs — with the digest
 # response verified on the platform side. Exits 0 on success.
 cargo run --example device_demo
+
+# Recording playback: RecordInfo query, paced playback INVITE (s=Playback,
+# t=<start> <end>), RTP/PS reassembly, PlaybackControl PAUSE / PLAY (Speed 2),
+# BYE — against a synthetic Annex-B + PTS-sidecar segment.
+cargo run --example playback_demo
+
+# Offline message layer: device-ID format/parse round-trip, keepalive Notify
+# build+parse, RecordInfo/DeviceInfo responses, GB/T 28181 time strings.
+cargo run --example manscdp_demo
 ```
 
-`device_demo` doubles as an executable smoke test of the whole stack (REGISTER + 401 digest, catalog, INVITE/ACK, RTP/PS media, BYE) without any hardware.
+`device_demo` doubles as an executable smoke test of the whole stack (REGISTER + 401 digest, catalog, INVITE/ACK, RTP/PS media, BYE) without any hardware. `playback_demo` covers the recorded-media path end-to-end (asserted), and `manscdp_demo` the pure message layer — no sockets, no hardware.
 
 ## Development
 
