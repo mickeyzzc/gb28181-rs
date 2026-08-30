@@ -492,30 +492,55 @@ impl SdpSession {
 
 // ─── SIP Request Builders ───────────────────────────────────────────────────
 
+/// Random RFC 3261 Via branch: `z9hG4bK` + 8 lowercase hex chars.
+///
+/// The branch MUST be unique per transaction (RFC 3261 §8.1.1.7) — deriving
+/// it from the CSeq counter (the historical behavior) made branches
+/// predictable and colliding across restarts.
+pub fn random_branch() -> String {
+    format!("z9hG4bK{:08x}", rand::random::<u32>())
+}
+
+/// Random From/To tag: 8 lowercase hex chars.
+pub fn random_tag() -> String {
+    format!("{:08x}", rand::random::<u32>())
+}
+
 /// Build a SIP REGISTER request for device registration.
+///
+/// `local_port` is advertised in Via and Contact (it must be the port the
+/// device actually listens on — historically this was hardcoded to 5060,
+/// breaking devices bound to other ports). `from_tag` SHOULD be stable for
+/// the lifetime of the registration dialog (same Call-ID → same tag, RFC
+/// 3261 §10.2); [`SipDeviceClient`] generates and reuses one.
 #[allow(clippy::too_many_arguments)]
 pub fn build_register_request(
     local_id: &str,
     local_addr: &str,
+    local_port: u16,
     remote_id: &str,
     remote_domain: &str,
     expires: u32,
     auth_header: Option<&str>,
     call_id: &str,
     cseq: u32,
+    from_tag: &str,
+    user_agent: &str,
 ) -> SipMessage {
     let mut headers = Vec::new();
 
     headers.push((
         "Via".to_string(),
         format!(
-            "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK{}",
-            local_addr, 5060, cseq
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_addr,
+            local_port,
+            random_branch()
         ),
     ));
     headers.push((
         "From".to_string(),
-        format!("<sip:{}@{}>;tag={}", local_id, remote_domain, cseq),
+        format!("<sip:{}@{}>;tag={}", local_id, remote_domain, from_tag),
     ));
     headers.push((
         "To".to_string(),
@@ -525,10 +550,10 @@ pub fn build_register_request(
     headers.push(("CSeq".to_string(), format!("{} REGISTER", cseq)));
     headers.push((
         "Contact".to_string(),
-        format!("<sip:{}@{}:{}>", local_id, local_addr, 5060),
+        format!("<sip:{}@{}:{}>", local_id, local_addr, local_port),
     ));
     headers.push(("Max-Forwards".to_string(), "70".to_string()));
-    headers.push(("User-Agent".to_string(), "mibee-rec/0.1".to_string()));
+    headers.push(("User-Agent".to_string(), user_agent.to_string()));
     headers.push(("Expires".to_string(), expires.to_string()));
     headers.push(("Content-Length".to_string(), "0".to_string()));
 
@@ -548,25 +573,33 @@ pub fn build_register_request(
 }
 
 /// Build a SIP BYE request.
+///
+/// `local_port` is advertised in Via; `from_tag` is the tag used on the
+/// dialog's other requests (see [`build_register_request`]).
+#[allow(clippy::too_many_arguments)]
 pub fn build_bye_request(
     local_id: &str,
     local_addr: &str,
+    local_port: u16,
     remote_id: &str,
     remote_addr: &str,
     call_id: &str,
     cseq: u32,
+    from_tag: &str,
 ) -> SipMessage {
     let mut headers = Vec::new();
     headers.push((
         "Via".to_string(),
         format!(
-            "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK{}",
-            local_addr, 5060, cseq
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_addr,
+            local_port,
+            random_branch()
         ),
     ));
     headers.push((
         "From".to_string(),
-        format!("<sip:{}@{}>;tag={}", local_id, local_addr, cseq),
+        format!("<sip:{}@{}>;tag={}", local_id, local_addr, from_tag),
     ));
     headers.push((
         "To".to_string(),
@@ -832,13 +865,12 @@ fn digest_hex(algorithm: &str, data: &[u8]) -> String {
     }
 }
 
-/// Generate a client nonce: 16 lowercase hex chars derived from the current time.
+/// Generate a client nonce: 16 lowercase hex chars from the CSPRNG.
+///
+/// RFC 7616 §3.4: the cnonce SHOULD be unpredictable; the historical
+/// time-derived value was guessable across requests.
 fn generate_cnonce() -> String {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    format!("{:016x}", (nanos & 0xFFFF_FFFF_FFFF_FFFF) as u64)
+    format!("{:016x}", rand::random::<u64>())
 }
 
 #[cfg(test)]
@@ -914,5 +946,101 @@ mod tests {
         let method: SipMethod = "OPTIONS".parse().expect("OPTIONS should parse");
         assert_eq!(method, SipMethod::Options);
         assert_eq!(method.to_string(), "OPTIONS");
+    }
+
+    /// Regression: Via and Contact must advertise the port the device
+    /// actually listens on, not a hardcoded 5060.
+    #[test]
+    fn test_register_advertises_local_port() {
+        let msg = build_register_request(
+            "34020000001320000001",
+            "192.168.62.104",
+            15060,
+            "34020000002000000001",
+            "3402000000",
+            3600,
+            None,
+            "call-1",
+            1,
+            "deadbeef",
+            "gb28181-rs/0.6.0",
+        );
+        let via = msg.get_header("Via").expect("Via header");
+        assert!(
+            via.starts_with("SIP/2.0/UDP 192.168.62.104:15060;"),
+            "Via must carry the local port, got: {via}"
+        );
+        let contact = msg.get_header("Contact").expect("Contact header");
+        assert_eq!(contact, "<sip:34020000001320000001@192.168.62.104:15060>");
+    }
+
+    /// The User-Agent comes from the caller — no product identity baked in.
+    #[test]
+    fn test_register_user_agent_is_caller_supplied() {
+        let msg = build_register_request(
+            "34020000001320000001",
+            "192.168.62.104",
+            5060,
+            "34020000002000000001",
+            "3402000000",
+            3600,
+            None,
+            "call-1",
+            1,
+            "deadbeef",
+            "custom-agent/9.9",
+        );
+        assert_eq!(msg.get_header("User-Agent"), Some("custom-agent/9.9"));
+    }
+
+    /// Regression: Via branches must be random and unique, not cseq-derived
+    /// (`z9hG4bK{cseq}` collided across restarts and was predictable).
+    #[test]
+    fn test_via_branches_are_unique() {
+        let mut branches = std::collections::HashSet::new();
+        for _ in 0..64 {
+            branches.insert(random_branch());
+        }
+        assert_eq!(branches.len(), 64, "branches must not repeat");
+        for b in &branches {
+            assert!(b.starts_with("z9hG4bK"), "magic cookie prefix: {b}");
+            assert_eq!(b.len(), 8 + 7, "branch length: {b}");
+        }
+    }
+
+    /// BYE also carries the local port and a random branch.
+    #[test]
+    fn test_bye_advertises_local_port() {
+        let msg = build_bye_request(
+            "34020000001320000001",
+            "192.168.62.104",
+            15060,
+            "34020000002000000001",
+            "192.168.63.197:5060",
+            "call-1",
+            7,
+            "cafe",
+        );
+        assert!(msg
+            .get_header("Via")
+            .expect("Via")
+            .starts_with("SIP/2.0/UDP 192.168.62.104:15060;"));
+        assert!(msg.get_header("From").expect("From").ends_with(";tag=cafe"));
+    }
+
+    /// Digest cnonce values must be unpredictable and unique.
+    #[test]
+    fn test_cnonce_is_random() {
+        let auth1 = build_digest_auth("u", "r", "p", "n", "sip:x", "REGISTER", "MD5", Some("auth"));
+        let auth2 = build_digest_auth("u", "r", "p", "n", "sip:x", "REGISTER", "MD5", Some("auth"));
+        let cn = |a: &str| {
+            a.split("cnonce=\"")
+                .nth(1)
+                .and_then(|s| s.split('"').next())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert_ne!(cn(&auth1), cn(&auth2), "cnonce must vary per request");
+        assert_eq!(cn(&auth1).len(), 16);
     }
 }

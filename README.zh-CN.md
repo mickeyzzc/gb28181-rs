@@ -5,18 +5,18 @@
 [![CI](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-107%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen.svg)
 
 **GB/T 28181-2016/2022 设备端（UAC）Rust 库** —— 让摄像头或媒体源以国标方式注册到 SIP 平台并向其推流。
 
-手写 SIP（不依赖任何 SIP 框架）、MANSCDP XML 编解码、RTP/PS 媒体推送，以及完整的设备服务端：直播、回放、下载。代码从 [mibee-eye-raspi-rs](https://github.com/Mi-Bee-Studio) 的生产实现逐字抽取，经真实国标平台打磨（摘要认证 URI 匹配、Via branch 唯一性、本机 IP 探测、MANSCDP 属性/元素双形式、TCP 传输、回放控制）。
+手写 SIP（不依赖任何 SIP 框架）、MANSCDP XML 编解码、RTP/PS 媒体推送，以及完整的设备服务端：直播、回放、下载。代码从 [mibee-eye-raspi-rs](https://github.com/Mi-Bee-Studio) 的生产实现抽取，经真实国标平台打磨（摘要认证 URI 匹配、Via branch 唯一性、本机 IP 探测、MANSCDP 属性/元素双形式、TCP 传输、回放控制）。
 
 ## 功能
 
 - **SIP 信令** —— 手写 GB/T 28181 子集的解析/序列化（REGISTER + 摘要认证、INVITE、MESSAGE、BYE、ACK、OPTIONS），支持 UDP 与 TCP
 - **注册生命周期** —— 401 摘要挑战（MD5 + SHA-256，qop=auth）、周期性重注册、保活心跳与超时判定
-- **MANSCDP XML** —— Catalog / DeviceInfo / DeviceStatus / RecordInfo / Keepalive，元素与属性双形式，GB2312/GBK/GB18030/UTF-8 编码
-- **媒体推送** —— H.264/H.265 NALU → MPEG-2 PS → RTP（UDP + RTP over TCP 封帧），SSRC 处理，大帧有界 PES 分片
+- **MANSCDP XML** —— Catalog / DeviceInfo / DeviceStatus / RecordInfo / Keepalive，元素与属性双形式；入站报文接受 UTF-8 **或** GB2312/GBK/GB18030，出站声明 GB2312 的报文按声明正确编码
+- **媒体推送** —— H.264/H.265 NALU → MPEG-2 PS → RTP（UDP + RTP over TCP 封帧），SSRC 处理，大帧有界 PES 分片；RTP 时间戳取自真实采集时间（任意帧率）
 - **直播 + 回放 + 下载** —— INVITE 驱动的直播会话；RecordInfo 查询与按帧节奏的回放/下载，SIP INFO 回放控制（播放/暂停/倍速）
 - **参考录像段格式** —— 裸 Annex-B H.264 + 每帧 `.ts.jsonl` 时间戳 sidecar（见 [`segment`](src/segment.rs)）
 
@@ -26,8 +26,8 @@
 
 ```toml
 [dependencies]
-gb28181-rs = "0.5.0"
-# git 替代方式: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.5.0" }
+gb28181-rs = "0.6.0"
+# git 替代方式: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.6.0" }
 ```
 
 本 crate 与采集、存储实现解耦，宿主注入两个接缝：
@@ -49,22 +49,66 @@ impl RecordingSource for MyRecordings {
     fn lookup(&self, start_ms: u64, end_ms: u64) -> Vec<SegmentMeta> { /* ... */ }
 }
 
-// 3) 启动设备服务端。
+// 3) 启动设备服务端。停机是优雅的：收发循环、保活任务与进行中的
+//    媒体任务都会停止。
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let config: Gb28181Config = toml::from_str(&std::fs::read_to_string("config.toml")?)?;
-    let server = Gb28181Server::start(
+    let mut config: Gb28181Config = toml::from_str(&std::fs::read_to_string("config.toml")?)?;
+    // 身份标识由宿主配置、默认中性（见下）。
+    config.user_agent = Some("my-host/1.0 (gb28181-rs)".to_string());
+
+    let mut server = Gb28181Server::start(
         config,
         std::sync::Arc::new(MyFrameHub { /* ... */ }),
         Some(std::sync::Arc::new(MyRecordings { /* ... */ })),
     ).await?;
-    server.await
+    // ... 运行你的应用；退出时：
+    server.shutdown().await
 }
 ```
 
 本地录像运行期间调用 `set_record_active(true)`，DeviceStatus 会回报 `<Record>ON</Record>`。
 
+本 crate 通过标准 [`log`](https://crates.io/crates/log) facade 输出日志 —— 宿主需初始化一个 logger（`env_logger`、`tracing` 等）才能看到输出；不初始化则库保持静默。
+
 测试可使用现成的 [`MockFrameHub`](src/mock.rs)（有界通道、满则丢弃语义的 `FrameSource` 实现）。
+
+### 配置
+
+`Gb28181Config` 对 serde 友好（TOML/JSON），可直接重导出到宿主自己的配置结构体。连接类默认值沿用国标示例值（`platform_sip_address = 192.168.1.1`、`device_id = 34020000001320000001`、`password = 12345678`、端口 5060）—— **生产环境务必显式设置**；示例默认值仍生效时，服务端启动会输出警告日志。
+
+身份字段（均可选、默认中性 —— 本库绝不在线上协议中替你宣传任何产品/厂商名）：
+
+| 字段 | 默认值 | 用途 |
+|---|---|---|
+| `user_agent` | `gb28181-rs/<版本>` | REGISTER 的 SIP `User-Agent` |
+| `device_name` | `Camera <device_id>` | Catalog/DeviceInfo 的 `Name` |
+| `manufacturer` | `Unknown` | Catalog/DeviceInfo 的 `Manufacturer` |
+| `model` | `Unknown` | Catalog/DeviceInfo 的 `Model` |
+| `firmware` | crate 版本号 | DeviceInfo 的 `Firmware` |
+
+`enabled` 是宿主侧开关 —— 本库从不读取它，由宿主决定是否调用 `start()`。
+
+## 库卫生（v0.6.0 加固）
+
+v0.6.0 把本 crate 打磨为可放心嵌入的中性基础库。[`tests/library_hygiene.rs`](tests/library_hygiene.rs) 中的回归测试逐条锁定以下保证：
+
+- **消费方不可触达 panic** —— 构造函数不做 I/O、绝不 panic；`format_device_id` 返回 `Result`。
+- **无硬编码 SIP 端口** —— REGISTER/BYE 的 Via 与 Contact 宣告配置的 `local_sip_port`（此前写死 5060）。
+- **字符集正确的 MANSCDP** —— 入站 GB2312/GBK/GB18030 报文正常解码（此前被直接丢弃）；出站声明 GB2312 的报文按声明编码（ASCII 输出与旧版逐字节一致，wire golden 契约不变）。
+- **XML 转义** —— 宿主提供的字符串（名称、路径）插值前转义。
+- **随机且唯一的 SIP 标识** —— Via branch、From/To tag、摘要 `cnonce` 均来自 CSPRNG，不再用计数器/时钟推导。
+- **`log` facade** —— 库代码零 `println!`/`eprintln!`。
+- **优雅停机** —— `ServerHandle::shutdown()` 停止运行循环、保活与媒体任务。
+- **库代码零品牌、零实验室地址**（配置示例默认值除外，启动时告警）。
+
+### 0.5.x → 0.6.0 破坏性变更
+
+- `Gb28181Server::start` 返回 `ServerHandle`（原来是 `JoinHandle<()>`）；`handle.await` 依然可用，新增 `handle.shutdown().await`。
+- `build_register_request` / `build_bye_request` 增加 `local_port` 参数（REGISTER 另有 `from_tag`/`user_agent`）。
+- `format_device_id` 返回 `Result<String>`（原来遇错 panic）。
+- Catalog/DeviceInfo 身份默认值由厂商字符串改为中性值 —— 需要原值请设置上述配置字段。
+- 库输出从 stdout/stderr 迁移到 `log` facade。
 
 ## 示例
 
@@ -94,11 +138,11 @@ cargo run --example manscdp_demo
 
 ## 开发
 
-本项目严格执行 **TDD**，见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 强制 `rustfmt`、`clippy -D warnings`（同时编译 examples）与全量测试（107 个）；`main` 分支受保护（仅 PR 合入，CI 必过）。
+本项目严格执行 **TDD**，见 [CONTRIBUTING.md](CONTRIBUTING.md)。CI 强制 `rustfmt`、`clippy -D warnings`（同时编译 examples）与全量测试（133 个）；`main` 分支受保护（仅 PR 合入，CI 必过）。
 
 ## 状态
 
-v0.5.0 —— API 面（`FrameSource`、`RecordingSource`、配置）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 国标平台生产验证。
+v0.6.0 —— API 面（`FrameSource`、`RecordingSource`、配置）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 国标平台生产验证。
 
 ## 许可
 

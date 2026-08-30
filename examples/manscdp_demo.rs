@@ -40,7 +40,7 @@ fn main() -> Result<()> {
     println!("== gb28181-rs MANSCDP + device-ID demo (offline) ==\n");
 
     // -- 1. Device IDs ------------------------------------------------------
-    let id = format_device_id("34020000", 0, 132, 1);
+    let id = format_device_id("34020000", 0, 132, 1).context("format device id")?;
     if id != DEVICE_ID {
         bail!("format_device_id produced {id}, want {DEVICE_ID}");
     }

@@ -478,6 +478,7 @@ async fn main() -> Result<()> {
         heartbeat_interval_secs: 3600,
         heartbeat_timeout_count: 3,
         transport: Transport::Udp,
+        ..Gb28181Config::default()
     };
 
     let hub = Arc::new(MockFrameHub::new());

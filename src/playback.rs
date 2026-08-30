@@ -143,7 +143,7 @@ fn build_frames(
         let aus = match read_segment(&path) {
             Ok(aus) => aus,
             Err(e) => {
-                eprintln!(
+                log::error!(
                     "gb28181: playback: failed to read segment {}: {e}",
                     path.display()
                 );
@@ -242,7 +242,7 @@ pub async fn run_playback_task(
     };
     let mut ctl_open = true;
 
-    println!("gb28181: playback task started for device {device_id} (paced={paced})");
+    log::info!("gb28181: playback task started for device {device_id} (paced={paced})");
 
     loop {
         if state.paused {
@@ -317,11 +317,11 @@ pub async fn run_playback_task(
                 let mut conn = conn.lock().await;
                 let frame = frame_rtp_over_tcp(&rtp_packet);
                 if let Err(e) = conn.write_all(&frame).await {
-                    eprintln!("gb28181: failed to send RTP packet over TCP: {e}");
+                    log::error!("gb28181: failed to send RTP packet over TCP: {e}");
                     return Ok(());
                 }
             } else if let Err(e) = media_socket.send_to(&rtp_packet, remote_addr).await {
-                eprintln!("gb28181: failed to send RTP packet: {e}");
+                log::error!("gb28181: failed to send RTP packet: {e}");
                 return Ok(());
             }
         }
@@ -329,7 +329,7 @@ pub async fn run_playback_task(
         state.idx += 1;
     }
 
-    println!("gb28181: playback task ended for device {device_id}");
+    log::info!("gb28181: playback task ended for device {device_id}");
     Ok(())
 }
 

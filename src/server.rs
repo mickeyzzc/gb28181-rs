@@ -15,7 +15,7 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 
 use crate::config::{Gb28181Config, Transport};
 use crate::frame::{AccessUnit, FrameSource};
@@ -36,6 +36,52 @@ const MAX_SIP_PACKET_SIZE: usize = 65535;
 // RTP payload type for PS (GB28181 standard)
 pub(super) const PS_PAYLOAD_TYPE: u8 = 96;
 
+/// Handle to a running GB28181 server.
+///
+/// Created by [`Gb28181Server::start`] / [`Gb28181Server::spawn`]. Await it
+/// (`handle.await`) to wait for the server task to finish, or call
+/// [`ServerHandle::shutdown`] for a graceful stop (the SIP recv/accept loop,
+/// the keepalive task, and any active media task all stop).
+#[derive(Debug)]
+pub struct ServerHandle {
+    task: tokio::task::JoinHandle<()>,
+    shutdown: watch::Sender<bool>,
+}
+
+impl ServerHandle {
+    /// Request a graceful shutdown and wait for the server task to finish.
+    ///
+    /// Stops the SIP recv/accept loop and the keepalive task, aborts any
+    /// active media/playback task, and unsubscribes from the frame source.
+    /// Sending a REGISTER with `Expires: 0` (SIP de-registration) is the
+    /// host's responsibility and NOT performed here.
+    pub async fn shutdown(&mut self) -> Result<()> {
+        // Ignore a send error: every receiver may already be dropped.
+        let _ = self.shutdown.send(true);
+        (&mut self.task)
+            .await
+            .context("gb28181: server task join failed")?;
+        Ok(())
+    }
+
+    /// Abort the server task immediately (tokio abort semantics — no cleanup
+    /// of active media tasks is guaranteed).
+    pub fn abort(&self) {
+        self.task.abort();
+    }
+}
+
+impl std::future::Future for ServerHandle {
+    type Output = ();
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        std::pin::Pin::new(&mut self.task).poll(cx).map(|_| ())
+    }
+}
+
 /// GB28181 SIP server.
 ///
 /// Manages the device's registration with a SIP platform and handles
@@ -45,8 +91,9 @@ pub struct Gb28181Server {
     config: Gb28181Config,
     /// Access unit hub for subscribing to H.264 frames
     au_hub: Arc<dyn FrameSource>,
-    /// SIP signaling socket (UDP only)
-    sip_socket: Arc<UdpSocket>,
+    /// SIP signaling socket (UDP; `None` until bound in `spawn`/`start` or
+    /// by the TCP connection handler)
+    sip_socket: Option<Arc<UdpSocket>>,
     /// TCP connection for SIP (when transport == Tcp)
     tcp_conn: Option<OwnedWriteHalf>,
     /// Media (RTP) socket (bound on INVITE)
@@ -94,11 +141,19 @@ struct InviteDialog {
 
 impl Gb28181Server {
     /// Create a new GB28181 server instance.
+    ///
+    /// The returned instance performs no I/O and never panics; it only
+    /// stores the configuration. Call [`Gb28181Server::spawn`] to bind the
+    /// SIP socket and run. Equivalent to
+    /// `with_recording_index(config, au_hub, None)`.
     pub fn new(config: Gb28181Config, au_hub: Arc<dyn FrameSource>) -> Self {
         Self::with_recording_index(config, au_hub, None)
     }
 
     /// Create a new GB28181 server with an optional recording index source.
+    ///
+    /// Like [`Gb28181Server::new`], this performs no I/O and never panics;
+    /// the SIP socket is bound later by [`Gb28181Server::spawn`].
     pub fn with_recording_index(
         config: Gb28181Config,
         au_hub: Arc<dyn FrameSource>,
@@ -107,7 +162,7 @@ impl Gb28181Server {
         Self {
             config,
             au_hub,
-            sip_socket: Arc::new(loopback_socket()), // Placeholder, will be rebound in start()
+            sip_socket: None,
             tcp_conn: None,
             media_socket: None,
             media_tcp_conn: None,
@@ -120,119 +175,135 @@ impl Gb28181Server {
         }
     }
 
-    /// Start the GB28181 server.
+    /// Bind the SIP socket and run this server (instance flavor of
+    /// [`Gb28181Server::start`]).
+    ///
+    /// Branches on `config.transport` exactly like `start`. Returns a
+    /// [`ServerHandle`] for graceful shutdown.
+    pub async fn spawn(self) -> Result<ServerHandle> {
+        match self.config.transport {
+            Transport::Udp => self.spawn_udp().await,
+            Transport::Tcp => self.spawn_tcp().await,
+        }
+    }
+
+    async fn spawn_udp(mut self) -> Result<ServerHandle> {
+        let sip_addr = format!("0.0.0.0:{}", self.config.local_sip_port);
+        let sip_socket = UdpSocket::bind(&sip_addr)
+            .await
+            .context(format!("gb28181: failed to bind SIP socket on {sip_addr}"))?;
+        self.sip_socket = Some(Arc::new(sip_socket));
+        self.run_bound().await
+    }
+
+    async fn spawn_tcp(self) -> Result<ServerHandle> {
+        let sip_addr = format!("0.0.0.0:{}", self.config.local_sip_port);
+        let listener = TcpListener::bind(&sip_addr).await.context(format!(
+            "gb28181: failed to bind TCP listener on {sip_addr}"
+        ))?;
+        self.run_tcp_bound(listener).await
+    }
+
+    /// Start the GB28181 server (associated-function flavor).
     ///
     /// Branches based on config.transport:
     /// - UDP (default): binds UDP socket, runs REGISTER lifecycle, enters recv loop
     /// - TCP: binds TCP listener, spawns per-connection handlers
     ///
-    /// Returns a JoinHandle that can be awaited to wait for server shutdown.
+    /// Returns a [`ServerHandle`] — await it for server exit, or call
+    /// `shutdown()` for a graceful stop.
     pub async fn start(
         config: Gb28181Config,
         au_hub: Arc<dyn FrameSource>,
         recording_index: Option<Arc<dyn RecordingSource>>,
-    ) -> Result<tokio::task::JoinHandle<()>> {
-        match config.transport {
-            Transport::Udp => Self::start_udp(config, au_hub, recording_index).await,
-            Transport::Tcp => Self::start_tcp(config, au_hub, recording_index).await,
-        }
+    ) -> Result<ServerHandle> {
+        Gb28181Server::with_recording_index(config, au_hub, recording_index)
+            .spawn()
+            .await
     }
 
-    /// Start UDP-based GB28181 server.
-    async fn start_udp(
-        config: Gb28181Config,
-        au_hub: Arc<dyn FrameSource>,
-        recording_index: Option<Arc<dyn RecordingSource>>,
-    ) -> Result<tokio::task::JoinHandle<()>> {
-        let sip_addr = format!("0.0.0.0:{}", config.local_sip_port);
-        let sip_socket = UdpSocket::bind(&sip_addr)
-            .await
-            .context(format!("gb28181: failed to bind SIP socket on {sip_addr}"))?;
-        let sip_socket = Arc::new(sip_socket);
+    /// Common post-bind path for UDP: warn on example defaults, spawn the
+    /// run task with a shutdown watch channel.
+    async fn run_bound(mut self) -> Result<ServerHandle> {
+        let local_sip_port = self.config.local_sip_port;
+        log::info!("gb28181: listening on SIP port {local_sip_port} (UDP)");
+        self.config.warn_on_example_defaults();
 
-        println!(
-            "gb28181: listening on SIP port {} (UDP)",
-            config.local_sip_port
-        );
-
-        let server = Gb28181Server {
-            config,
-            au_hub,
-            sip_socket,
-            tcp_conn: None,
-            media_socket: None,
-            media_tcp_conn: None,
-            media_task: None,
-            subscriber_id: None,
-            invite_info: None,
-            local_ip: String::new(),
-            recording_index,
-            playback_ctl: None,
-        };
-
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
-            if let Err(e) = server.run_udp().await {
-                eprintln!("gb28181: server error: {e}");
+            if let Err(e) = self.run_udp(&mut shutdown_rx).await {
+                log::error!("gb28181: server error: {e}");
             }
         });
 
-        Ok(handle)
+        Ok(ServerHandle {
+            task: handle,
+            shutdown: shutdown_tx,
+        })
     }
 
-    /// Start TCP-based GB28181 server.
-    async fn start_tcp(
-        config: Gb28181Config,
-        au_hub: Arc<dyn FrameSource>,
-        recording_index: Option<Arc<dyn RecordingSource>>,
-    ) -> Result<tokio::task::JoinHandle<()>> {
-        let sip_addr = format!("0.0.0.0:{}", config.local_sip_port);
-        let listener = TcpListener::bind(&sip_addr).await.context(format!(
-            "gb28181: failed to bind TCP listener on {sip_addr}"
-        ))?;
+    /// Common post-bind path for TCP.
+    async fn run_tcp_bound(self, listener: TcpListener) -> Result<ServerHandle> {
+        let local_sip_port = self.config.local_sip_port;
+        log::info!("gb28181: listening on SIP port {local_sip_port} (TCP)");
+        self.config.warn_on_example_defaults();
 
-        println!(
-            "gb28181: listening on SIP port {} (TCP)",
-            config.local_sip_port
-        );
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let au_hub = self.au_hub;
+        let config = self.config;
+        let recording_index = self.recording_index;
 
         let handle = tokio::spawn(async move {
             // Accept loop for TCP connections
             loop {
-                match listener.accept().await {
-                    Ok((conn, peer_addr)) => {
-                        let au_hub_clone = Arc::clone(&au_hub);
-                        let config_clone = config.clone();
-                        let rec_clone = recording_index.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = handle_tcp_connection(
-                                conn,
-                                peer_addr,
-                                au_hub_clone,
-                                config_clone,
-                                rec_clone,
-                            )
-                            .await
-                            {
-                                eprintln!(
-                                    "gb28181: TCP connection error from {}: {}",
-                                    peer_addr, e
-                                );
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        match accepted {
+                            Ok((conn, peer_addr)) => {
+                                let au_hub_clone = Arc::clone(&au_hub);
+                                let config_clone = config.clone();
+                                let rec_clone = recording_index.clone();
+                                let mut shutdown_conn = shutdown_rx.clone();
+                                tokio::spawn(async move {
+                                    if let Err(e) = handle_tcp_connection(
+                                        conn,
+                                        peer_addr,
+                                        au_hub_clone,
+                                        config_clone,
+                                        rec_clone,
+                                        &mut shutdown_conn,
+                                    )
+                                    .await
+                                    {
+                                        log::error!(
+                                            "gb28181: TCP connection error from {}: {}",
+                                            peer_addr, e
+                                        );
+                                    }
+                                });
                             }
-                        });
+                            Err(e) => {
+                                log::error!("gb28181: TCP accept error: {e}");
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        }
                     }
-                    Err(e) => {
-                        eprintln!("gb28181: TCP accept error: {}", e);
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    _ = shutdown_rx.changed() => {
+                        log::info!("gb28181: shutdown requested — closing TCP accept loop");
+                        break;
                     }
                 }
             }
         });
 
-        Ok(handle)
+        Ok(ServerHandle {
+            task: handle,
+            shutdown: shutdown_tx,
+        })
     }
 
     /// Main UDP server loop.
-    async fn run_udp(mut self) -> Result<()> {
+    async fn run_udp(&mut self, shutdown: &mut watch::Receiver<bool>) -> Result<()> {
         // Parse platform SIP address
         let platform_sip_addr: SocketAddr = format!(
             "{}:{}",
@@ -250,8 +321,12 @@ impl Gb28181Server {
         };
         self.local_ip = local_ip.clone();
         let local_sip_port = self.config.local_sip_port;
+        let sip_socket = self
+            .sip_socket
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("gb28181: SIP socket not bound"))?;
 
-        // Create SIP device client
+        // Create SIP device client (User-Agent from config; neutral default).
         let mut sip_client = SipDeviceClient::new(
             &self.config.device_id,
             platform_sip_addr,
@@ -260,45 +335,63 @@ impl Gb28181Server {
             &self.config.sip_domain,
             &self.config.password,
             self.config.register_interval_secs as u32,
-        );
+        )
+        .with_user_agent(&self.config.effective_user_agent());
 
-        // REGISTER lifecycle: retry with backoff, do NOT exit on failure
+        // REGISTER lifecycle: retry with backoff, do NOT exit on failure.
+        // Both the attempts and the backoff sleeps race against shutdown so
+        // a shutdown request is honored immediately during startup.
         let mut registered = false;
         const MAX_REG_ATTEMPTS: u32 = 3;
         const REG_BACKOFF_SECS: u64 = 10;
         for attempt in 1..=MAX_REG_ATTEMPTS {
-            match self
-                .perform_register(&mut sip_client, platform_sip_addr)
-                .await
-            {
-                Ok(()) => {
-                    registered = true;
-                    println!(
-                        "gb28181: registered with platform {} (attempt {}/{})",
-                        platform_sip_addr, attempt, MAX_REG_ATTEMPTS
-                    );
-                    break;
+            tokio::select! {
+                result = self.perform_register(&mut sip_client, platform_sip_addr) => {
+                    match result {
+                        Ok(()) => {
+                            registered = true;
+                            log::info!(
+                                "gb28181: registered with platform {} (attempt {}/{})",
+                                platform_sip_addr,
+                                attempt,
+                                MAX_REG_ATTEMPTS
+                            );
+                            break;
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "gb28181: registration attempt {}/{} failed: {e}",
+                                attempt,
+                                MAX_REG_ATTEMPTS
+                            );
+                        }
+                    }
                 }
-                Err(e) => {
-                    eprintln!(
-                        "gb28181: registration attempt {}/{} failed: {e}",
-                        attempt, MAX_REG_ATTEMPTS
-                    );
-                    if attempt < MAX_REG_ATTEMPTS {
-                        tokio::time::sleep(Duration::from_secs(REG_BACKOFF_SECS)).await;
+                _ = shutdown.changed() => {
+                    log::info!("gb28181: shutdown requested during registration — stopping");
+                    return Ok(());
+                }
+            }
+            if attempt < MAX_REG_ATTEMPTS {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(REG_BACKOFF_SECS)) => {}
+                    _ = shutdown.changed() => {
+                        log::info!("gb28181: shutdown requested during registration backoff — stopping");
+                        return Ok(());
                     }
                 }
             }
         }
 
         if registered {
-            // Spawn keepalive task
-            let sip_socket_for_keepalive = Arc::clone(&self.sip_socket);
+            // Spawn keepalive task (stops on shutdown)
+            let sip_socket_for_keepalive = Arc::clone(&sip_socket);
             let keepalive_device_id = self.config.device_id.clone();
             let keepalive_interval_secs = self.config.heartbeat_interval_secs;
             let keepalive_domain = self.config.sip_domain.clone();
             let keepalive_local_ip = local_ip.clone();
             let keepalive_local_port = local_sip_port;
+            let mut keepalive_shutdown = shutdown.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_keepalive(
                     sip_socket_for_keepalive,
@@ -308,14 +401,15 @@ impl Gb28181Server {
                     &keepalive_local_ip,
                     keepalive_local_port,
                     keepalive_interval_secs,
+                    &mut keepalive_shutdown,
                 )
                 .await
                 {
-                    eprintln!("gb28181: keepalive error: {e}");
+                    log::error!("gb28181: keepalive error: {e}");
                 }
             });
         } else {
-            eprintln!(
+            log::warn!(
                 "gb28181: all {} registration attempts failed — continuing in listen-only mode (SIP port stays bound)",
                 MAX_REG_ATTEMPTS
             );
@@ -335,15 +429,22 @@ impl Gb28181Server {
 
         loop {
             tokio::select! {
-                recv_result = self.sip_socket.recv_from(&mut buf) => {
+                recv_result = sip_socket.recv_from(&mut buf) => {
                     match recv_result {
                         Ok((len, peer_addr)) => {
                             let data = &buf[..len];
-                            let data_str = match std::str::from_utf8(data) {
-                                Ok(s) => s,
-                                Err(_) => continue,
+                            // Fast path: strict UTF-8 (zero copy). Legacy
+                            // platforms send GB2312/GBK/GB18030 — decode
+                            // instead of dropping the datagram.
+                            let parsed = match std::str::from_utf8(data) {
+                                Ok(s) => SipMessage::parse(s),
+                                Err(_) => {
+                                    let decoded = crate::charset::decode_wire_body(data);
+                                    log::debug!("gb28181: decoded non-UTF-8 SIP datagram as GB18030");
+                                    SipMessage::parse(&decoded)
+                                }
                             };
-                            if let Ok(msg) = SipMessage::parse(data_str) {
+                            if let Ok(msg) = parsed {
                                 if let Err(e) = self
                                     .handle_message(
                                         &msg,
@@ -354,50 +455,58 @@ impl Gb28181Server {
                                     )
                                     .await
                                 {
-                                    eprintln!("gb28181: message handling error: {e}");
+                                    log::error!("gb28181: message handling error: {e}");
                                 }
                             }
                         }
                         Err(e) => {
-                            eprintln!("gb28181: socket recv error: {e}");
+                            log::error!("gb28181: socket recv error: {e}");
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
                     }
                 }
                 _ = re_register_interval.tick() => {
-                    if registered {
-                        // Registration refresh (issue #19): re-REGISTER before
-                        // the negotiated expiry. A restarted platform has an
-                        // empty registration table while we still believe we
-                        // are registered — refreshing recovers immediately
-                        // instead of deadlocking until keepalive timeouts.
-                        if let Err(e) = self
-                            .perform_register(&mut sip_client, platform_sip_addr)
-                            .await
-                        {
-                            eprintln!(
-                                "gb28181: registration refresh failed: {e} — marking unregistered, will retry"
-                            );
-                            registered = false;
-                        } else {
-                            println!(
-                                "gb28181: registration refreshed with platform {}",
-                                platform_sip_addr
-                            );
+                    // Registration (re-)attempt races against shutdown so the
+                    // tick arm cannot delay a pending shutdown by its 5s
+                    // response timeouts.
+                    let mut sd = shutdown.clone();
+                    tokio::select! {
+                        _ = sd.changed() => {
+                            log::info!("gb28181: shutdown requested during re-registration — stopping");
+                            return self.shutdown_cleanup();
                         }
-                    } else {
-                        eprintln!("gb28181: periodic re-registration attempt");
-                        match self.perform_register(&mut sip_client, platform_sip_addr).await {
+                        result = self.perform_register(&mut sip_client, platform_sip_addr) => {
+                            if registered {
+                                // Registration refresh (issue #19): re-REGISTER before
+                                // the negotiated expiry. A restarted platform has an
+                                // empty registration table while we still believe we
+                                // are registered — refreshing recovers immediately
+                                // instead of deadlocking until keepalive timeouts.
+                                if let Err(e) = result {
+                                    log::warn!(
+                                        "gb28181: registration refresh failed: {e} — marking unregistered, will retry"
+                                    );
+                                    registered = false;
+                                } else {
+                                    log::info!(
+                                        "gb28181: registration refreshed with platform {}",
+                                        platform_sip_addr
+                                    );
+                                }
+                            } else {
+                                log::info!("gb28181: periodic re-registration attempt");
+                                match result {
                             Ok(()) => {
                                 registered = true;
-                                println!("gb28181: registered with platform {} (periodic retry)", platform_sip_addr);
+                                log::info!("gb28181: registered with platform {} (periodic retry)", platform_sip_addr);
                                 // Spawn keepalive now that we're registered
-                                let sip_socket_for_keepalive = Arc::clone(&self.sip_socket);
+                                let sip_socket_for_keepalive = Arc::clone(&sip_socket);
                                 let keepalive_device_id = self.config.device_id.clone();
                                 let keepalive_interval_secs = self.config.heartbeat_interval_secs;
                                 let keepalive_domain = self.config.sip_domain.clone();
                                 let keepalive_local_ip = local_ip.clone();
                                 let keepalive_local_port = local_sip_port;
+                                let mut keepalive_shutdown = shutdown.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = run_keepalive(
                                         sip_socket_for_keepalive,
@@ -407,21 +516,45 @@ impl Gb28181Server {
                                         &keepalive_local_ip,
                                         keepalive_local_port,
                                         keepalive_interval_secs,
+                                        &mut keepalive_shutdown,
                                     )
                                     .await
                                     {
-                                        eprintln!("gb28181: keepalive error: {e}");
+                                        log::error!("gb28181: keepalive error: {e}");
                                     }
                                 });
                             }
                             Err(e) => {
-                                eprintln!("gb28181: periodic re-registration failed: {e}");
+                                log::warn!("gb28181: periodic re-registration failed: {e}");
+                            }
+                        }
                             }
                         }
                     }
                 }
+                _ = shutdown.changed() => {
+                    log::info!("gb28181: shutdown requested — stopping SIP recv loop");
+                    return self.shutdown_cleanup();
+                }
             }
         }
+    }
+
+    /// Graceful-shutdown cleanup: unsubscribe from the frame source and
+    /// abort any active media session so spawned tasks do not outlive the
+    /// server.
+    fn shutdown_cleanup(&mut self) -> Result<()> {
+        if let Some(subscriber_id) = self.subscriber_id.take() {
+            self.au_hub.unsubscribe(subscriber_id);
+        }
+        if let Some(task) = self.media_task.take() {
+            task.abort();
+        }
+        self.media_socket = None;
+        self.media_tcp_conn = None;
+        self.invite_info = None;
+        self.playback_ctl = None;
+        Ok(())
     }
 
     /// Perform REGISTER lifecycle.
@@ -499,7 +632,7 @@ impl Gb28181Server {
                 self.handle_info(msg, peer_addr).await?;
             }
             Some(SipMethod::Subscribe) | Some(SipMethod::Notify) | Some(SipMethod::Options) => {
-                eprintln!(
+                log::warn!(
                     "gb28181: received {}, responding 200 OK",
                     msg.method.map(|m| m.to_string()).unwrap_or_default()
                 );
@@ -513,12 +646,12 @@ impl Gb28181Server {
                 } else if msg.status_code.is_some() && msg.status_code != Some(SipStatusCode::Ok) {
                     *keepalive_failures += 1;
                     if *keepalive_failures >= self.config.heartbeat_timeout_count {
-                        eprintln!(
+                        log::warn!(
                             "gb28181: keepalive timeout after {} failures, re-registering",
                             *keepalive_failures
                         );
                         if let Err(e) = self.perform_register(client, platform_addr).await {
-                            eprintln!("gb28181: re-registration failed: {e}");
+                            log::warn!("gb28181: re-registration failed: {e}");
                         }
                         *keepalive_failures = 0;
                     }
@@ -542,9 +675,9 @@ impl Gb28181Server {
             "Catalog" => {
                 let channel = ChannelItem {
                     device_id: self.config.device_id.clone(),
-                    name: format!("MiBee Camera {}", self.config.device_id),
-                    manufacturer: "MiBee".to_string(),
-                    model: "OV5647".to_string(),
+                    name: self.config.effective_device_name(),
+                    manufacturer: self.config.effective_manufacturer(),
+                    model: self.config.effective_model(),
                     owner: String::new(),
                     civil_code: String::new(),
                     address: String::new(),
@@ -573,10 +706,10 @@ impl Gb28181Server {
             "DeviceInfo" => {
                 let info = DeviceItem {
                     device_id: self.config.device_id.clone(),
-                    name: format!("MiBee Camera {}", self.config.device_id),
-                    manufacturer: "MiBee".to_string(),
-                    model: "OV5647".to_string(),
-                    firmware: env!("CARGO_PKG_VERSION").to_string(),
+                    name: self.config.effective_device_name(),
+                    manufacturer: self.config.effective_manufacturer(),
+                    model: self.config.effective_model(),
+                    firmware: self.config.effective_firmware(),
                 };
                 let response = build_device_info_response(
                     &query.sn,
@@ -641,7 +774,7 @@ impl Gb28181Server {
                 Ok(Some(response))
             }
             "DeviceControl" | "Broadcast" | "DeviceConfig" | "HomePosition" => {
-                eprintln!("gb28181: control command not supported: {}", query.cmd_type);
+                log::warn!("gb28181: control command not supported: {}", query.cmd_type);
                 let response = super::client::build_control_reject_response(
                     &query.cmd_type,
                     &query.sn,
@@ -682,7 +815,7 @@ impl Gb28181Server {
                     // re-send the SAME 200 OK, never 486 (issue #18: the
                     // platform aborts the session on 486 and the stream
                     // deadlocks until a dialog reset).
-                    eprintln!(
+                    log::warn!(
                         "gb28181: INVITE retransmission for dialog {} — re-sending cached 200 OK",
                         dialog.call_id
                     );
@@ -692,22 +825,25 @@ impl Gb28181Server {
                     return Ok(());
                 }
                 if same_dialog {
-                    eprintln!(
+                    log::warn!(
                         "gb28181: re-INVITE on dialog {} (CSeq {} → {}) — recycling media session",
-                        dialog.call_id, dialog.cseq, incoming_cseq
+                        dialog.call_id,
+                        dialog.cseq,
+                        incoming_cseq
                     );
                 } else {
                     // Different Call-ID = a NEW dialog (platform restarted and
                     // lost the old one, or the previous BYE never reached us).
                     // Recycling the stale session instead of 486-ing forever
                     // (issue #6).
-                    eprintln!(
+                    log::warn!(
                         "gb28181: INVITE for new dialog {} — recycling stale session {}",
-                        invite_info.call_id, dialog.call_id
+                        invite_info.call_id,
+                        dialog.call_id
                     );
                 }
             } else {
-                eprintln!(
+                log::warn!(
                     "gb28181: INVITE with no dialog tracked — recycling orphaned media session"
                 );
             }
@@ -723,9 +859,11 @@ impl Gb28181Server {
             self.playback_ctl = None;
         }
 
-        println!(
+        log::info!(
             "gb28181: INVITE from {} to {}:{}",
-            invite_info.media_address, invite_info.media_port, invite_info.ssrc
+            invite_info.media_address,
+            invite_info.media_port,
+            invite_info.ssrc
         );
 
         // TCP media where the platform dials the device (a=setup:active in
@@ -733,7 +871,7 @@ impl Gb28181Server {
         // Refuse with 488 instead of answering a mismatched transport and
         // streaming into a black hole (issue #14).
         if invite_info.media_transport == MediaTransport::TcpListen {
-            eprintln!("gb28181: TCP media with setup:active unsupported — 488");
+            log::warn!("gb28181: TCP media with setup:active unsupported — 488");
             let resp = build_error_response(msg, 488, "Not Acceptable Here");
             self.send_sip_message(&resp, peer_addr).await?;
             return Ok(());
@@ -770,14 +908,14 @@ impl Gb28181Server {
                 let start_ms = invite_info.start_secs.map(|s| s * 1000).unwrap_or(0);
                 let end_ms = invite_info.end_secs.map(|s| s * 1000).unwrap_or(u64::MAX);
                 let Some(source) = self.recording_index.clone() else {
-                    eprintln!("gb28181: playback INVITE but no recording index — 488");
+                    log::warn!("gb28181: playback INVITE but no recording index — 488");
                     let resp = build_error_response(msg, 488, "Not Acceptable Here");
                     self.send_sip_message(&resp, peer_addr).await?;
                     return Ok(());
                 };
                 let segments = source.lookup(start_ms, end_ms);
                 if segments.is_empty() {
-                    eprintln!(
+                    log::warn!(
                         "gb28181: playback INVITE with no recordings in [{start_ms}, {end_ms}] — 488"
                     );
                     let resp = build_error_response(msg, 488, "Not Acceptable Here");
@@ -822,7 +960,7 @@ impl Gb28181Server {
             let conn = TcpStream::connect(media_dest)
                 .await
                 .context("gb28181: failed to connect to TCP media port")?;
-            println!("gb28181: connected to TCP media port {media_dest}");
+            log::info!("gb28181: connected to TCP media port {media_dest}");
             Some(Arc::new(Mutex::new(conn)))
         } else {
             None
@@ -880,7 +1018,7 @@ impl Gb28181Server {
                     )
                     .await
                     {
-                        eprintln!("gb28181: playback task error: {e}");
+                        log::warn!("gb28181: playback task error: {e}");
                     }
                 })
             }
@@ -902,7 +1040,7 @@ impl Gb28181Server {
                     }
                 });
 
-                println!("gb28181: subscribed to AuHub (subscriber_id={subscriber_id})");
+                log::info!("gb28181: subscribed to AuHub (subscriber_id={subscriber_id})");
                 self.subscriber_id = Some(subscriber_id);
 
                 let media_task_conn = media_tcp_conn.clone();
@@ -917,7 +1055,7 @@ impl Gb28181Server {
                     )
                     .await
                     {
-                        eprintln!("gb28181: media task error: {e}");
+                        log::warn!("gb28181: media task error: {e}");
                     }
                 })
             }
@@ -927,7 +1065,7 @@ impl Gb28181Server {
         self.media_tcp_conn = media_tcp_conn;
         self.media_task = Some(media_task);
 
-        println!("gb28181: media stream started on port {media_port}");
+        log::info!("gb28181: media stream started on port {media_port}");
         Ok(())
     }
 
@@ -944,7 +1082,7 @@ impl Gb28181Server {
             .map(|d| d.call_id == call_id)
             .unwrap_or(false);
         if self.media_task.is_none() || !matches_dialog {
-            eprintln!(
+            log::warn!(
                 "gb28181: received BYE for unknown dialog (Call-ID={call_id}) — replying 481"
             );
             let resp = build_error_response(msg, 481, "Call/Transaction Does Not Exist");
@@ -952,7 +1090,7 @@ impl Gb28181Server {
             return Ok(());
         }
 
-        println!("gb28181: received BYE, stopping media stream");
+        log::info!("gb28181: received BYE, stopping media stream");
 
         // Unsubscribe from AuHub
         if let Some(subscriber_id) = self.subscriber_id.take() {
@@ -1002,7 +1140,7 @@ impl Gb28181Server {
         };
 
         if let Err(e) = self.send_sip_message(&response, peer_addr).await {
-            eprintln!("gb28181: failed to send 200 OK to BYE: {e}");
+            log::warn!("gb28181: failed to send 200 OK to BYE: {e}");
         }
 
         Ok(())
@@ -1021,15 +1159,15 @@ impl Gb28181Server {
             Some(ctl) => match parse_playback_control(&msg.body) {
                 Some(control) => {
                     if ctl.send(control).await.is_err() {
-                        eprintln!("gb28181: playback control channel closed");
+                        log::warn!("gb28181: playback control channel closed");
                     }
                 }
                 None => {
-                    eprintln!("gb28181: INFO PlaybackControl with unknown/invalid body — ignored");
+                    log::warn!("gb28181: INFO PlaybackControl with unknown/invalid body — ignored");
                 }
             },
             None => {
-                eprintln!(
+                log::warn!(
                     "gb28181: received INFO PlaybackControl but no active playback session — no-op"
                 );
             }
@@ -1041,17 +1179,23 @@ impl Gb28181Server {
     ///
     /// UDP (default): writes to the UDP socket via send_to.
     /// TCP: writes the serialized message to the active TCP connection.
+    ///
+    /// The body is wire-encoded via [`crate::charset`] (GB2312-declared
+    /// non-ASCII bodies go out as GB18030; ASCII is byte-identical to the
+    /// historical format) and Content-Length always matches the wire bytes.
     async fn send_sip_message(&mut self, msg: &SipMessage, dest: SocketAddr) -> Result<()> {
-        let data = msg.serialize();
+        let data = serialize_wire(msg);
         if let Some(conn) = self.tcp_conn.as_mut() {
-            conn.write_all(data.as_bytes())
+            conn.write_all(&data)
                 .await
                 .context("gb28181: TCP write failed")?;
-        } else {
-            self.sip_socket
-                .send_to(data.as_bytes(), dest)
+        } else if let Some(socket) = self.sip_socket.as_ref() {
+            socket
+                .send_to(&data, dest)
                 .await
                 .context("gb28181: send_to failed")?;
+        } else {
+            bail!("gb28181: no SIP transport bound (server not started)");
         }
         Ok(())
     }
@@ -1092,15 +1236,26 @@ impl Gb28181Server {
 
     /// Receive a SIP message with timeout.
     async fn receive_with_timeout(&self, timeout: Duration) -> Result<SipMessage> {
+        let socket = self
+            .sip_socket
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("gb28181: SIP socket not bound"))?;
         let mut buf = vec![0u8; MAX_SIP_PACKET_SIZE];
-        let (len, _) = tokio::time::timeout(timeout, self.sip_socket.recv_from(&mut buf))
+        let (len, _) = tokio::time::timeout(timeout, socket.recv_from(&mut buf))
             .await
             .context("gb28181: receive timeout")?
             .context("gb28181: recv_from failed")?;
 
-        let data_str = std::str::from_utf8(&buf[..len])
-            .map_err(|e| anyhow::anyhow!("gb28181: invalid UTF-8: {e}"))?;
-        SipMessage::parse(data_str).context("gb28181: parse failed")
+        let data = &buf[..len];
+        let parsed = match std::str::from_utf8(data) {
+            Ok(s) => SipMessage::parse(s),
+            Err(_) => {
+                let decoded = crate::charset::decode_wire_body(data);
+                log::debug!("gb28181: decoded non-UTF-8 SIP datagram as GB18030");
+                SipMessage::parse(&decoded)
+            }
+        };
+        parsed.context("gb28181: parse failed")
     }
 }
 
@@ -1108,6 +1263,31 @@ impl Gb28181Server {
 /// (RFC 3261 §10.2 — clients commonly refresh at 50% of the expiry window).
 fn registration_refresh_interval_secs(expires_secs: u64) -> u64 {
     (expires_secs / 2).max(1)
+}
+
+/// Serialize a SIP message for the wire with charset-correct body encoding.
+///
+/// Headers are always ASCII. The body is encoded by [`crate::charset`]:
+/// ASCII bodies (the overwhelmingly common case) produce bytes identical to
+/// `serialize()`; a non-ASCII body whose XML declaration says GB2312 is
+/// encoded as GB18030. `Content-Length` is recomputed from the encoded body
+/// so it always matches the bytes actually sent.
+pub(crate) fn serialize_wire(msg: &SipMessage) -> Vec<u8> {
+    let body_bytes = crate::charset::encode_wire_body(&msg.body);
+    let mut head = String::with_capacity(256);
+    head.push_str(&msg.start_line);
+    head.push_str("\r\n");
+    for (name, value) in &msg.headers {
+        if name.eq_ignore_ascii_case("Content-Length") {
+            head.push_str(&format!("{name}: {}\r\n", body_bytes.len()));
+        } else {
+            head.push_str(&format!("{name}: {value}\r\n"));
+        }
+    }
+    head.push_str("\r\n");
+    let mut out = head.into_bytes();
+    out.extend_from_slice(&body_bytes);
+    out
 }
 
 /// Build a device SDP answer for INVITE response.
@@ -1188,7 +1368,8 @@ fn build_error_response(request: &SipMessage, code: u16, reason: &str) -> SipMes
     }
 }
 
-/// Run the keepalive task.
+/// Run the keepalive task (stops when `shutdown` fires).
+#[allow(clippy::too_many_arguments)]
 async fn run_keepalive(
     sip_socket: Arc<UdpSocket>,
     platform_addr: SocketAddr,
@@ -1197,25 +1378,33 @@ async fn run_keepalive(
     local_ip: &str,
     local_port: u16,
     interval_secs: u64,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     let mut sn = 1u32;
     let mut cseq = 1000u32;
 
     loop {
-        interval.tick().await;
+        tokio::select! {
+            _ = interval.tick() => {
+                let sn_str = sn.to_string();
+                let notify = build_keepalive_notify(
+                    &sn_str, device_id, domain, local_ip, local_port, "OK", cseq,
+                )?;
 
-        let sn_str = sn.to_string();
-        let notify =
-            build_keepalive_notify(&sn_str, device_id, domain, local_ip, local_port, "OK", cseq)?;
+                let data = serialize_wire(&notify);
+                if let Err(e) = sip_socket.send_to(&data, platform_addr).await {
+                    log::error!("gb28181: keepalive send failed: {e}");
+                }
 
-        let data = notify.serialize();
-        if let Err(e) = sip_socket.send_to(data.as_bytes(), platform_addr).await {
-            eprintln!("gb28181: keepalive send failed: {e}");
+                sn += 1;
+                cseq += 1;
+            }
+            _ = shutdown.changed() => {
+                log::info!("gb28181: keepalive task stopping (shutdown)");
+                return Ok(());
+            }
         }
-
-        sn += 1;
-        cseq += 1;
     }
 }
 
@@ -1233,15 +1422,32 @@ async fn run_media_task(
 ) -> Result<()> {
     let mut rtp_pusher = RtpPusher::new(remote_addr, ssrc, PS_PAYLOAD_TYPE);
     let mut pts = 0u64;
+    // Capture timestamp of the previous access unit — PTS deltas derive from
+    // real capture time (90 kHz), so 25 fps streams no longer play at 30 fps.
+    let mut last_capture: Option<std::time::Instant> = None;
 
-    println!("gb28181: media task started for device {device_id}");
+    log::info!("gb28181: media task started for device {device_id}");
 
     while let Some(au) = rx.recv().await {
         // Convert NAL units to slices for mux_h264_to_ps
         let nalu_slices: Vec<&[u8]> = au.nalus.iter().map(|n| n.data.as_slice()).collect();
 
-        // Calculate PTS/DTS (use timestamp field)
-        pts += 3000; // Increment by 90kHz/30 = 3000 ticks per frame at 30fps
+        // PTS/DTS at 90 kHz from capture-time deltas. The first frame uses
+        // the nominal 30 fps increment (3000 ticks); later frames use the
+        // real inter-frame duration (clamped to 1..=100 s to survive clock
+        // quirks and huge gaps after stream stalls).
+        let delta_ticks: u32 = match last_capture.replace(au.timestamp) {
+            None => 3000,
+            Some(prev) => {
+                let ticks = au
+                    .timestamp
+                    .saturating_duration_since(prev)
+                    .as_millis()
+                    .saturating_mul(90);
+                u32::try_from(ticks).unwrap_or(u32::MAX).clamp(1, 9_000_000)
+            }
+        };
+        pts += u64::from(delta_ticks);
 
         // Mux H.264 to PS
         let ps_data = mux_h264_to_ps(&nalu_slices, au.is_key_frame, pts, pts);
@@ -1268,19 +1474,19 @@ async fn run_media_task(
                 let mut conn = conn.lock().await;
                 let frame = frame_rtp_over_tcp(&rtp_packet);
                 if let Err(e) = conn.write_all(&frame).await {
-                    eprintln!("gb28181: failed to send RTP packet over TCP: {e}");
+                    log::error!("gb28181: failed to send RTP packet over TCP: {e}");
                     break;
                 }
             } else if let Err(e) = media_socket.send_to(&rtp_packet, remote_addr).await {
-                eprintln!("gb28181: failed to send RTP packet: {e}");
+                log::error!("gb28181: failed to send RTP packet: {e}");
                 break;
             }
         }
 
-        rtp_pusher.increment_timestamp(3000);
+        rtp_pusher.increment_timestamp(delta_ticks);
     }
 
-    println!("gb28181: media task ended for device {device_id}");
+    log::info!("gb28181: media task ended for device {device_id}");
     Ok(())
 }
 
@@ -1321,22 +1527,18 @@ pub(super) fn frame_rtp_over_tcp(rtp_packet: &[u8]) -> Vec<u8> {
     frame
 }
 
-/// Create a loopback socket as placeholder (will be rebound in start()).
-fn loopback_socket() -> UdpSocket {
-    // This is a stub - the actual socket is created in start()
-    panic!("loopback_socket should never be called");
-}
-
 /// Handle a TCP connection for SIP signaling.
 ///
 /// Reads Content-Length framed SIP messages from the connection and
-/// dispatches them through the same `handle_message` logic as UDP.
+/// dispatches them through the same `handle_message` logic as UDP. Stops
+/// cleanly when `shutdown` fires.
 async fn handle_tcp_connection(
     conn: TcpStream,
     peer_addr: SocketAddr,
     au_hub: Arc<dyn FrameSource>,
     config: Gb28181Config,
     recording_index: Option<Arc<dyn RecordingSource>>,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     use tokio::io::BufReader;
 
@@ -1362,7 +1564,7 @@ async fn handle_tcp_connection(
 
     // Placeholder UDP socket: never used for sending (tcp_conn takes
     // precedence in send_sip_message), bound so receive_with_timeout
-    // does not panic if re-registration is ever attempted on TCP.
+    // does not error if re-registration is ever attempted on TCP.
     let placeholder_udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
 
     // Server instance bound to this TCP connection: all responses
@@ -1370,7 +1572,7 @@ async fn handle_tcp_connection(
     let mut server = Gb28181Server {
         config,
         au_hub,
-        sip_socket: placeholder_udp,
+        sip_socket: Some(placeholder_udp),
         tcp_conn: Some(write_half),
         media_socket: None,
         media_tcp_conn: None,
@@ -1382,7 +1584,7 @@ async fn handle_tcp_connection(
         playback_ctl: None,
     };
 
-    // Create SIP device client
+    // Create SIP device client (User-Agent from config; neutral default)
     let mut sip_client = SipDeviceClient::new(
         &server.config.device_id,
         platform_sip_addr,
@@ -1391,7 +1593,8 @@ async fn handle_tcp_connection(
         &server.config.sip_domain,
         &server.config.password,
         server.config.register_interval_secs as u32,
-    );
+    )
+    .with_user_agent(&server.config.effective_user_agent());
 
     // Message loop: read Content-Length framed SIP messages
     let mut keepalive_failures = 0u32;
@@ -1399,29 +1602,41 @@ async fn handle_tcp_connection(
 
     loop {
         buf.clear();
-        match read_sip_message_framed(&mut reader, &mut buf).await {
-            Ok(()) => {
-                let data_str = match std::str::from_utf8(&buf) {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                if let Ok(msg) = SipMessage::parse(data_str) {
-                    if let Err(e) = server
-                        .handle_message(
-                            &msg,
-                            peer_addr,
-                            &mut sip_client,
-                            platform_sip_addr,
-                            &mut keepalive_failures,
-                        )
-                        .await
-                    {
-                        eprintln!("gb28181: TCP message handling error: {e}");
+        tokio::select! {
+            framed = read_sip_message_framed(&mut reader, &mut buf) => {
+                match framed {
+                    Ok(()) => {
+                        let parsed = match std::str::from_utf8(&buf) {
+                            Ok(s) => SipMessage::parse(s),
+                            Err(_) => {
+                                let decoded = crate::charset::decode_wire_body(&buf);
+                                log::debug!("gb28181: decoded non-UTF-8 SIP frame as GB18030");
+                                SipMessage::parse(&decoded)
+                            }
+                        };
+                        if let Ok(msg) = parsed {
+                            if let Err(e) = server
+                                .handle_message(
+                                    &msg,
+                                    peer_addr,
+                                    &mut sip_client,
+                                    platform_sip_addr,
+                                    &mut keepalive_failures,
+                                )
+                                .await
+                            {
+                                log::error!("gb28181: TCP message handling error: {e}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        log::error!("gb28181: TCP read error: {e}");
+                        break;
                     }
                 }
             }
-            Err(e) => {
-                eprintln!("gb28181: TCP read error: {e}");
+            _ = shutdown.changed() => {
+                log::info!("gb28181: shutdown requested — closing TCP connection handler");
                 break;
             }
         }
@@ -1635,6 +1850,7 @@ mod tests {
             heartbeat_interval_secs: 60,
             heartbeat_timeout_count: 3,
             transport: Transport::Tcp,
+            ..Gb28181Config::default()
         };
         let handle =
             Gb28181Server::start(config, Arc::new(crate::mock::MockFrameHub::new()), None).await?;
@@ -1741,6 +1957,7 @@ async fn test_recordinfo_dispatch_with_source() {
         heartbeat_interval_secs: 60,
         heartbeat_timeout_count: 3,
         transport: Transport::Udp,
+        ..Gb28181Config::default()
     };
     let source = FakeRecordingSource {
         segments: vec![super::SegmentMeta {
@@ -1753,7 +1970,7 @@ async fn test_recordinfo_dispatch_with_source() {
     let server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
-        sip_socket,
+        sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
         media_tcp_conn: None,
@@ -1827,12 +2044,13 @@ async fn test_recordinfo_dispatch_without_source() {
         heartbeat_interval_secs: 60,
         heartbeat_timeout_count: 3,
         transport: Transport::Udp,
+        ..Gb28181Config::default()
     };
     let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
     let server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
-        sip_socket,
+        sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
         media_tcp_conn: None,
@@ -1885,12 +2103,13 @@ async fn test_playback_invite_empty_range_returns_488() {
         heartbeat_interval_secs: 60,
         heartbeat_timeout_count: 3,
         transport: Transport::Udp,
+        ..Gb28181Config::default()
     };
     let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
     let mut server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
-        sip_socket,
+        sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
         media_tcp_conn: None,
@@ -1966,6 +2185,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         heartbeat_interval_secs: 60,
         heartbeat_timeout_count: 3,
         transport: Transport::Udp,
+        ..Gb28181Config::default()
     };
     let source = FakeRecordingSource {
         segments: vec![super::SegmentMeta {
@@ -1978,7 +2198,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
     let mut server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
-        sip_socket,
+        sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
         media_tcp_conn: None,
@@ -2058,12 +2278,13 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         heartbeat_interval_secs: 60,
         heartbeat_timeout_count: 3,
         transport: Transport::Udp,
+        ..Gb28181Config::default()
     };
     let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
     let server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
-        sip_socket,
+        sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
         media_tcp_conn: None,
@@ -2203,12 +2424,13 @@ async fn test_info_playback_control_live_session_noop() {
         heartbeat_interval_secs: 60,
         heartbeat_timeout_count: 3,
         transport: Transport::Udp,
+        ..Gb28181Config::default()
     };
     let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
     let mut server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
-        sip_socket,
+        sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
         media_tcp_conn: None,
@@ -2290,13 +2512,14 @@ mod tcp_media_tests {
             heartbeat_interval_secs: 60,
             heartbeat_timeout_count: 3,
             transport: Transport::Udp, // SIP over UDP + TCP MEDIA — the #14 scenario
+            ..Gb28181Config::default()
         };
         let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
         let hub = Arc::new(crate::mock::MockFrameHub::new());
         let mut server = Gb28181Server {
             config,
             au_hub: hub.clone(),
-            sip_socket,
+            sip_socket: Some(sip_socket),
             tcp_conn: None,
             media_socket: None,
             media_tcp_conn: None,
@@ -2415,12 +2638,13 @@ mod tcp_media_tests {
             heartbeat_interval_secs: 60,
             heartbeat_timeout_count: 3,
             transport: Transport::Udp,
+            ..Gb28181Config::default()
         };
         let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
         let mut server = Gb28181Server {
             config,
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
-            sip_socket,
+            sip_socket: Some(sip_socket),
             tcp_conn: None,
             media_socket: None,
             media_tcp_conn: None,
@@ -2495,9 +2719,10 @@ mod tcp_media_tests {
                 heartbeat_interval_secs: 60,
                 heartbeat_timeout_count: 3,
                 transport: Transport::Udp,
+                ..Gb28181Config::default()
             },
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
-            sip_socket,
+            sip_socket: Some(sip_socket),
             tcp_conn: None,
             media_socket: None,
             media_tcp_conn: None,
@@ -2513,7 +2738,12 @@ mod tcp_media_tests {
         // then a STALE 401 (wrong CSeq) before the real 200 OK.
         let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
         let platform_addr = platform.local_addr().expect("addr");
-        let server_addr = server.sip_socket.local_addr().expect("server addr");
+        let server_addr = server
+            .sip_socket
+            .as_ref()
+            .expect("socket bound")
+            .local_addr()
+            .expect("server addr");
 
         let stale_200 =
             "SIP/2.0 200 OK\r\nCSeq: 999 REGISTER\r\nCall-ID: stale\r\nContent-Length: 0\r\n\r\n";
