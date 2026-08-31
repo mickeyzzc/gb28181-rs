@@ -33,12 +33,45 @@
 //!
 //! ## Segment format
 //!
-//! The [`segment`] module implements the reference recording format used by
-//! the playback path: a bare Annex-B H.264 bytestream with a per-frame
+//! The [`segment`] module implements the reference recording format used by the
+//! playback path: a bare Annex-B H.264 bytestream with a per-frame
 //! `<segment>.ts.jsonl` sidecar of millisecond timestamps.
+//!
+//! ## Logging
+//!
+//! The crate logs through the [`log`](https://docs.rs/log) facade — hosts
+//! initialize a logger to see output. Nothing is written to stdout/stderr
+//! directly.
+//!
+//! # Example
+//!
+//! Wire the server over the two host seams (compile-checked by `cargo test
+//! --doc`):
+//!
+//! ```
+//! use std::sync::Arc;
+//! use gb28181_rs::config::Transport;
+//! use gb28181_rs::mock::MockFrameHub;
+//! use gb28181_rs::{Gb28181Config, Gb28181Server};
+//!
+//! # fn main() -> anyhow::Result<()> {
+//! let mut config = Gb28181Config::default();
+//! config.platform_sip_address = "192.0.2.10".to_string(); // your platform
+//! config.device_id = "34020000001320000001".to_string();
+//! config.password = "secret".to_string();
+//! config.user_agent = Some("my-host/1.0 (gb28181-rs)".to_string());
+//!
+//! // Constructors perform no I/O and never panic; spawn() binds and runs.
+//! let server = Gb28181Server::new(config, Arc::new(MockFrameHub::new()));
+//! // let handle = tokio_runtime.block_on(server.spawn())?; // real usage
+//! # let _ = server;
+//! # Ok(())
+//! # }
+//! ```
 
 use std::sync::atomic::AtomicBool;
 
+pub mod charset;
 pub mod client;
 pub mod config;
 pub mod device_id;
@@ -64,7 +97,7 @@ pub use ps::{
 };
 pub use rtp_pusher::{RtpPusher, RtpStreamInfo};
 pub use segment::{read_segment, RecordedAu};
-pub use server::Gb28181Server;
+pub use server::{Gb28181Server, ServerHandle};
 pub use sip::{
     build_bye_request, build_digest_auth, build_invite_response, build_register_request,
     parse_digest_auth, DigestAuthParams, SdpMedia, SdpSession, SessionType, SipMessage, SipMethod,

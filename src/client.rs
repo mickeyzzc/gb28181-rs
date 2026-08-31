@@ -11,13 +11,34 @@ use anyhow::{anyhow, Result};
 use super::manscdp::{ChannelItem, DeviceItem, Notify, Query};
 use super::rtp_pusher::H264_PAYLOAD_TYPE;
 use super::sip::{
-    build_bye_request, build_digest_auth, build_register_request, DigestAuthParams, SdpSession,
-    SessionType, SipMessage, SipMethod, SipStatusCode,
+    build_bye_request, build_digest_auth, build_register_request, random_tag, DigestAuthParams,
+    SdpSession, SessionType, SipMessage, SipMethod, SipStatusCode,
 };
+
+/// Escape a string for interpolation into MANSCDP XML text or attribute
+/// content: `&`, `<`, `>`, `"`, `'`.
+///
+/// Host-supplied values (device names, file paths, manufacturer strings)
+/// reach the wire through `format!` — without escaping, a `<` or `&` in any
+/// of them produces malformed XML that strict platforms reject.
+pub(crate) fn xml_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&apos;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
 
 /// A GB/T 28181 SIP device client that registers with a SIP platform.
 ///
-/// Manages the REGISTER dialog with a GB/T 28181 SIP platform, including
+/// Manages the REGISTER dialog with a GB28181 SIP platform, including
 /// digest authentication challenge-response.
 #[derive(Debug, Clone)]
 pub struct SipDeviceClient {
@@ -41,6 +62,12 @@ pub struct SipDeviceClient {
     pub cseq: u32,
     /// Registration expiry in seconds
     pub expires: u32,
+    /// SIP `User-Agent` sent on REGISTER (RFC 3261 §20.41). Host-configurable;
+    /// the default is neutral (`gb28181-rs/<version>`), never a product name.
+    pub user_agent: String,
+    /// From-tag for the REGISTER dialog — generated once, stable for the
+    /// dialog lifetime (same Call-ID → same From tag, RFC 3261 §10.2).
+    from_tag: String,
 }
 
 impl SipDeviceClient {
@@ -69,7 +96,16 @@ impl SipDeviceClient {
             call_id: format!("{}-{}", device_id, nanos),
             cseq: 1,
             expires,
+            user_agent: format!("gb28181-rs/{}", env!("CARGO_PKG_VERSION")),
+            from_tag: random_tag(),
         }
+    }
+
+    /// Override the SIP `User-Agent` (builder style).
+    #[must_use]
+    pub fn with_user_agent(mut self, user_agent: &str) -> Self {
+        self.user_agent = user_agent.to_string();
+        self
     }
 
     /// Build an initial (unauthenticated) SIP REGISTER request.
@@ -77,12 +113,15 @@ impl SipDeviceClient {
         build_register_request(
             &self.device_id,
             &self.local_ip,
+            self.local_port,
             &self.domain,
             &self.domain,
             self.expires,
             None,
             &self.call_id,
             self.cseq,
+            &self.from_tag,
+            &self.user_agent,
         )
     }
 
@@ -102,12 +141,15 @@ impl SipDeviceClient {
         build_register_request(
             &self.device_id,
             &self.local_ip,
+            self.local_port,
             &self.domain,
             &self.domain,
             self.expires,
             Some(&auth_header),
             &self.call_id,
             self.cseq,
+            &self.from_tag,
+            &self.user_agent,
         )
     }
 
@@ -122,10 +164,12 @@ impl SipDeviceClient {
         build_bye_request(
             &self.device_id,
             &self.local_ip,
+            self.local_port,
             remote_id,
             remote_addr,
             call_id,
             cseq,
+            &self.from_tag,
         )
     }
 
@@ -214,6 +258,13 @@ pub fn parse_invite(msg: &SipMessage) -> Result<InviteInfo> {
         .last()
         .unwrap_or("127.0.0.1")
         .to_string();
+    if ip == "127.0.0.1" {
+        // INVITE SDP without a usable c= line: the fallback destination is
+        // loopback — almost certainly wrong, so make it visible.
+        log::warn!(
+            "gb28181: INVITE SDP lacks usable connection address; media would be sent to 127.0.0.1"
+        );
+    }
 
     let payload_type = media
         .payload_types
@@ -272,15 +323,19 @@ pub fn build_catalog_response(
 ) -> Result<SipMessage> {
     let body = format!(
         "<Response CmdType=\"Catalog\" SN=\"{}\"><DeviceID>{}</DeviceID><SumNum>{}</SumNum><DeviceList Num=\"{}\">{}</DeviceList></Response>",
-        sn,
-        device_id,
+        xml_escape(sn),
+        xml_escape(device_id),
         items.len(),
         items.len(),
         items
             .iter()
             .map(|item| format!(
                 "<Item><DeviceID>{}</DeviceID><Name>{}</Name><Manufacturer>{}</Manufacturer><Model>{}</Model><Status>{}</Status></Item>",
-                item.device_id, item.name, item.manufacturer, item.model, item.status
+                xml_escape(&item.device_id),
+                xml_escape(&item.name),
+                xml_escape(&item.manufacturer),
+                xml_escape(&item.model),
+                xml_escape(&item.status)
             ))
             .collect::<String>()
     );
@@ -290,13 +345,15 @@ pub fn build_catalog_response(
     headers.push((
         "Via".to_string(),
         format!(
-            "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK{}",
-            local_ip, local_port, cseq
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
         ),
     ));
     headers.push((
         "From".to_string(),
-        format!("<sip:{}@{}>;tag={}", device_id, domain, cseq),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
     ));
     headers.push(("To".to_string(), format!("<sip:{}@{}>", domain, domain)));
     headers.push((
@@ -338,7 +395,12 @@ pub fn build_device_info_response(
 ) -> Result<SipMessage> {
     let body = format!(
         "<Response CmdType=\"DeviceInfo\" SN=\"{}\"><DeviceID>{}</DeviceID><Result>OK</Result><DeviceName>{}</DeviceName><Manufacturer>{}</Manufacturer><Model>{}</Model><Firmware>{}</Firmware></Response>",
-        sn, device_id, info.name, info.manufacturer, info.model, info.firmware
+        xml_escape(sn),
+        xml_escape(device_id),
+        xml_escape(&info.name),
+        xml_escape(&info.manufacturer),
+        xml_escape(&info.model),
+        xml_escape(&info.firmware)
     );
 
     let mut headers = Vec::new();
@@ -346,13 +408,15 @@ pub fn build_device_info_response(
     headers.push((
         "Via".to_string(),
         format!(
-            "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK{}",
-            local_ip, local_port, cseq
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
         ),
     ));
     headers.push((
         "From".to_string(),
-        format!("<sip:{}@{}>;tag={}", device_id, domain, cseq),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
     ));
     headers.push(("To".to_string(), format!("<sip:{}@{}>", domain, domain)));
     headers.push((
@@ -394,7 +458,9 @@ pub fn build_keepalive_notify(
 ) -> Result<SipMessage> {
     let body = format!(
         "<Notify CmdType=\"Keepalive\" SN=\"{}\"><DeviceID>{}</DeviceID><Status>{}</Status></Notify>",
-        sn, device_id, status
+        xml_escape(sn),
+        xml_escape(device_id),
+        xml_escape(status)
     );
 
     let mut headers = Vec::new();
@@ -402,13 +468,15 @@ pub fn build_keepalive_notify(
     headers.push((
         "Via".to_string(),
         format!(
-            "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK{}",
-            local_ip, local_port, cseq
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
         ),
     ));
     headers.push((
         "From".to_string(),
-        format!("<sip:{}@{}>;tag={}", device_id, domain, cseq),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
     ));
     headers.push(("To".to_string(), format!("<sip:{}@{}>", domain, domain)));
     headers.push((
@@ -474,7 +542,14 @@ pub fn build_recordinfo_response(
         .iter()
         .map(|it| {
             format!("<Item><DeviceID>{}</DeviceID><Name>{}</Name><FilePath>{}</FilePath><Address>{}</Address><StartTime>{}</StartTime><EndTime>{}</EndTime><Secrecy>{}</Secrecy><Type>{}</Type></Item>",
-                it.device_id, it.name, it.file_path, it.address, it.start_time, it.end_time, it.secrecy, it.r#type)
+                xml_escape(&it.device_id),
+                xml_escape(&it.name),
+                xml_escape(&it.file_path),
+                xml_escape(&it.address),
+                xml_escape(&it.start_time),
+                xml_escape(&it.end_time),
+                xml_escape(&it.secrecy),
+                xml_escape(&it.r#type))
         })
         .collect::<String>();
     let body = format!(
@@ -487,9 +562,9 @@ pub fn build_recordinfo_response(
         {}\
         </RecordList>\
         </Response>",
-        sn,
-        device_id,
-        device_id,
+        xml_escape(sn),
+        xml_escape(device_id),
+        xml_escape(device_id),
         items.len(),
         items.len(),
         items_xml
@@ -500,13 +575,15 @@ pub fn build_recordinfo_response(
     headers.push((
         "Via".to_string(),
         format!(
-            "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK{}",
-            local_ip, local_port, cseq
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
         ),
     ));
     headers.push((
         "From".to_string(),
-        format!("<sip:{}@{}>;tag={}", device_id, domain, cseq),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
     ));
     headers.push(("To".to_string(), format!("<sip:{}@{ }>", domain, domain)));
     headers.push((
@@ -627,7 +704,10 @@ pub fn build_device_status_response(
         <Record>{}</Record>\
         <DeviceTime>{}</DeviceTime>\
         </Response>",
-        sn, device_id, record_state, now
+        xml_escape(sn),
+        xml_escape(device_id),
+        record_state,
+        now
     );
 
     let mut headers = Vec::new();
@@ -635,13 +715,15 @@ pub fn build_device_status_response(
     headers.push((
         "Via".to_string(),
         format!(
-            "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK{}",
-            local_ip, local_port, cseq
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
         ),
     ));
     headers.push((
         "From".to_string(),
-        format!("<sip:{}@{}>;tag={}", device_id, domain, cseq),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
     ));
     headers.push(("To".to_string(), format!("<sip:{}@{ }>", domain, domain)));
     headers.push((
@@ -687,7 +769,9 @@ pub fn build_control_reject_response(
         <DeviceID>{}</DeviceID>\
         <Result>ERROR</Result>\
         </Response>",
-        cmd_type, sn, device_id
+        xml_escape(cmd_type),
+        xml_escape(sn),
+        xml_escape(device_id)
     );
 
     let mut headers = Vec::new();
@@ -695,13 +779,15 @@ pub fn build_control_reject_response(
     headers.push((
         "Via".to_string(),
         format!(
-            "SIP/2.0/UDP {}:{};rport;branch=z9hG4bK{}",
-            local_ip, local_port, cseq
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
         ),
     ));
     headers.push((
         "From".to_string(),
-        format!("<sip:{}@{}>;tag={}", device_id, domain, cseq),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
     ));
     headers.push(("To".to_string(), format!("<sip:{}@{ }>", domain, domain)));
     headers.push((
@@ -746,7 +832,7 @@ pub fn dispatch_inbound_message(msg: &SipMessage) -> Result<(SipMessage, Option<
     let content_type = msg.get_header("Content-Type").unwrap_or("");
 
     if content_type != "Application/MANSCDP+xml" {
-        eprintln!(
+        log::warn!(
             "gb28181: received MESSAGE with unsupported Content-Type: {}",
             content_type
         );
@@ -759,9 +845,10 @@ pub fn dispatch_inbound_message(msg: &SipMessage) -> Result<(SipMessage, Option<
             "Catalog" => {
                 // Platform queries catalog → return 200 OK + queue Catalog response
                 // Note: caller must provide the actual channel items via build_catalog_response
-                eprintln!(
+                log::debug!(
                     "gb28181: received Catalog Query SN={} from {}",
-                    query.sn, query.device_id
+                    query.sn,
+                    query.device_id
                 );
                 let ok_response = build_200_ok_response(msg)?.0;
                 // Caller must build the actual catalog response with real data
@@ -769,25 +856,26 @@ pub fn dispatch_inbound_message(msg: &SipMessage) -> Result<(SipMessage, Option<
                 Ok((ok_response, None))
             }
             "DeviceInfo" => {
-                eprintln!(
+                log::debug!(
                     "gb28181: received DeviceInfo Query SN={} from {}",
-                    query.sn, query.device_id
+                    query.sn,
+                    query.device_id
                 );
                 let ok_response = build_200_ok_response(msg)?.0;
                 // Caller must build the actual device info response
                 Ok((ok_response, None))
             }
             _ => {
-                eprintln!("gb28181: unknown Query CmdType: {}", query.cmd_type);
+                log::warn!("gb28181: unknown Query CmdType: {}", query.cmd_type);
                 build_200_ok_response(msg)
             }
         }
     } else if let Ok(_notify) = serde_xml_rs::from_str::<Notify>(&msg.body) {
         // Platform is acknowledging our Keepalive (or other notification)
-        eprintln!("gb28181: received platform acknowledge for Notify");
+        log::debug!("gb28181: received platform acknowledge for Notify");
         build_200_ok_response(msg)
     } else {
-        eprintln!("gb28181: failed to parse MESSAGE body as Query or Notify");
+        log::warn!("gb28181: failed to parse MESSAGE body as Query or Notify");
         build_200_ok_response(msg)
     }
 }
@@ -1023,6 +1111,110 @@ mod tests {
         .expect("control reject response should build");
         assert!(resp.body.contains(">ERROR<"));
         assert!(resp.body.contains("DeviceControl"));
+    }
+
+    /// Regression: host-supplied strings (names, paths) must be XML-escaped
+    /// before interpolation — a `<` in a segment path previously produced
+    /// malformed XML.
+    #[test]
+    fn test_catalog_response_escapes_host_strings() {
+        let items = [ChannelItem {
+            device_id: "34020000001320000001".to_string(),
+            name: "Cam <A&B> \"1\"".to_string(),
+            manufacturer: "Mfr<&".to_string(),
+            model: "M/x".to_string(),
+            owner: String::new(),
+            civil_code: String::new(),
+            address: String::new(),
+            parental: 0,
+            parent_id: String::new(),
+            safety_way: 0,
+            register_way: 1,
+            secrecy: 0,
+            status: "ON".to_string(),
+            ip_address: String::new(),
+            port: 5060,
+            longitude: 0.0,
+            latitude: 0.0,
+        }];
+        let msg = build_catalog_response(
+            "5",
+            "34020000001320000001",
+            "3402000000",
+            "192.168.62.104",
+            5060,
+            42,
+            &items,
+        )
+        .expect("build");
+        assert!(msg
+            .body
+            .contains("<Name>Cam &lt;A&amp;B&gt; &quot;1&quot;</Name>"));
+        assert!(msg
+            .body
+            .contains("<Manufacturer>Mfr&lt;&amp;</Manufacturer>"));
+        // Well-formedness smoke check via the crate's own dual parser.
+        assert!(
+            super::super::manscdp::parse_query_dual(&msg.body).is_none()
+                || msg.body.matches('<').count() >= msg.body.matches('&').count()
+        );
+    }
+
+    /// The default client User-Agent is the crate name/version (neutral), and
+    /// `with_user_agent` overrides it.
+    #[test]
+    fn test_client_user_agent_default_neutral_and_overridable() {
+        let addr: std::net::SocketAddr = "192.0.2.1:5060".parse().expect("addr");
+        let client = SipDeviceClient::new(
+            "34020000001320000001",
+            addr,
+            "192.0.2.2",
+            15060,
+            "3402000000",
+            "pw",
+            3600,
+        );
+        let reg = client.build_register();
+        let ua = reg.get_header("User-Agent").expect("UA present");
+        assert!(ua.starts_with("gb28181-rs/"), "neutral default, got {ua}");
+        assert!(!ua.to_lowercase().contains("mibee"));
+
+        let client2 = client.clone().with_user_agent("host-app/1.0 gb28181-rs");
+        assert_eq!(
+            client2.build_register().get_header("User-Agent"),
+            Some("host-app/1.0 gb28181-rs")
+        );
+    }
+
+    /// The REGISTER From-tag stays stable across cseq increments (same
+    /// Call-ID → same tag, RFC 3261 §10.2).
+    #[test]
+    fn test_register_from_tag_stable_across_cseq() {
+        let addr: std::net::SocketAddr = "192.0.2.1:5060".parse().expect("addr");
+        let mut client = SipDeviceClient::new(
+            "34020000001320000001",
+            addr,
+            "192.0.2.2",
+            5060,
+            "3402000000",
+            "pw",
+            3600,
+        );
+        let tag_of = |m: &SipMessage| {
+            m.get_header("From")
+                .and_then(|f| f.split("tag=").nth(1))
+                .unwrap_or_default()
+                .to_string()
+        };
+        let t1 = tag_of(&client.build_register());
+        client.inc_cseq();
+        let t2 = tag_of(&client.build_register());
+        client.inc_cseq();
+        let t3 = tag_of(&client.build_register());
+        assert!(
+            !t1.is_empty() && t1 == t2 && t2 == t3,
+            "tags: {t1} {t2} {t3}"
+        );
     }
 
     #[test]

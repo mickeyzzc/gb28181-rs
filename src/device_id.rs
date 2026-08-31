@@ -30,9 +30,27 @@ pub struct DeviceIdParts {
 /// * `industry` - 2-digit industry type code
 /// * `dev_type` - 3-digit device type code
 /// * `serial` - 7-digit serial number
-pub fn format_device_id(center_code: &str, industry: u8, dev_type: u16, serial: u32) -> String {
-    assert_eq!(center_code.len(), 8, "center_code must be 8 digits");
-    format!("{}{:02}{:03}{:07}", center_code, industry, dev_type, serial)
+///
+/// # Errors
+/// `Err` when `center_code` is not exactly 8 ASCII digits (this is a public
+/// API — bad input is returned, never panicked on).
+pub fn format_device_id(
+    center_code: &str,
+    industry: u8,
+    dev_type: u16,
+    serial: u32,
+) -> Result<String> {
+    if center_code.len() != 8 || !center_code.chars().all(|c| c.is_ascii_digit()) {
+        bail!(
+            "center_code must be exactly 8 ASCII digits, got {:?} ({} chars)",
+            center_code,
+            center_code.len()
+        );
+    }
+    Ok(format!(
+        "{}{:02}{:03}{:07}",
+        center_code, industry, dev_type, serial
+    ))
 }
 
 /// Parse a 20-digit GB/T 28181 device ID into its components.
@@ -87,7 +105,7 @@ mod tests {
         // The default device/channel ID used across this workspace:
         // region 34020000, industry 00, type 132, serial 0000001.
         assert_eq!(
-            format_device_id("34020000", 0, 132, 1),
+            format_device_id("34020000", 0, 132, 1).expect("valid center"),
             "34020000001320000001"
         );
     }
@@ -95,7 +113,7 @@ mod tests {
     #[test]
     fn format_zero_pads_each_field() {
         assert_eq!(
-            format_device_id("11000000", 6, 5, 42),
+            format_device_id("11000000", 6, 5, 42).expect("valid center"),
             "11000000060050000042"
         );
     }
@@ -105,7 +123,8 @@ mod tests {
         for (industry, dev_type, serial) in
             [(0u8, 132u16, 2000001u32), (0, 111, 7), (6, 118, 9999999)]
         {
-            let id = format_device_id("34020000", industry, dev_type, serial);
+            let id =
+                format_device_id("34020000", industry, dev_type, serial).expect("valid center");
             let parts = parse_device_id(&id).expect("roundtrip parses");
             assert_eq!(parts.region_code, "34020000");
             assert_eq!(parts.industry_type, industry);
@@ -116,7 +135,8 @@ mod tests {
 
     #[test]
     fn format_with_ipc_type_code() {
-        let id = format_device_id("34020000", 0, u16::from(device_types::IPC), 1);
+        let id =
+            format_device_id("34020000", 0, u16::from(device_types::IPC), 1).expect("valid center");
         assert_eq!(id, "34020000001110000001");
         assert_eq!(
             parse_device_id(&id).unwrap().device_type,
@@ -151,9 +171,12 @@ mod tests {
         assert!(parse_device_id("3402000A0013200000001").is_err());
     }
 
+    /// Regression: a bad center code is a returned error, not a panic —
+    /// consumer-reachable APIs must not panic on input.
     #[test]
-    #[should_panic(expected = "center_code must be 8 digits")]
-    fn format_panics_on_short_center_code() {
-        let _ = format_device_id("3402000", 0, 132, 1);
+    fn format_rejects_bad_center_code_without_panicking() {
+        assert!(format_device_id("3402000", 0, 132, 1).is_err());
+        assert!(format_device_id("3402000A", 0, 132, 1).is_err());
+        assert!(format_device_id("", 0, 132, 1).is_err());
     }
 }

@@ -33,7 +33,7 @@ impl MockFrameHub {
 
     /// Writes an access unit to all subscribers (non-blocking, drops on full).
     pub fn write(&self, au: AccessUnit) {
-        let guard = self.subscribers.lock().unwrap();
+        let guard = self.subscribers.lock().unwrap_or_else(|p| p.into_inner());
         for sender in guard.values() {
             let _ = sender.try_send(au.clone());
         }
@@ -41,7 +41,10 @@ impl MockFrameHub {
 
     /// Number of currently registered subscribers.
     pub fn subscriber_count(&self) -> usize {
-        self.subscribers.lock().unwrap().len()
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .len()
     }
 }
 
@@ -55,12 +58,18 @@ impl FrameSource for MockFrameHub {
     fn subscribe_with_capacity(&self, capacity: usize) -> FrameSubscription {
         let (tx, rx) = mpsc::sync_channel(capacity);
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        self.subscribers.lock().unwrap().insert(id, tx);
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(id, tx);
         FrameSubscription { id, receiver: rx }
     }
 
     fn unsubscribe(&self, id: u64) {
-        self.subscribers.lock().unwrap().remove(&id);
+        self.subscribers
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&id);
     }
 }
 

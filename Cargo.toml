@@ -1,6 +1,6 @@
 [package]
 name = "gb28181-rs"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.80"
 description = "GB/T 28181-2016/2022 device-side (UAC) library for Rust: SIP signaling, MANSCDP XML, RTP/PS media push, playback"
@@ -11,7 +11,9 @@ categories = ["multimedia", "network-programming"]
 
 [dependencies]
 anyhow = "1"
+encoding_rs = "0.8"
 hex = "0.4"
+log = "0.4"
 md-5 = "0.10"
 rand = "0.8"
 serde = { version = "1", features = ["derive"] }

@@ -25,6 +25,9 @@ pub enum Transport {
 /// GB28181 SIP device settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gb28181Config {
+    /// Host-side enable switch. The library itself NEVER reads this field —
+    /// the host gates `Gb28181Server::start()` on it. Keeping it here lets
+    /// hosts re-export [`Gb28181Config`] straight into their config files.
     #[serde(default = "default_gb28181_enabled")]
     pub enabled: bool,
     #[serde(default = "default_gb28181_platform_sip_address")]
@@ -49,6 +52,87 @@ pub struct Gb28181Config {
     pub heartbeat_timeout_count: u32,
     #[serde(default)]
     pub transport: Transport,
+    /// SIP `User-Agent` header value. `None` → neutral
+    /// `gb28181-rs/<version>` (never a product name).
+    #[serde(default)]
+    pub user_agent: Option<String>,
+    /// Catalog/DeviceInfo `Name`. `None` → `Camera <device_id>`.
+    #[serde(default)]
+    pub device_name: Option<String>,
+    /// Catalog/DeviceInfo `Manufacturer`. `None` → `Unknown`.
+    #[serde(default)]
+    pub manufacturer: Option<String>,
+    /// Catalog/DeviceInfo `Model`. `None` → `Unknown`.
+    #[serde(default)]
+    pub model: Option<String>,
+    /// DeviceInfo `Firmware` version string. `None` → the crate version.
+    #[serde(default)]
+    pub firmware: Option<String>,
+}
+
+impl Gb28181Config {
+    /// Effective SIP User-Agent (config override or the neutral default).
+    #[must_use]
+    pub fn effective_user_agent(&self) -> String {
+        self.user_agent
+            .clone()
+            .unwrap_or_else(|| format!("gb28181-rs/{}", env!("CARGO_PKG_VERSION")))
+    }
+
+    /// Effective catalog/device display name.
+    #[must_use]
+    pub fn effective_device_name(&self) -> String {
+        self.device_name
+            .clone()
+            .unwrap_or_else(|| format!("Camera {}", self.device_id))
+    }
+
+    /// Effective manufacturer string.
+    #[must_use]
+    pub fn effective_manufacturer(&self) -> String {
+        self.manufacturer
+            .clone()
+            .unwrap_or_else(|| "Unknown".to_string())
+    }
+
+    /// Effective model string.
+    #[must_use]
+    pub fn effective_model(&self) -> String {
+        self.model.clone().unwrap_or_else(|| "Unknown".to_string())
+    }
+
+    /// Effective firmware string.
+    #[must_use]
+    pub fn effective_firmware(&self) -> String {
+        self.firmware
+            .clone()
+            .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
+    }
+
+    /// Log a warning when serde defaults that point at the spec's example
+    /// values survived into a running server — a mis-loaded host config
+    /// would otherwise silently target `192.168.1.1` with password
+    /// `12345678` and the spec-example device ID.
+    pub fn warn_on_example_defaults(&self) {
+        if self.platform_sip_address == default_gb28181_platform_sip_address() {
+            log::warn!(
+                "gb28181: platform_sip_address is the example default {} — set it explicitly in the host config",
+                default_gb28181_platform_sip_address()
+            );
+        }
+        if self.password == default_gb28181_password() {
+            log::warn!(
+                "gb28181: password is the example default {:?} — set it explicitly in the host config",
+                default_gb28181_password()
+            );
+        }
+        if self.device_id == default_gb28181_device_id() {
+            log::warn!(
+                "gb28181: device_id is the spec-example ID {} — two devices with it collide on the platform",
+                default_gb28181_device_id()
+            );
+        }
+    }
 }
 
 fn default_gb28181_enabled() -> bool {
@@ -100,6 +184,11 @@ impl Default for Gb28181Config {
             heartbeat_interval_secs: default_gb28181_heartbeat_interval_secs(),
             heartbeat_timeout_count: default_gb28181_heartbeat_timeout_count(),
             transport: Transport::default(),
+            user_agent: None,
+            device_name: None,
+            manufacturer: None,
+            model: None,
+            firmware: None,
         }
     }
 }
@@ -127,5 +216,61 @@ mod tests {
         assert_eq!(d.heartbeat_interval_secs, s.heartbeat_interval_secs);
         assert_eq!(d.heartbeat_timeout_count, s.heartbeat_timeout_count);
         assert!(matches!(d.transport, Transport::Udp));
+        assert_eq!(d.user_agent, None);
+        assert_eq!(d.device_name, None);
+        assert_eq!(d.manufacturer, None);
+        assert_eq!(d.model, None);
+        assert_eq!(d.firmware, None);
+    }
+
+    /// Identity defaults are neutral (no product/vendor branding) and
+    /// overridable — the core library-neutrality contract.
+    #[test]
+    fn identity_defaults_are_neutral_and_overridable() {
+        let cfg = Gb28181Config::default();
+        assert!(cfg.effective_user_agent().starts_with("gb28181-rs/"));
+        assert!(!cfg.effective_user_agent().to_lowercase().contains("mibee"));
+        assert_eq!(
+            cfg.effective_device_name(),
+            format!("Camera {}", cfg.device_id)
+        );
+        assert!(!cfg.effective_device_name().contains("MiBee"));
+        assert_eq!(cfg.effective_manufacturer(), "Unknown");
+        assert_eq!(cfg.effective_model(), "Unknown");
+        assert_eq!(cfg.effective_firmware(), env!("CARGO_PKG_VERSION"));
+
+        let cfg = Gb28181Config {
+            user_agent: Some("host/1.0".to_string()),
+            device_name: Some("前门摄像头".to_string()),
+            manufacturer: Some("Acme".to_string()),
+            model: Some("Cam-X".to_string()),
+            firmware: Some("9.9.9".to_string()),
+            ..Gb28181Config::default()
+        };
+        assert_eq!(cfg.effective_user_agent(), "host/1.0");
+        assert_eq!(cfg.effective_device_name(), "前门摄像头");
+        assert_eq!(cfg.effective_manufacturer(), "Acme");
+        assert_eq!(cfg.effective_model(), "Cam-X");
+        assert_eq!(cfg.effective_firmware(), "9.9.9");
+    }
+
+    /// serde round-trip of the optional identity overrides.
+    #[test]
+    fn identity_overrides_survive_serde() {
+        let toml_src = r#"
+platform_sip_address = "10.0.0.5"
+device_id = "34020000001320000099"
+user_agent = "host/2.0"
+device_name = "Gate Camera"
+manufacturer = "Acme"
+model = "Cam-Y"
+firmware = "1.2.3"
+"#;
+        let cfg: Gb28181Config = toml::from_str(toml_src).expect("parse");
+        assert_eq!(cfg.effective_user_agent(), "host/2.0");
+        assert_eq!(cfg.effective_device_name(), "Gate Camera");
+        assert_eq!(cfg.effective_manufacturer(), "Acme");
+        assert_eq!(cfg.effective_model(), "Cam-Y");
+        assert_eq!(cfg.effective_firmware(), "1.2.3");
     }
 }
