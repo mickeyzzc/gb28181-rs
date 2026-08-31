@@ -91,16 +91,16 @@ Identity fields (all optional, all neutral by default — this library never adv
 
 ## Documentation
 
-Topic guides under [`docs/`](docs/) (English, with Chinese counterparts in [`docs/zh/`](docs/zh/)):
+Topic guides live under [`docs/en/`](docs/en/) — each has a Chinese counterpart under `docs/zh/`:
 
 | Guide | Covers |
 |---|---|
-| [Configuration](docs/configuration.md) · [配置](docs/zh/configuration.md) | every `Gb28181Config` field, identity defaults, the example-value warning, device-ID structure |
-| [Live streaming](docs/live-streaming.md) · [直播推流](docs/zh/live-streaming.md) | the `FrameSource` seam, `Nalu`/`AccessUnit` shapes, INVITE lifecycle, PTS derivation |
-| [Recording & playback](docs/recording-playback.md) · [录像回放](docs/zh/recording-playback.md) | `RecordingSource`, `SegmentMeta`, the reference segment format, RecordInfo/playback/download/control |
-| [PS muxing & RTP](docs/psmux.md) · [PS 封装与 RTP](docs/zh/psmux.md) | standalone `mux_h264_to_ps`/`mux_h265_to_ps`, parsing, `RtpPusher`, byte-level golden guarantees |
-| [MANSCDP & charsets](docs/manscdp.md) · [消息与字符集](docs/zh/manscdp.md) | message types, dual element/attribute forms, UTF-8/GB18030 wire charsets, device IDs |
-| [Server lifecycle](docs/server.md) · [服务器生命周期](docs/zh/server.md) | constructors vs binding, UDP/TCP transports, graceful shutdown, retry/backoff, logging |
+| [Configuration](docs/en/configuration.md) | every `Gb28181Config` field, identity defaults, the example-value warning, device-ID structure |
+| [Live streaming](docs/en/live-streaming.md) | the `FrameSource` seam, `Nalu`/`AccessUnit` shapes, INVITE lifecycle, PTS derivation |
+| [Recording & playback](docs/en/recording-playback.md) | `RecordingSource`, `SegmentMeta`, the reference segment format, RecordInfo/playback/download/control |
+| [PS muxing & RTP](docs/en/psmux.md) | standalone `mux_h264_to_ps`/`mux_h265_to_ps`, parsing, `RtpPusher`, byte-level golden guarantees |
+| [MANSCDP & charsets](docs/en/manscdp.md) | message types, dual element/attribute forms, UTF-8/GB18030 wire charsets, device IDs |
+| [Server lifecycle](docs/en/server.md) | constructors vs binding, UDP/TCP transports, graceful shutdown, retry/backoff, logging |
 
 ## Library hygiene (v0.6.0 hardening)
 
