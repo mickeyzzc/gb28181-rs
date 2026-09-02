@@ -139,6 +139,59 @@ struct InviteDialog {
     _media_port: u16,
 }
 
+/// Local-IP route probe retry budget: 30 attempts × 3 s ≈ 90 s, matching
+/// `systemd-networkd-wait-online`'s default timeout — the probe outlives a
+/// normal boot-time DHCP wait instead of killing the server.
+const LOCAL_IP_PROBE_ATTEMPTS: u32 = 30;
+const LOCAL_IP_PROBE_BACKOFF: Duration = Duration::from_secs(3);
+
+/// Retry a local-IP probe until it succeeds, attempts run out, or shutdown
+/// is requested.
+///
+/// `attempt` is an injectable async probe (production: bind a UDP socket and
+/// `connect()` to the platform so the kernel picks the outgoing interface).
+/// Returns `Ok(Some(local_ip))` on success, `Ok(None)` when shutdown was
+/// requested while probing (caller should stop cleanly), or `Err` once all
+/// attempts failed.
+async fn probe_local_ip_with_retry<F, Fut>(
+    mut attempt: F,
+    max_attempts: u32,
+    backoff: Duration,
+    shutdown: &mut watch::Receiver<bool>,
+) -> Result<Option<String>>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<String>>,
+{
+    for attempt_no in 1..=max_attempts {
+        tokio::select! {
+            outcome = attempt() => match outcome {
+                Ok(ip) => return Ok(Some(ip)),
+                Err(e) if attempt_no < max_attempts => {
+                    log::warn!(
+                        "gb28181: local IP probe attempt {attempt_no}/{max_attempts} failed: {e} — retrying in {backoff:?}"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "gb28181: local IP probe to the platform failed after {max_attempts} attempts: {e}"
+                    ));
+                }
+            },
+            _ = shutdown.changed() => return Ok(None),
+        }
+        if attempt_no < max_attempts {
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = shutdown.changed() => return Ok(None),
+            }
+        }
+    }
+    Err(anyhow::anyhow!(
+        "gb28181: local IP probe attempts exhausted"
+    ))
+}
+
 impl Gb28181Server {
     /// Create a new GB28181 server instance.
     ///
@@ -314,10 +367,29 @@ impl Gb28181Server {
 
         // Detect the real local IP by probing the route to the platform
         // (the SIP socket binds 0.0.0.0, so its local_addr() is not usable).
+        // Boot race: at service start the network may not be up yet, making
+        // the probe fail with ENETUNREACH — retry until the route appears,
+        // mirroring the REGISTER lifecycle's wait-for-platform behavior.
         let local_ip = {
-            let probe = UdpSocket::bind("0.0.0.0:0").await?;
-            probe.connect(platform_sip_addr).await?;
-            probe.local_addr()?.ip().to_string()
+            let probe_target = platform_sip_addr;
+            match probe_local_ip_with_retry(
+                || async move {
+                    let probe = UdpSocket::bind("0.0.0.0:0").await?;
+                    probe.connect(probe_target).await?;
+                    Ok(probe.local_addr()?.ip().to_string())
+                },
+                LOCAL_IP_PROBE_ATTEMPTS,
+                LOCAL_IP_PROBE_BACKOFF,
+                shutdown,
+            )
+            .await?
+            {
+                Some(ip) => ip,
+                None => {
+                    log::info!("gb28181: shutdown requested during local IP probe — stopping");
+                    return Ok(());
+                }
+            }
         };
         self.local_ip = local_ip.clone();
         let local_sip_port = self.config.local_sip_port;
@@ -1704,6 +1776,131 @@ fn random_cseq() -> u32 {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+
+    // -- local IP probe retry (boot network race) ---------------------------
+
+    /// A probe that fails twice with ENETUNREACH (the boot race: no route to
+    /// the platform yet) and succeeds on the third call must succeed overall
+    /// after exactly three attempts.
+    #[tokio::test]
+    async fn test_local_ip_probe_retries_transient_failures() {
+        let (_tx, mut rx) = watch::channel(false);
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let scripted = Arc::clone(&calls);
+        let ip = probe_local_ip_with_retry(
+            move || {
+                let n = scripted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    if n < 2 {
+                        Err(std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            "network is unreachable (simulated boot race)",
+                        ))
+                    } else {
+                        Ok("192.0.2.10".to_string())
+                    }
+                }
+            },
+            5,
+            Duration::from_millis(1),
+            &mut rx,
+        )
+        .await
+        .expect("probe must succeed after transient failures");
+        assert_eq!(ip.as_deref(), Some("192.0.2.10"));
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "exactly three attempts expected"
+        );
+    }
+
+    /// A permanently failing probe must return an error after exactly
+    /// `max_attempts` attempts (not loop forever).
+    #[tokio::test]
+    async fn test_local_ip_probe_errors_after_max_attempts() {
+        let (_tx, mut rx) = watch::channel(false);
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let scripted = Arc::clone(&calls);
+        let result = probe_local_ip_with_retry(
+            move || {
+                scripted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "network is unreachable",
+                    ))
+                }
+            },
+            3,
+            Duration::from_millis(1),
+            &mut rx,
+        )
+        .await;
+        let err = result.expect_err("exhausted probe must error");
+        assert!(
+            err.to_string().contains("after 3 attempts"),
+            "error should mention the attempt count: {err}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    /// Shutdown requested during the backoff sleep must abort the probe
+    /// immediately with `Ok(None)` instead of waiting out the backoff.
+    #[tokio::test]
+    async fn test_local_ip_probe_shutdown_during_backoff_aborts() {
+        let (tx, mut rx) = watch::channel(false);
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let scripted = Arc::clone(&calls);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let _ = tx.send(true);
+        });
+        let started = std::time::Instant::now();
+        let ip = probe_local_ip_with_retry(
+            move || {
+                scripted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::NotConnected,
+                        "network is unreachable",
+                    ))
+                }
+            },
+            100,
+            Duration::from_secs(3600),
+            &mut rx,
+        )
+        .await
+        .expect("shutdown abort must not be an error");
+        assert_eq!(ip, None, "shutdown must abort with Ok(None)");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "shutdown must preempt the (1-hour) backoff"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    /// A probe that succeeds on the first attempt must not sleep at all.
+    #[tokio::test]
+    async fn test_local_ip_probe_first_try_success_no_retry() {
+        let (_tx, mut rx) = watch::channel(false);
+        let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let scripted = Arc::clone(&calls);
+        let ip = probe_local_ip_with_retry(
+            move || {
+                scripted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                async move { Ok("203.0.113.7".to_string()) }
+            },
+            5,
+            Duration::from_secs(3600),
+            &mut rx,
+        )
+        .await
+        .expect("immediate success");
+        assert_eq!(ip.as_deref(), Some("203.0.113.7"));
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn test_build_device_sdp_answer() {
