@@ -418,7 +418,7 @@ async fn main() -> Result<()> {
     let hub = Arc::new(MockFrameHub::new());
     tokio::spawn(produce_frames(Arc::clone(&hub)));
 
-    Gb28181Server::start(config, hub, None).await?;
+    let server = Gb28181Server::start(config, hub, None).await?;
     println!(
         "[device]  gb28181-rs {} starting (SIP UDP :15060)",
         env!("CARGO_PKG_VERSION")
@@ -436,5 +436,9 @@ async fn main() -> Result<()> {
         bail!("no keyframe received — GOP never fired?");
     }
     println!("device demo: all checks passed");
+    // Keep the server handle alive across the demo and let it exit cleanly
+    // with the demo timeout instead of being dropped unsupervised.
+    server.abort();
+
     Ok(())
 }

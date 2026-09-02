@@ -67,3 +67,40 @@ tokio::select! {
 `tracing`……）即可看到注册、INVITE、媒体事件。不直接写 stdout/stderr。
 
 [`log`]: https://docs.rs/log
+
+## 语音对讲（audio-only INVITE，接收侧）
+
+GB/T 28181-2022 §9.2 语音对讲：平台向设备发起 **audio-only INVITE**
+（只有 `m=audio`、没有 `m=video`），随后把 G.711 RTP 流推给设备。0.7.0
+起本库实现接收侧：
+
+```rust
+use std::sync::Arc;
+use gb28181_rs::{Gb28181Config, Gb28181Server};
+
+// 闭包 Fn(&[u8], u32) 开箱即用（有 blanket impl）：
+let sink = |payload: &[u8], ssrc: u32| {
+    // payload = 一个 RTP 包的 G.711 字节（A 律 payload type 8，
+    // μ 律 payload type 0）。拷贝进通道交给音频输出线程——
+    // 这里跑在媒体任务上，必须轻量。
+};
+
+let server = Gb28181Server::new(config, hub)
+    .with_audio_sink(Arc::new(sink));
+```
+
+行为细节：
+
+- offer 解析：audio-only offer 会让 `parse_invite` 给出
+  `media_kind: MediaKind::Audio` 与 `audio_codec`
+  （`AudioCodec::Pcma`/`Pcmu`）；带 `m=video` 的混合 offer 走原视频推流路径。
+- 应答通告一个临时 UDP 接收端口，回显 offer 的 payload type
+  （`a=rtpmap:8 PCMA/8000` / `0 PCMU/8000`），`y=` 行带会话 SSRC——
+  字节级稳定，golden 测试约束。
+- 收到的每个 RTP 包去掉 12 字节固定头（含 CSRC 列表）后，负载连同
+  包内 SSRC 交给 sink。
+- 未注册 sink、或 offer 为非 G.711 / TCP 媒体时，INVITE 被 **488** 拒绝。
+- 对讲会话与视频会话共用同一个会话槽位：视频 INVITE 会回收进行中的
+  对讲，反之亦然；BYE 走共享的媒体任务清理路径终结接收。
+
+设备麦克风音频的上行（发送侧）不在本修订内。

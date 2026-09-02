@@ -22,7 +22,8 @@ use crate::frame::{AccessUnit, FrameSource};
 
 use super::client::{
     build_catalog_response, build_device_info_response, build_keepalive_notify,
-    parse_401_challenge, parse_invite, MediaTransport, SipDeviceClient,
+    parse_401_challenge, parse_invite, AudioCodec, InviteInfo, MediaKind, MediaTransport,
+    SipDeviceClient,
 };
 use super::manscdp::{ChannelItem, DeviceItem};
 use super::playback::{parse_playback_control, run_playback_task, PlaybackControl};
@@ -42,7 +43,13 @@ pub(super) const PS_PAYLOAD_TYPE: u8 = 96;
 /// (`handle.await`) to wait for the server task to finish, or call
 /// [`ServerHandle::shutdown`] for a graceful stop (the SIP recv/accept loop,
 /// the keepalive task, and any active media task all stop).
+///
+/// `#[must_use]`: dropping the handle detaches you from the server (it keeps
+/// running), but hosts that spawned it inside a `tokio::spawn` and let the
+/// handle drop have repeatedly ended up with dead servers — await it or keep
+/// it for shutdown.
 #[derive(Debug)]
+#[must_use = "dropping the handle leaves the server unsupervised; await it or call shutdown()"]
 pub struct ServerHandle {
     task: tokio::task::JoinHandle<()>,
     shutdown: watch::Sender<bool>,
@@ -86,6 +93,27 @@ impl std::future::Future for ServerHandle {
 ///
 /// Manages the device's registration with a SIP platform and handles
 /// INVITE/BYE sessions for streaming video.
+/// Receives G.711 audio payload from a talkback session
+/// (audio-only INVITE, GB/T 28181-2022 §9.2 — the device-side receive half
+/// of voice talkback).
+///
+/// `on_audio` is called once per received RTP packet on the media task;
+/// keep it cheap (copy and forward, e.g. into a channel to the audio
+/// output thread). Implement this trait, or just pass a closure
+/// `Fn(&[u8], u32)` — a blanket impl covers closures.
+pub trait AudioTalkbackSink: Send + Sync {
+    /// One RTP packet's audio payload (G.711 A-law/μ-law bytes) and the
+    /// packet's SSRC (falls back to the session SSRC when the header
+    /// carries 0).
+    fn on_audio(&self, payload: &[u8], ssrc: u32);
+}
+
+impl<F: Fn(&[u8], u32) + Send + Sync> AudioTalkbackSink for F {
+    fn on_audio(&self, payload: &[u8], ssrc: u32) {
+        self(payload, ssrc)
+    }
+}
+
 pub struct Gb28181Server {
     /// Configuration for the GB28181 server
     config: Gb28181Config,
@@ -113,6 +141,9 @@ pub struct Gb28181Server {
     recording_index: Option<Arc<dyn RecordingSource>>,
     /// Control channel for an active playback session (SIP INFO PlaybackControl).
     playback_ctl: Option<mpsc::Sender<PlaybackControl>>,
+    /// Audio talkback sink (audio-only INVITE receive). `None` = talkback
+    /// INVITEs are refused with 488.
+    audio_sink: Option<Arc<dyn AudioTalkbackSink>>,
 }
 
 /// Information about an active INVITE dialog.
@@ -225,7 +256,17 @@ impl Gb28181Server {
             local_ip: String::new(),
             recording_index,
             playback_ctl: None,
+            audio_sink: None,
         }
+    }
+
+    /// Attach the audio talkback sink (receive half of GB/T 28181-2022
+    /// §9.2 voice talkback). Without it, audio-only INVITEs are refused
+    /// with 488.
+    #[must_use]
+    pub fn with_audio_sink(mut self, sink: Arc<dyn AudioTalkbackSink>) -> Self {
+        self.audio_sink = Some(sink);
+        self
     }
 
     /// Bind the SIP socket and run this server (instance flavor of
@@ -305,6 +346,7 @@ impl Gb28181Server {
         let au_hub = self.au_hub;
         let config = self.config;
         let recording_index = self.recording_index;
+        let audio_sink = self.audio_sink;
 
         let handle = tokio::spawn(async move {
             // Accept loop for TCP connections
@@ -316,6 +358,7 @@ impl Gb28181Server {
                                 let au_hub_clone = Arc::clone(&au_hub);
                                 let config_clone = config.clone();
                                 let rec_clone = recording_index.clone();
+                                let sink_clone = audio_sink.clone();
                                 let mut shutdown_conn = shutdown_rx.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_tcp_connection(
@@ -324,6 +367,7 @@ impl Gb28181Server {
                                         au_hub_clone,
                                         config_clone,
                                         rec_clone,
+                                        sink_clone,
                                         &mut shutdown_conn,
                                     )
                                     .await
@@ -949,6 +993,12 @@ impl Gb28181Server {
             return Ok(());
         }
 
+        // Audio-only offer = talkback receive (GB/T 28181-2022 §9.2): the
+        // platform streams G.711 to us instead of us pushing PS video.
+        if invite_info.media_kind == MediaKind::Audio {
+            return self.handle_audio_invite(msg, invite_info, peer_addr).await;
+        }
+
         // Bind local UDP for media (ephemeral port)
         let media_socket = UdpSocket::bind("0.0.0.0:0")
             .await
@@ -1142,6 +1192,140 @@ impl Gb28181Server {
     }
 
     /// Handle SIP BYE request.
+    /// Handle an audio-only INVITE (talkback receive, GB/T 28181-2022 §9.2).
+    ///
+    /// The answer advertises an ephemeral UDP port; the platform streams
+    /// G.711 RTP to it and each packet's audio payload goes to the
+    /// configured [`AudioTalkbackSink`]. Refused with 488 when no sink is
+    /// registered, the codec is not G.711 A/μ-law, or the offer asks for
+    /// TCP media (UDP only in this revision).
+    ///
+    /// The talkback dialog occupies the same single-dialog slot as video
+    /// sessions: an audio INVITE recycles any active video session and vice
+    /// versa, and BYE tears the talkback receiver down through the shared
+    /// media-task cleanup.
+    async fn handle_audio_invite(
+        &mut self,
+        msg: &SipMessage,
+        invite_info: InviteInfo,
+        peer_addr: SocketAddr,
+    ) -> Result<()> {
+        let Some(sink) = self.audio_sink.clone() else {
+            log::warn!("gb28181: talkback INVITE but no audio sink configured — 488");
+            let resp = build_error_response(msg, 488, "Not Acceptable Here");
+            self.send_sip_message(&resp, peer_addr).await?;
+            return Ok(());
+        };
+        let Some(codec) = invite_info.audio_codec else {
+            log::warn!("gb28181: talkback INVITE with non-G.711 codec — 488");
+            let resp = build_error_response(msg, 488, "Not Acceptable Here");
+            self.send_sip_message(&resp, peer_addr).await?;
+            return Ok(());
+        };
+        if invite_info.media_transport != MediaTransport::Udp {
+            log::warn!("gb28181: talkback over TCP media unsupported — 488");
+            let resp = build_error_response(msg, 488, "Not Acceptable Here");
+            self.send_sip_message(&resp, peer_addr).await?;
+            return Ok(());
+        }
+
+        log::info!(
+            "gb28181: talkback INVITE from {} ({}), ssrc {}",
+            peer_addr,
+            codec.name(),
+            invite_info.ssrc
+        );
+
+        // Bind the receive port advertised in the answer (ephemeral UDP).
+        let media_socket = UdpSocket::bind("0.0.0.0:0")
+            .await
+            .context("gb28181: failed to bind talkback media socket")?;
+        let media_socket = Arc::new(media_socket);
+        let media_port = media_socket.local_addr()?.port();
+
+        let local_tag = rand::random::<u32>();
+        let cseq = msg
+            .get_header("CSeq")
+            .and_then(|c| c.split_whitespace().next())
+            .and_then(|c| c.parse::<u32>().ok())
+            .unwrap_or(1);
+        let device_ip = self.local_ip.clone();
+        let local_sip_port = self.config.local_sip_port;
+
+        let sdp = build_audio_sdp_answer(media_port, invite_info.ssrc, &device_ip, codec);
+        let response = build_invite_response(
+            msg,
+            &self.config.device_id,
+            &sdp,
+            local_tag,
+            cseq,
+            &device_ip,
+            local_sip_port,
+        );
+        self.send_sip_message(&response, peer_addr).await?;
+
+        // Dialog bookkeeping on the shared slot so retransmission resend,
+        // re-INVITE recycle and BYE cleanup all reuse the existing paths.
+        let remote_tag = msg
+            .get_header("From")
+            .and_then(|f| f.strip_prefix("<").and_then(|f| f.strip_suffix(">")))
+            .and_then(|f| f.split(';').nth(1))
+            .and_then(|t| t.strip_prefix("tag="))
+            .unwrap_or("unknown")
+            .to_string();
+        let call_id = msg.get_header("Call-ID").unwrap_or("unknown").to_string();
+        self.invite_info = Some(InviteDialog {
+            call_id: call_id.clone(),
+            _remote_tag: remote_tag,
+            _local_tag: local_tag,
+            cseq,
+            invite_response: Some(response),
+            _remote_addr: peer_addr,
+            _ssrc: invite_info.ssrc,
+            _media_addr: invite_info.media_address,
+            _media_port: invite_info.media_port,
+        });
+
+        // RTP receive loop: strip the fixed 12-byte header (+ CSRC list)
+        // and hand the G.711 payload to the sink. Lives on the shared
+        // media_task slot, so BYE / dialog recycle aborts it.
+        let session_ssrc = invite_info.ssrc;
+        let recv_socket = Arc::clone(&media_socket);
+        let media_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            loop {
+                match recv_socket.recv_from(&mut buf).await {
+                    Ok((len, _)) => {
+                        if len < 12 {
+                            continue;
+                        }
+                        let csrc_count = (buf[0] & 0x0F) as usize;
+                        let header_len = 12 + csrc_count * 4;
+                        if len <= header_len {
+                            continue;
+                        }
+                        let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                        sink.on_audio(
+                            &buf[header_len..len],
+                            if ssrc != 0 { ssrc } else { session_ssrc },
+                        );
+                    }
+                    Err(e) => {
+                        log::warn!("gb28181: talkback recv error: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+        self.media_task = Some(media_task);
+        self.media_socket = Some(media_socket);
+        log::info!(
+            "gb28181: talkback session {call_id} receiving {} on UDP :{media_port}",
+            codec.name()
+        );
+        Ok(())
+    }
+
     async fn handle_bye(&mut self, msg: &SipMessage, peer_addr: SocketAddr) -> Result<()> {
         // BYE for a dialog we don't have (none active, or Call-ID mismatch):
         // 481, and NO side effects on registration/keepalive state (a
@@ -1406,6 +1590,29 @@ fn build_device_sdp_answer(
     }
 }
 
+/// Build the SDP answer for an audio-only talkback INVITE
+/// (GB/T 28181-2022 §9.2): the device advertises the UDP port its RTP
+/// receive loop is bound to and mirrors the offered G.711 payload type.
+fn build_audio_sdp_answer(
+    media_port: u16,
+    ssrc: u32,
+    device_ip: &str,
+    codec: AudioCodec,
+) -> String {
+    let pt = codec.payload_type();
+    format!(
+        "v=0\r\n\
+         o=- 0 0 IN IP4 {device_ip}\r\n\
+         s=Play\r\n\
+         c=IN IP4 {device_ip}\r\n\
+         t=0 0\r\n\
+         m=audio {media_port} RTP/AVP {pt}\r\n\
+         a=rtpmap:{pt} {}/8000\r\n\
+         y={ssrc}\r\n",
+        codec.name()
+    )
+}
+
 /// Build a SIP error response.
 fn build_error_response(request: &SipMessage, code: u16, reason: &str) -> SipMessage {
     let mut headers = Vec::new();
@@ -1610,6 +1817,7 @@ async fn handle_tcp_connection(
     au_hub: Arc<dyn FrameSource>,
     config: Gb28181Config,
     recording_index: Option<Arc<dyn RecordingSource>>,
+    audio_sink: Option<Arc<dyn AudioTalkbackSink>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     use tokio::io::BufReader;
@@ -1654,6 +1862,7 @@ async fn handle_tcp_connection(
         local_ip: local_ip.clone(),
         recording_index,
         playback_ctl: None,
+        audio_sink,
     };
 
     // Create SIP device client (User-Agent from config; neutral default)
@@ -1917,6 +2126,27 @@ mod tests {
         assert!(sdp.contains("c=IN IP4 192.168.1.100"));
     }
 
+    /// Talkback SDP answer golden (GB/T 28181-2022 §9.2): m=audio mirrors
+    /// the offered payload type, y= carries the session SSRC, and the
+    /// device's receive port is the one the RTP recv loop binds.
+    #[test]
+    fn test_build_audio_sdp_answer_pcma() {
+        let sdp = build_audio_sdp_answer(40000, 777, "192.168.62.104", AudioCodec::Pcma);
+        assert_eq!(
+            sdp,
+            "v=0\r\no=- 0 0 IN IP4 192.168.62.104\r\ns=Play\r\nc=IN IP4 192.168.62.104\r\nt=0 0\r\nm=audio 40000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\ny=777\r\n"
+        );
+    }
+
+    #[test]
+    fn test_build_audio_sdp_answer_pcmu() {
+        let sdp = build_audio_sdp_answer(40001, 778, "192.168.62.104", AudioCodec::Pcmu);
+        assert_eq!(
+            sdp,
+            "v=0\r\no=- 0 0 IN IP4 192.168.62.104\r\ns=Play\r\nc=IN IP4 192.168.62.104\r\nt=0 0\r\nm=audio 40001 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\ny=778\r\n"
+        );
+    }
+
     /// Issue #5 regression: gosip (MiBee NVR) parses the CSeq sequence into
     /// a signed int32 and drops the header (→ 400 Bad Request) when the value
     /// exceeds i32::MAX. `random_cseq()` must NEVER return a value that
@@ -2177,6 +2407,7 @@ async fn test_recordinfo_dispatch_with_source() {
         local_ip: "192.168.62.104".to_string(),
         recording_index: Some(Arc::new(source)),
         playback_ctl: None,
+        audio_sink: None,
     };
 
     // Query times are derived from the segment's own ms via the same
@@ -2257,6 +2488,7 @@ async fn test_recordinfo_dispatch_without_source() {
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
+        audio_sink: None,
     };
 
     let body = "<Query><CmdType>RecordInfo</CmdType><SN>9</SN><DeviceID>34020000001320000001</DeviceID><StartTime>2026-08-15T14:00:00</StartTime><EndTime>2026-08-15T15:00:00</EndTime></Query>";
@@ -2316,6 +2548,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
+        audio_sink: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786807800\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -2405,6 +2638,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         local_ip: "192.168.62.104".to_string(),
         recording_index: Some(Arc::new(source)),
         playback_ctl: None,
+        audio_sink: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786804500\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -2491,6 +2725,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
+        audio_sink: None,
     };
     let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
     let peer_addr = peer.local_addr().expect("peer addr");
@@ -2637,6 +2872,7 @@ async fn test_info_playback_control_live_session_noop() {
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
+        audio_sink: None,
     };
 
     let body = "<Control><CmdType>PlaybackControl</CmdType><SN>1</SN><DeviceID>34020000001320000001</DeviceID><Info><ControlValue>PAUSE</ControlValue></Info></Control>";
@@ -2726,6 +2962,7 @@ mod tcp_media_tests {
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
+            audio_sink: None,
         };
 
         // Platform stand-in: TCP listener on an ephemeral port.
@@ -2851,6 +3088,7 @@ mod tcp_media_tests {
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
+            audio_sink: None,
         };
 
         let body = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 9 TCP/RTP/AVP 96\r\na=setup:active\r\ny=2000000001\r\n";
@@ -2929,6 +3167,7 @@ mod tcp_media_tests {
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
+            audio_sink: None,
         };
 
         // Fake platform: sends a STALE 200 OK (wrong CSeq) before the real 401,
@@ -2988,5 +3227,186 @@ mod tcp_media_tests {
             .await
             .expect("register must succeed despite stale interleaved responses");
         sender.await.unwrap();
+    }
+    // ─── audio talkback receive (GB/T 28181-2022 §9.2) ─────────────────────
+
+    fn audio_invite_msg(call_id: &str, pt: u8) -> SipMessage {
+        SipMessage {
+            start_line: "INVITE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Invite),
+            status_code: None,
+            uri: Some("sip:34020000001320000001@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                (
+                    "From".to_string(),
+                    "<sip:34020000002000000001@3402000000>;tag=plat".to_string(),
+                ),
+                (
+                    "To".to_string(),
+                    "<sip:34020000001320000001@3402000000>".to_string(),
+                ),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "Via".to_string(),
+                    "SIP/2.0/UDP 192.168.63.197:5060;branch=z9hG4bKaudio".to_string(),
+                ),
+            ],
+            body: format!(
+                "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Play\r\nc=IN IP4 192.168.63.197\r\nt=0 0\r\nm=audio 15062 RTP/AVP {pt}\r\na=sendonly\r\ny=777\r\n"
+            ),
+        }
+    }
+
+    /// A talkback INVITE with no sink registered is refused with 488 —
+    /// receiving audio nobody consumes would be a silent black hole.
+    #[tokio::test]
+    async fn test_audio_invite_without_sink_returns_488() {
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "192.168.62.104".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+        };
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let msg = audio_invite_msg("audio-nosink-1", 8);
+        server
+            .handle_invite(&msg, peer_addr)
+            .await
+            .expect("handle_invite should not error");
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 488")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert_eq!(resp.status_code.map(|c| c.code()), Some(488));
+    }
+
+    /// Full talkback loop: audio INVITE → 200 OK with m=audio answer →
+    /// platform streams RTP to the answered port → the sink receives the
+    /// G.711 payload with the session SSRC.
+    #[tokio::test]
+    async fn test_audio_invite_answers_and_delivers_rtp() {
+        use std::sync::Mutex;
+        type Collected = Arc<Mutex<Vec<(Vec<u8>, u32)>>>;
+        let received: Collected = Arc::new(Mutex::new(Vec::new()));
+        let sink_capture = Arc::clone(&received);
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: Some(Arc::new(move |payload: &[u8], ssrc: u32| {
+                sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
+            })),
+        };
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let msg = audio_invite_msg("audio-e2e-1", 8);
+        server
+            .handle_invite(&msg, peer_addr)
+            .await
+            .expect("handle_invite should not error");
+
+        // 1) 200 OK with an m=audio answer carrying a receive port.
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 200 OK")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert_eq!(resp.status_code.map(|c| c.code()), Some(200));
+        assert!(resp.body.contains("m=audio "));
+        assert!(resp.body.contains("a=rtpmap:8 PCMA/8000"));
+        assert!(resp.body.contains("y=777"));
+        let audio_port: u16 = resp
+            .body
+            .lines()
+            .find(|l| l.starts_with("m=audio "))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|p| p.parse().ok())
+            .expect("audio port in answer");
+
+        // 2) Stream one RTP packet (PCMA, SSRC 777) at the answered port.
+        let mut pkt = vec![
+            0x80u8, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x09,
+        ];
+        pkt.extend_from_slice(&[0xD5u8, 0x5A, 0xA5]);
+        peer.send_to(&pkt, ("127.0.0.1", audio_port))
+            .await
+            .expect("send rtp");
+
+        // 3) The sink receives payload + SSRC.
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            {
+                let got = received.lock().unwrap();
+                assert!(got.len() <= 1, "expected exactly one delivery");
+                if got.len() == 1 {
+                    assert_eq!(got[0].0, vec![0xD5, 0x5A, 0xA5]);
+                    assert_eq!(got[0].1, 777);
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sink never received the RTP payload"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 }
