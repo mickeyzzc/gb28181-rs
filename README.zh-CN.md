@@ -17,6 +17,7 @@
 - **注册生命周期** —— 401 摘要挑战（MD5 + SHA-256，qop=auth）、周期性重注册、保活心跳与超时判定
 - **MANSCDP XML** —— Catalog / DeviceInfo / DeviceStatus / RecordInfo / Keepalive，元素与属性双形式；入站报文接受 UTF-8 **或** GB2312/GBK/GB18030，出站声明 GB2312 的报文按声明正确编码
 - **媒体推送** —— H.264/H.265 NALU → MPEG-2 PS → RTP（UDP + RTP over TCP 封帧），SSRC 处理，大帧有界 PES 分片；RTP 时间戳取自真实采集时间（任意帧率）
+- **语音对讲（接收侧）** —— audio-only INVITE（GB/T 28181-2022 §9.2）：临时端口接收 G.711 A/μ 律 RTP 并交付 `AudioTalkbackSink`（闭包即用）；非 G.711 或未注册 sink 的 offer 以 488 拒绝
 - **直播 + 回放 + 下载** —— INVITE 驱动的直播会话；RecordInfo 查询与按帧节奏的回放/下载，SIP INFO 回放控制（播放/暂停/倍速）
 - **参考录像段格式** —— 裸 Annex-B H.264 + 每帧 `.ts.jsonl` 时间戳 sidecar（见 [`segment`](src/segment.rs)）
 

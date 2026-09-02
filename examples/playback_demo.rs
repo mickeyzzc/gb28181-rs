@@ -482,7 +482,7 @@ async fn main() -> Result<()> {
     };
 
     let hub = Arc::new(MockFrameHub::new());
-    Gb28181Server::start(config, hub, Some(Arc::new(recording))).await?;
+    let server = Gb28181Server::start(config, hub, Some(Arc::new(recording))).await?;
     println!(
         "[device]  gb28181-rs {} starting with recording index (SIP UDP :15060)",
         env!("CARGO_PKG_VERSION")
@@ -505,5 +505,9 @@ async fn main() -> Result<()> {
         bail!("never reached the pause point");
     }
     println!("playback demo: all checks passed");
+    // Keep the server handle alive across the demo and let it exit cleanly
+    // with the demo timeout instead of being dropped unsupervised.
+    server.abort();
+
     Ok(())
 }

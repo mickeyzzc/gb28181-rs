@@ -17,6 +17,7 @@ Hand-written SIP (no SIP framework), MANSCDP XML codec, RTP/PS media push, and a
 - **Registration lifecycle** — REGISTER with 401 digest challenge (MD5 + SHA-256, qop=auth), periodic re-register, keepalive heartbeat with timeout
 - **MANSCDP XML** — Catalog / DeviceInfo / DeviceStatus / RecordInfo / Keepalive, element **and** attribute forms; inbound bodies accepted as UTF-8 **or** GB2312/GBK/GB18030, outbound GB2312-declared bodies wire-encoded correctly
 - **Media push** — H.264/H.265 NALUs → MPEG-2 Program Stream → RTP (UDP + RTP-over-TCP framed), SSRC handling, bounded PES splitting for large access units; RTP timestamps derived from real capture time (any frame rate)
+- **Voice talkback (receive)** — audio-only INVITE (GB/T 28181-2022 §9.2): G.711 A/μ-law RTP received on an ephemeral port and delivered to an `AudioTalkbackSink` (closure-friendly); non-G.711 or no-sink offers are refused with 488
 - **Live + playback + download** — INVITE-driven live sessions; RecordInfo queries and paced playback/download from recorded segments, with SIP INFO playback control (play/pause/speed)
 - **Reference segment format** — bare Annex-B H.264 + `.ts.jsonl` per-frame timestamp sidecar ([`segment`](src/segment.rs))
 

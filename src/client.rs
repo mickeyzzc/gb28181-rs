@@ -207,6 +207,50 @@ pub enum MediaTransport {
     TcpListen,
 }
 
+/// Kind of media an INVITE negotiates.
+///
+/// Video offers (`m=video`) drive the classic PS-over-RTP push path; an
+/// audio-only offer (`m=audio`, no `m=video`) is a talkback session per
+/// GB/T 28181-2022 §9.2 — the platform streams G.711 audio to the device
+/// and the device plays it out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MediaKind {
+    /// Video session (`m=video`): device pushes PS-over-RTP.
+    Video,
+    /// Audio-only talkback session (`m=audio`): device receives G.711.
+    Audio,
+}
+
+/// G.711 variant negotiated for talkback, by RTP payload type
+/// (8 = PCMA/A-law, 0 = PCMU/μ-law).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AudioCodec {
+    /// G.711 A-law (payload type 8).
+    Pcma,
+    /// G.711 μ-law (payload type 0).
+    Pcmu,
+}
+
+impl AudioCodec {
+    /// RTP payload type used on the wire.
+    #[must_use]
+    pub fn payload_type(self) -> u8 {
+        match self {
+            AudioCodec::Pcma => 8,
+            AudioCodec::Pcmu => 0,
+        }
+    }
+
+    /// SDP rtpmap encoding name.
+    #[must_use]
+    pub fn name(self) -> &'static str {
+        match self {
+            AudioCodec::Pcma => "PCMA",
+            AudioCodec::Pcmu => "PCMU",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct InviteInfo {
     /// Call-ID from the INVITE
@@ -229,6 +273,10 @@ pub struct InviteInfo {
     /// Requested playback end (seconds since the Unix epoch), None if
     /// absent or `t=0 0` (whole range).
     pub end_secs: Option<u64>,
+    /// Whether the offer negotiates video or an audio-only talkback session.
+    pub media_kind: MediaKind,
+    /// G.711 variant for audio-only offers, `None` for video sessions.
+    pub audio_codec: Option<AudioCodec>,
 }
 
 /// Parse a SIP INVITE message to extract stream target information.
@@ -293,11 +341,43 @@ pub fn parse_invite(msg: &SipMessage) -> Result<InviteInfo> {
     } else {
         MediaTransport::Udp
     };
+    // Audio-only offer (m=audio, no m=video anywhere) = talkback receive
+    // (GB/T 28181-2022 §9.2). Mixed offers keep the video-push behavior.
+    let has_video = sdp.media.iter().any(|m| m.media_type == "video");
+    let audio_media = sdp.media.iter().find(|m| m.media_type == "audio");
+    let (media_kind, audio_codec) = if !has_video {
+        let m = audio_media.expect("checked: some media line exists");
+        let codec = m
+            .payload_types
+            .iter()
+            .find_map(|pt| match pt {
+                8 => Some(AudioCodec::Pcma),
+                0 => Some(AudioCodec::Pcmu),
+                _ => None,
+            })
+            .or_else(|| {
+                // Payload types outside {0,8}: fall back to the rtpmap name.
+                m.attributes.iter().find_map(|(k, v)| {
+                    if k == "rtpmap" && v.starts_with("8 PCMA") {
+                        Some(AudioCodec::Pcma)
+                    } else if k == "rtpmap" && v.starts_with("0 PCMU") {
+                        Some(AudioCodec::Pcmu)
+                    } else {
+                        None
+                    }
+                })
+            });
+        (MediaKind::Audio, codec)
+    } else {
+        (MediaKind::Video, None)
+    };
     Ok(InviteInfo {
         call_id,
         media_transport,
         media_address: ip,
         media_port: media.port,
+        media_kind,
+        audio_codec,
         ssrc,
         payload_type,
         session_type,
@@ -1383,6 +1463,45 @@ mod media_transport_tests {
         );
         let info = parse_invite(&msg).expect("parse");
         assert_eq!(info.media_transport, MediaTransport::TcpConnect);
+    }
+
+    /// GB/T 28181-2022 §9.2 talkback: an audio-only offer (m=audio, no
+    /// m=video) is a talkback session the device RECEIVES audio on.
+    #[test]
+    fn audio_only_offer_is_talkback_pcma() {
+        let msg = invite_with_sdp(
+            "mt-audio-pcma",
+            "v=0\r\no=- 0 0 IN IP4 192.168.1.10\r\ns=Play\r\nc=IN IP4 192.168.1.10\r\nt=0 0\r\nm=audio 15062 RTP/AVP 8\r\na=sendonly\r\ny=777\r\n",
+        );
+        let info = parse_invite(&msg).expect("parse");
+        assert_eq!(info.media_kind, MediaKind::Audio);
+        assert_eq!(info.audio_codec, Some(AudioCodec::Pcma));
+        assert_eq!(info.media_port, 15062);
+        assert_eq!(info.payload_type, 8);
+        assert_eq!(info.ssrc, 777);
+    }
+
+    #[test]
+    fn audio_only_offer_pcmu() {
+        let msg = invite_with_sdp(
+            "mt-audio-pcmu",
+            "v=0\r\no=- 0 0 IN IP4 192.168.1.10\r\ns=Play\r\nc=IN IP4 192.168.1.10\r\nt=0 0\r\nm=audio 15063 RTP/AVP 0\r\ny=778\r\n",
+        );
+        let info = parse_invite(&msg).expect("parse");
+        assert_eq!(info.media_kind, MediaKind::Audio);
+        assert_eq!(info.audio_codec, Some(AudioCodec::Pcmu));
+        assert_eq!(info.payload_type, 0);
+    }
+
+    #[test]
+    fn video_offer_stays_video_kind() {
+        let msg = invite_with_sdp(
+            "mt-video-kind",
+            "v=0\r\no=- 0 0 IN IP4 192.168.1.10\r\ns=Play\r\nc=IN IP4 192.168.1.10\r\nt=0 0\r\nm=video 30000 RTP/AVP 96\r\ny=2000000001\r\n",
+        );
+        let info = parse_invite(&msg).expect("parse");
+        assert_eq!(info.media_kind, MediaKind::Video);
+        assert_eq!(info.audio_codec, None);
     }
 
     #[test]

@@ -85,7 +85,9 @@ pub mod segment;
 pub mod server;
 pub mod sip;
 
-pub use client::{parse_401_challenge, parse_invite, InviteInfo, SipDeviceClient};
+pub use client::{
+    parse_401_challenge, parse_invite, AudioCodec, InviteInfo, MediaKind, SipDeviceClient,
+};
 pub use config::Gb28181Config;
 pub use device_id::device_types;
 pub use device_id::{format_device_id, parse_device_id, DeviceIdParts};
@@ -97,7 +99,7 @@ pub use ps::{
 };
 pub use rtp_pusher::{RtpPusher, RtpStreamInfo};
 pub use segment::{read_segment, RecordedAu};
-pub use server::{Gb28181Server, ServerHandle};
+pub use server::{AudioTalkbackSink, Gb28181Server, ServerHandle};
 pub use sip::{
     build_bye_request, build_digest_auth, build_invite_response, build_register_request,
     parse_digest_auth, DigestAuthParams, SdpMedia, SdpSession, SessionType, SipMessage, SipMethod,
