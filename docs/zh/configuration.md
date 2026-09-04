@@ -25,7 +25,7 @@ config.transport = Transport::Tcp;
 | `device_id` | `String` | `"34020000001320000001"` | 20 位国标设备 ID（规范文档示例值）。 |
 | `channel_id` | `String` | `"34020000001320000001"` | 目录中上报的 20 位通道 ID。 |
 | `sip_domain` | `String` | `"3402000000"` | SIP 域（通常是平台中心编码）。 |
-| `password` | `String` | `"12345678"` | 与平台约定的 SIP 摘要认证密码。 |
+| `password` | `String` | `""` | 与平台约定的 SIP 摘要认证密码。没有默认值——为空或仍是广为人知的示例值时，服务端会告警。 |
 | `local_sip_port` | `u16` | `5060` | 本地 SIP 监听端口（UDP socket 或 TCP listener）。 |
 | `register_interval_secs` | `u64` | `60` | REGISTER 刷新间隔。 |
 | `heartbeat_interval_secs` | `u64` | `60` | 保活（MESSAGE）间隔。 |
@@ -74,11 +74,11 @@ assert_eq!(cfg.effective_device_name(), format!("Camera {}", cfg.device_id));
 
 ## 示例默认值警告
 
-规范文档的示例值（`192.168.1.1`、`12345678`、示例设备 ID）为了线上
-报文格式稳定而保留。如果运行中的服务器仍看到它们，
-`warn_on_example_defaults()` 会打警告——服务器在 bind 之后自动调用。
-两台设备共用示例 ID 会在平台上撞号；配置没加载成功而静默指向示例
-平台，是它拦的另一类事故。
+`warn_on_example_defaults()` 会在 bind 之后自动调用，命中以下任一
+情况即打警告：仍是示例平台地址 `192.168.1.1`、仍是示例设备 ID
+（两台设备共用会在平台上撞号）、SIP 密码为空（摘要认证必然失败）、
+或密码被显式设为广为人知的示例值 `12345678`。密码本身出厂没有
+默认值。
 
 ## 设备 ID
 
