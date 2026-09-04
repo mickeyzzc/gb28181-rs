@@ -76,7 +76,7 @@ A ready-made [`MockFrameHub`](src/mock.rs) implements `FrameSource` with bounded
 
 ### Configuration
 
-`Gb28181Config` is serde-friendly (TOML/JSON) and can be re-exported into the host's own config struct. Connection defaults follow the spec's example values (`platform_sip_address = 192.168.1.1`, `device_id = 34020000001320000001`, `password = 12345678`, ports 5060) — **always set them explicitly in production**; the server logs a warning at startup when the example defaults are still in effect.
+`Gb28181Config` is serde-friendly (TOML/JSON) and can be re-exported into the host's own config struct. Address defaults follow the spec's example values (`platform_sip_address = 192.168.1.1`, `device_id = 34020000001320000001`, ports 5060) — **always set them explicitly in production**; the server logs a warning at startup when the example defaults are still in effect. The SIP password has **no default**: it starts empty, and the server warns when it is unset or still the well-known example `12345678`.
 
 Identity fields (all optional, all neutral by default — this library never advertises a product/vendor name on the wire):
 
