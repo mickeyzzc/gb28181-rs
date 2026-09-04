@@ -123,8 +123,10 @@ impl Gb28181Config {
 
     /// Check the spec-example defaults that a mis-loaded host config
     /// would otherwise silently carry into production: platform
-    /// `192.168.1.1`, password `12345678`, and the spec-example device
-    /// ID (two devices sharing it collide on the platform).
+    /// `192.168.1.1`, the spec-example device ID (two devices sharing it
+    /// collide on the platform), and an SIP password that cannot be
+    /// trusted — empty (digest auth cannot succeed; there is no default
+    /// password) or the well-known spec-example value `12345678`.
     ///
     /// With `strict_example_defaults = false` (the default) each finding
     /// logs a warning — the historical behavior. With strict mode on,
@@ -138,7 +140,7 @@ impl Gb28181Config {
         if self.platform_sip_address == default_gb28181_platform_sip_address() {
             offending.push("platform_sip_address");
         }
-        if self.password == default_gb28181_password() {
+        if self.password.is_empty() || self.password == "12345678" {
             offending.push("password");
         }
         if self.device_id == default_gb28181_device_id() {
@@ -160,10 +162,16 @@ impl Gb28181Config {
             );
         }
         if offending.contains(&"password") {
-            log::warn!(
-                "gb28181: password is the example default {:?} — set it explicitly in the host config",
-                default_gb28181_password()
-            );
+            if self.password.is_empty() {
+                log::warn!(
+                    "gb28181: password is empty — digest auth cannot succeed; set it explicitly in the host config"
+                );
+            } else {
+                log::warn!(
+                    "gb28181: password is the well-known spec-example value {:?} — change it in the host config",
+                    self.password
+                );
+            }
         }
         if offending.contains(&"device_id") {
             log::warn!(
@@ -194,7 +202,7 @@ fn default_gb28181_sip_domain() -> String {
     "3402000000".to_string()
 }
 fn default_gb28181_password() -> String {
-    "12345678".to_string()
+    String::new()
 }
 fn default_gb28181_local_sip_port() -> u16 {
     5060
@@ -297,6 +305,20 @@ mod tests {
         assert_eq!(d.manufacturer, None);
         assert_eq!(d.model, None);
         assert_eq!(d.firmware, None);
+    }
+
+    /// The SIP password must NOT default to a credential: an unset
+    /// password stays empty so a mis-loaded host config cannot silently
+    /// authenticate with a value that is publicly documented somewhere.
+    #[test]
+    fn password_default_is_empty() {
+        let d = Gb28181Config::default();
+        assert!(d.password.is_empty(), "Default password must be empty");
+        let s: Gb28181Config = toml::from_str("").expect("empty config deserializes");
+        assert!(
+            s.password.is_empty(),
+            "serde default password must be empty"
+        );
     }
 
     /// Identity defaults are neutral (no product/vendor branding) and
