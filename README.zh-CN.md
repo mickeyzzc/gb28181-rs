@@ -19,9 +19,10 @@
 - **媒体推送** —— H.264/H.265 NALU → MPEG-2 PS → RTP（UDP + RTP over TCP 封帧），SSRC 处理，大帧有界 PES 分片；RTP 时间戳取自真实采集时间（任意帧率）
 - **语音对讲（接收侧）** —— audio-only INVITE（GB/T 28181-2022 §9.2）：临时端口接收 G.711 A/μ 律 RTP 并交付 `AudioTalkbackSink`（闭包即用）；非 G.711 或未注册 sink 的 offer 以 488 拒绝
 - **直播 + 回放 + 下载** —— INVITE 驱动的直播会话；RecordInfo 查询与按帧节奏的回放/下载，SIP INFO 回放控制（播放/暂停/倍速）
+- **GB 35114 A 级安全**（可选，`gb35114` feature）—— 基于 SM2 数字证书的 REGISTER 双向认证（`Capability`/`Unidirection`/`Bidirection` 头域）、`cryptkey` SM2 DER 信封内的 VKEK 协商、保活等外出请求的 keyed-SM3 `Note` 头完整性；与 Go 孪生库共享 golden 夹具，证明跨实现互通
 - **参考录像段格式** —— 裸 Annex-B H.264 + 每帧 `.ts.jsonl` 时间戳 sidecar（见 [`segment`](src/segment.rs)）
 
-设计上不包含：平台端（UAS）角色、SIP over TLS/WebSocket。
+设计上不包含：平台端（UAS）角色、SIP over TLS/WebSocket、GB 35114 B/C 级（依赖 GB/T 25724 SVAC 硬件媒体）。
 
 ## 使用
 
@@ -89,6 +90,33 @@ async fn main() -> anyhow::Result<()> {
 | `firmware` | crate 版本号 | DeviceInfo 的 `Firmware` |
 
 `enabled` 是宿主侧开关 —— 本库从不读取它，由宿主决定是否调用 `start()`。
+
+## GB35114 A 级安全（v0.8.0，可选）
+
+[GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) 在 GB/T 28181 之上叠加基于 SM2 数字证书的安全层。本库只实现 **A级** —— B/C 级额外依赖 SVAC 媒体（GB/T 25724，硬件编解码器），设计上不在范围内。通过 `gb35114` feature 开启（需要 Rust ≥ 1.85；不开 feature 时 crate 的 MSRV 仍为 1.80）：
+
+```toml
+[dependencies]
+gb28181-rs = { version = "0.8", features = ["gb35114"] }
+```
+
+```rust
+use gb28181_rs::authenticator::RegisterAuthenticator as _;
+use gb28181_rs::security35114::{load_certificate, load_identity, Authenticator, Options};
+
+let dev = load_identity(&cert_pem, &key_pem)?;          // SM2 SEC1 或 PKCS#8
+let platform = load_certificate(&platform_cert_pem)?;   // 用于验签 sign2
+let auth = Authenticator::new(Options::new(dev, device_id, server_id))?;
+
+let server = Gb28181Server::with_recording_index(cfg, hub, None)
+    .with_register_authenticator(Some(Arc::new(auth)))  // 取代摘要认证
+    .spawn()
+    .await?;
+```
+
+握手流程按标准文本并以真实抓包交叉校准：`Capability` 能力宣告 → 401 携带 `random1` → 带 `sign1` 的重注册（SM2 签名 random2‖random1‖serverID）→ 200 OK `SecurityInfo` 携带 SM2 封装的 VKEK（`cryptkey`，DER C1‖C3‖C2 信封）；`Bidirection` 模式另含平台 `sign2`。注册成功后，所有外出请求（保活等）携带以 VKEK 为密钥的 `Date` + `Note: Digest nonce="…",algorithm=SM3`。密码学来自 RustCrypto 的 `sm2`/`sm3` crate（纯 Rust，`aarch64-musl` 交叉编译友好）；golden 测试与 Go 孪生库（`gb28181-go/security35114`）共享证书、向量与互通夹具——包括 gmsm 产出的签名/信封样本必须在本库验签、解封成功。
+
+两处跨实现歧义点做成可配置项（[`RandomEncoding`](src/security35114/mod.rs)、[`Sign2Order`](src/security35114/mod.rs)）：签名负载中随机数的表示形式、`sign2` 的 R1/R2 操作数顺序。默认值遵循标准文本。已知限制：设备侧尚未对平台发来的请求做 `Note` 校验。
 
 ## 文档
 
