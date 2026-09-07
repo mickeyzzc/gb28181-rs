@@ -19,9 +19,10 @@ Hand-written SIP (no SIP framework), MANSCDP XML codec, RTP/PS media push, and a
 - **Media push** — H.264/H.265 NALUs → MPEG-2 Program Stream → RTP (UDP + RTP-over-TCP framed), SSRC handling, bounded PES splitting for large access units; RTP timestamps derived from real capture time (any frame rate)
 - **Voice talkback (receive)** — audio-only INVITE (GB/T 28181-2022 §9.2): G.711 A/μ-law RTP received on an ephemeral port and delivered to an `AudioTalkbackSink` (closure-friendly); non-G.711 or no-sink offers are refused with 488
 - **Live + playback + download** — INVITE-driven live sessions; RecordInfo queries and paced playback/download from recorded segments, with SIP INFO playback control (play/pause/speed)
+- **GB 35114 A-level security** *(opt-in, `gb35114` feature)* — SM2-certificate mutual authentication over the REGISTER flow (`Capability`/`Unidirection`/`Bidirection` headers), VKEK negotiation inside the `cryptkey` SM2 DER envelope, keyed-SM3 `Note`-header integrity for keepalive and other outgoing requests; golden fixtures shared with the Go twin prove cross-implementation interop
 - **Reference segment format** — bare Annex-B H.264 + `.ts.jsonl` per-frame timestamp sidecar ([`segment`](src/segment.rs))
 
-Not included (by design): platform/UAS role, SIP over TLS/WebSocket.
+Not included (by design): platform/UAS role, SIP over TLS/WebSocket, GB 35114 B/C levels (those require SVAC hardware media per GB/T 25724).
 
 ## Usage
 
@@ -89,6 +90,33 @@ Identity fields (all optional, all neutral by default — this library never adv
 | `firmware` | crate version | DeviceInfo `Firmware` |
 
 `enabled` is a host convenience switch — the library never reads it; the host gates `start()` on it.
+
+## GB35114 A-level security (v0.8.0, opt-in)
+
+[GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) layers SM2-certificate security on top of GB/T 28181. This crate implements **A-level** only — levels B/C additionally require SVAC media (GB/T 25724, a hardware codec), which is out of scope by design. Enable with the `gb35114` feature (needs Rust ≥ 1.85; the crate's MSRV stays 1.80 without it):
+
+```toml
+[dependencies]
+gb28181-rs = { version = "0.8", features = ["gb35114"] }
+```
+
+```rust
+use gb28181_rs::authenticator::RegisterAuthenticator as _;
+use gb28181_rs::security35114::{load_certificate, load_identity, Authenticator, Options};
+
+let dev = load_identity(&cert_pem, &key_pem)?;          // SM2 SEC1 or PKCS#8
+let platform = load_certificate(&platform_cert_pem)?;   // verifies sign2
+let auth = Authenticator::new(Options::new(dev, device_id, server_id))?;
+
+let server = Gb28181Server::with_recording_index(cfg, hub, None)
+    .with_register_authenticator(Some(Arc::new(auth)))  // replaces Digest auth
+    .spawn()
+    .await?;
+```
+
+The handshake follows the published standard text cross-checked against real captures: `Capability` announcement → 401 with `random1` → signed re-REGISTER (`sign1` = SM2 over random2‖random1‖serverID) → 200 OK `SecurityInfo` carrying the SM2-sealed VKEK (`cryptkey`, DER C1‖C3‖C2 envelope) and, for `Bidirection`, the platform's `sign2`. After registration every outgoing request (keepalive, …) carries `Date` + `Note: Digest nonce="…",algorithm=SM3` keyed by the VKEK. Crypto comes from the RustCrypto `sm2`/`sm3` crates (pure Rust — `aarch64-musl` cross-compile friendly); the golden tests share their certificates, vectors, and interop fixtures with the Go twin (`gb28181-go/security35114`), including gmsm-produced signature/envelope samples that must verify and decrypt here.
+
+Two points are ambiguous across implementations and therefore configurable ([`RandomEncoding`](src/security35114/mod.rs), [`Sign2Order`](src/security35114/mod.rs)): the random representation inside the signed payload, and the R1/R2 operand order of `sign2`. Defaults match the standard text. Known limitation: incoming platform requests are not `Note`-verified on the device side yet.
 
 ## Documentation
 

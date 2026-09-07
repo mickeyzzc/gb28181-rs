@@ -11,12 +11,13 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex};
 
+use crate::authenticator::RegisterAuthenticator;
 use crate::config::{Gb28181Config, Transport};
 use crate::frame::{AccessUnit, FrameSource};
 
@@ -144,6 +145,9 @@ pub struct Gb28181Server {
     /// Audio talkback sink (audio-only INVITE receive). `None` = talkback
     /// INVITEs are refused with 488.
     audio_sink: Option<Arc<dyn AudioTalkbackSink>>,
+    /// Optional replacement for Digest REGISTER authentication (GB 35114
+    /// A-level via the `gb35114` feature). `None` keeps the Digest flow.
+    authenticator: Option<Arc<dyn RegisterAuthenticator>>,
 }
 
 /// Information about an active INVITE dialog.
@@ -257,7 +261,19 @@ impl Gb28181Server {
             recording_index,
             playback_ctl: None,
             audio_sink: None,
+            authenticator: None,
         }
+    }
+
+    /// Installs an alternative REGISTER authentication strategy (GB 35114
+    /// A-level when built with the `gb35114` feature). `None` (default)
+    /// keeps the built-in SIP Digest flow.
+    pub fn with_register_authenticator(
+        mut self,
+        authenticator: Option<Arc<dyn RegisterAuthenticator>>,
+    ) -> Self {
+        self.authenticator = authenticator;
+        self
     }
 
     /// Attach the audio talkback sink (receive half of GB/T 28181-2022
@@ -508,6 +524,7 @@ impl Gb28181Server {
             let keepalive_local_ip = local_ip.clone();
             let keepalive_local_port = local_sip_port;
             let mut keepalive_shutdown = shutdown.clone();
+            let keepalive_authenticator = self.authenticator.clone();
             tokio::spawn(async move {
                 if let Err(e) = run_keepalive(
                     sip_socket_for_keepalive,
@@ -517,6 +534,7 @@ impl Gb28181Server {
                     &keepalive_local_ip,
                     keepalive_local_port,
                     keepalive_interval_secs,
+                    keepalive_authenticator,
                     &mut keepalive_shutdown,
                 )
                 .await
@@ -623,6 +641,7 @@ impl Gb28181Server {
                                 let keepalive_local_ip = local_ip.clone();
                                 let keepalive_local_port = local_sip_port;
                                 let mut keepalive_shutdown = shutdown.clone();
+                                let keepalive_authenticator = self.authenticator.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = run_keepalive(
                                         sip_socket_for_keepalive,
@@ -632,6 +651,7 @@ impl Gb28181Server {
                                         &keepalive_local_ip,
                                         keepalive_local_port,
                                         keepalive_interval_secs,
+                                        keepalive_authenticator,
                                         &mut keepalive_shutdown,
                                     )
                                     .await
@@ -679,8 +699,16 @@ impl Gb28181Server {
         client: &mut SipDeviceClient,
         platform_addr: SocketAddr,
     ) -> Result<()> {
-        // Step 1: Send initial REGISTER
-        let register = client.build_register();
+        // Step 1: Send initial REGISTER — a RegisterAuthenticator may
+        // announce capabilities (GB 35114 Capability); None keeps the
+        // plain Digest-era behavior.
+        let mut register = client.build_register();
+        if let Some(auth) = &self.authenticator {
+            let authz = auth.initial_authorization();
+            if !authz.is_empty() {
+                register.headers.push(("Authorization".to_string(), authz));
+            }
+        }
         let initial_cseq = client.cseq;
         self.send_sip_message(&register, platform_addr).await?;
 
@@ -695,11 +723,22 @@ impl Gb28181Server {
             bail!("Expected 401 Unauthorized, got {:?}", msg.status_code);
         }
 
-        // Step 3: Parse challenge and send authenticated REGISTER
-        let auth = parse_401_challenge(&msg)?;
+        // Step 3: Answer the challenge — the authenticator's header when
+        // installed, classic Digest otherwise.
         client.inc_cseq();
         let authed_cseq = client.cseq;
-        let authed_register = client.build_register_with_auth(&auth);
+        let authed_register = if let Some(auth) = &self.authenticator {
+            let www_auth = msg
+                .get_header("WWW-Authenticate")
+                .ok_or_else(|| anyhow!("401 response missing WWW-Authenticate header"))?;
+            let authz = auth.authorize_with_challenge(www_auth)?;
+            let mut reg = client.build_register();
+            reg.headers.push(("Authorization".to_string(), authz));
+            reg
+        } else {
+            let auth = parse_401_challenge(&msg)?;
+            client.build_register_with_auth(&auth)
+        };
         self.send_sip_message(&authed_register, platform_addr)
             .await?;
 
@@ -709,6 +748,9 @@ impl Gb28181Server {
             .await?;
         if msg.status_code != Some(SipStatusCode::Ok) {
             bail!("Expected 200 OK, got {:?}", msg.status_code);
+        }
+        if let Some(auth) = &self.authenticator {
+            auth.verify_ok(msg.get_header("SecurityInfo").unwrap_or(""))?;
         }
 
         client.inc_cseq();
@@ -1657,6 +1699,7 @@ async fn run_keepalive(
     local_ip: &str,
     local_port: u16,
     interval_secs: u64,
+    authenticator: Option<Arc<dyn RegisterAuthenticator>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -1667,9 +1710,27 @@ async fn run_keepalive(
         tokio::select! {
             _ = interval.tick() => {
                 let sn_str = sn.to_string();
-                let notify = build_keepalive_notify(
+                let mut notify = build_keepalive_notify(
                     &sn_str, device_id, domain, local_ip, local_port, "OK", cseq,
                 )?;
+
+                // GB35114: stamp Date + Note (keyed-SM3 digest) on every
+                // keepalive when an authenticator with signing support is
+                // installed and the VKEK has been negotiated.
+                if let Some(auth) = &authenticator {
+                    let method = notify.method.map(|m| m.to_string()).unwrap_or_default();
+                    let (date, note) = auth.decorate_outgoing(
+                        &method,
+                        notify.get_header("From").unwrap_or(""),
+                        notify.get_header("To").unwrap_or(""),
+                        notify.get_header("Call-ID").unwrap_or(""),
+                        &notify.body,
+                    );
+                    if !date.is_empty() {
+                        notify.headers.push(("Date".to_string(), date));
+                        notify.headers.push(("Note".to_string(), note));
+                    }
+                }
 
                 let data = serialize_wire(&notify);
                 if let Err(e) = sip_socket.send_to(&data, platform_addr).await {
@@ -1863,6 +1924,7 @@ async fn handle_tcp_connection(
         recording_index,
         playback_ctl: None,
         audio_sink,
+        authenticator: None,
     };
 
     // Create SIP device client (User-Agent from config; neutral default)
@@ -2408,6 +2470,7 @@ async fn test_recordinfo_dispatch_with_source() {
         recording_index: Some(Arc::new(source)),
         playback_ctl: None,
         audio_sink: None,
+        authenticator: None,
     };
 
     // Query times are derived from the segment's own ms via the same
@@ -2489,6 +2552,7 @@ async fn test_recordinfo_dispatch_without_source() {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        authenticator: None,
     };
 
     let body = "<Query><CmdType>RecordInfo</CmdType><SN>9</SN><DeviceID>34020000001320000001</DeviceID><StartTime>2026-08-15T14:00:00</StartTime><EndTime>2026-08-15T15:00:00</EndTime></Query>";
@@ -2549,6 +2613,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        authenticator: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786807800\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -2639,6 +2704,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         recording_index: Some(Arc::new(source)),
         playback_ctl: None,
         audio_sink: None,
+        authenticator: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786804500\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -2726,6 +2792,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        authenticator: None,
     };
     let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
     let peer_addr = peer.local_addr().expect("peer addr");
@@ -2873,6 +2940,7 @@ async fn test_info_playback_control_live_session_noop() {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        authenticator: None,
     };
 
     let body = "<Control><CmdType>PlaybackControl</CmdType><SN>1</SN><DeviceID>34020000001320000001</DeviceID><Info><ControlValue>PAUSE</ControlValue></Info></Control>";
@@ -2963,6 +3031,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            authenticator: None,
         };
 
         // Platform stand-in: TCP listener on an ephemeral port.
@@ -3089,6 +3158,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            authenticator: None,
         };
 
         let body = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 9 TCP/RTP/AVP 96\r\na=setup:active\r\ny=2000000001\r\n";
@@ -3168,6 +3238,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            authenticator: None,
         };
 
         // Fake platform: sends a STALE 200 OK (wrong CSeq) before the real 401,
@@ -3293,6 +3364,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            authenticator: None,
         };
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         let peer_addr = peer.local_addr().expect("peer addr");
@@ -3352,6 +3424,7 @@ mod tcp_media_tests {
             audio_sink: Some(Arc::new(move |payload: &[u8], ssrc: u32| {
                 sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
             })),
+            authenticator: None,
         };
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         let peer_addr = peer.local_addr().expect("peer addr");

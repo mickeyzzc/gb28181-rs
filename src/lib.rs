@@ -71,6 +71,7 @@
 
 use std::sync::atomic::AtomicBool;
 
+pub mod authenticator;
 pub mod charset;
 pub mod client;
 pub mod config;
@@ -81,6 +82,8 @@ pub mod mock;
 pub mod playback;
 pub mod ps;
 pub mod rtp_pusher;
+#[cfg(feature = "gb35114")]
+pub mod security35114;
 pub mod segment;
 pub mod server;
 pub mod sip;

@@ -23,6 +23,10 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Test
         run: cargo test
+      - name: Clippy (gb35114)
+        run: cargo clippy --all-targets --features gb35114 -- -D warnings
+      - name: Test (gb35114)
+        run: cargo test --features gb35114
 
   msrv:
     # The rust-version field is a resolver contract for downstreams —

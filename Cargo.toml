@@ -1,6 +1,6 @@
 [package]
 name = "gb28181-rs"
-version = "0.7.0"
+version = "0.8.0"
 edition = "2021"
 rust-version = "1.80"
 description = "GB/T 28181-2016/2022 device-side (UAC) library for Rust: SIP signaling, MANSCDP XML, RTP/PS media push, playback"
@@ -11,6 +11,7 @@ categories = ["multimedia", "network-programming"]
 
 [dependencies]
 anyhow = "1"
+base64 = { version = "0.22", default-features = false, features = ["std"], optional = true }
 encoding_rs = "0.8"
 hex = "0.4"
 log = "0.4"
@@ -19,7 +20,10 @@ rand = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde-xml-rs = "0.6"
 sha2 = "0.10"
+sm2 = { version = "0.14.0-rc.15", optional = true }
+sm3 = { version = "0.4.2", default-features = false, features = ["std"], optional = true }
 tokio = { version = "1", features = ["sync", "rt", "macros", "net", "time", "io-util"] }
+x509-parser = { version = "0.16", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -27,3 +31,9 @@ toml = "0.8"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[features]
+# GB 35114-2017 A-level device security (SM2 certs, keyed-SM3 Note header).
+# sm2 0.14.0-rc requires a newer toolchain than the crate's MSRV — build
+# with Rust >= 1.85 when enabling.
+gb35114 = ["dep:sm2", "dep:sm3", "dep:x509-parser", "dep:base64"]

@@ -29,6 +29,9 @@ jobs:
       - name: Tests
         run: cargo test --quiet
 
+      - name: Tests (gb35114)
+        run: cargo test --quiet --features gb35114
+
       - name: Drop the test-generated Cargo.lock (lockless library)
         run: rm -f Cargo.lock
 
