@@ -137,6 +137,10 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 `Platform` 并发安全，会话按设备 ID 索引；设备重注册期间旧 VKEK 继续可验；对 SIP-over-UDP 重传的已完成 REGISTER 幂等返回同一 `SecurityInfo`；对过期 `random1`、方案错配、未知/不匹配证书、外来 server ID 以 [`PlatformError`](src/security35114/platform.rs) 哨兵枚举拒绝（在 `anyhow` 链上 `err.downcast_ref::<PlatformError>()`），便于上层映射 4xx。模块内回环测试用真实设备侧 `Authenticator` 驱动——握手、双方 VKEK 一致、`Note` 篡改检测。
 
+### GB28181-2022 抓拍线格式类型（issue #49 孪生对齐）
+
+`manscdp` 解析入站 `DeviceControl` 抓拍命令（`parse_control_snapshot`：`SnapShot` 携带 `SnapNum`/`Interval`/`UploadURL`/`SessionID`，A.2.1.24），并构造设备侧 `UploadSnapShotFinished` 完成上报（`build_upload_snapshot_finished`，A.2.5.7）——golden 与 Go 孪生库逐字节一致。
+
 ## 文档
 
 专题教程在 [`docs/zh/`](docs/zh/) —— 每篇在 `docs/en/` 下有英文对照版：

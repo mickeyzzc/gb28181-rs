@@ -137,6 +137,10 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 `Platform` is concurrency-safe, keys sessions by device ID, keeps the previous VKEK verifying while a device re-registers, answers SIP-over-UDP retransmissions of the completed REGISTER idempotently, and rejects stale `random1`, scheme confusion, unknown/mismatched certificates, and foreign server IDs with the [`PlatformError`](src/security35114/platform.rs) sentinel enum (`err.downcast_ref::<PlatformError>()` on the `anyhow` chain) for 4xx mapping. The in-module loopback tests drive it against the real device-side `Authenticator` — handshake, VKEK agreement on both sides, and `Note` tamper detection.
 
+### GB28181-2022 snapshot wire types (issue #49 twin)
+
+`manscdp` parses the inbound `DeviceControl` snapshot command (`parse_control_snapshot`: `SnapShot` with `SnapNum`/`Interval`/`UploadURL`/`SessionID`, A.2.1.24) and builds the device-side `UploadSnapShotFinished` completion report (`build_upload_snapshot_finished`, A.2.5.7) — goldens byte-identical to the Go twin.
+
 ## Documentation
 
 Topic guides live under [`docs/en/`](docs/en/) — each has a Chinese counterpart under `docs/zh/`:

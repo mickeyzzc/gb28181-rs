@@ -346,9 +346,113 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
     Some(era * 146_097 + doe - 719_468)
 }
 
+// ---------------------------------------------------------------------------
+// GB/T 28181-2022 image snapshot (A.2.1.24 / A.2.5.7) — twin-parity wire
+// types with gb28181-go (#49): the Control element is <SnapShot> with
+// SnapNum/Interval/UploadURL/SessionID; the completion notify carries the
+// same SessionID plus a SnapShotList of SnapShotFileID entries.
+// ---------------------------------------------------------------------------
+
+/// The snapshot payload inside an inbound DeviceControl (A.2.1.24
+/// snapShotCfgType).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapShotCmd {
+    /// Frames to capture, 1..=10; manual snapshot = 1.
+    #[serde(rename = "SnapNum")]
+    pub snap_num: u32,
+    /// Per-frame interval in seconds (>=1); absent for manual snapshots.
+    #[serde(rename = "Interval", default, skip_serializing_if = "Option::is_none")]
+    pub interval: Option<u32>,
+    /// HTTP endpoint the device POSTs the JPEGs to.
+    #[serde(rename = "UploadURL")]
+    pub upload_url: String,
+    /// Platform-generated session ID ([A-Za-z0-9-], 32..128 bytes),
+    /// echoed in the completion notify.
+    #[serde(rename = "SessionID")]
+    pub session_id: String,
+}
+
+/// An inbound DeviceControl body carrying a snapshot command.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ControlSnapShot {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: String,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "SnapShot")]
+    pub snap_shot: SnapShotCmd,
+}
+
+/// The `<SnapShotList>` node: 0..=10 uploaded-image IDs. An empty list is
+/// the standard's wholly/partially-failed signal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapShotList {
+    #[serde(rename = "SnapShotFileID", default)]
+    pub snap_shot_file_id: Vec<String>,
+}
+
+/// The completion notify (A.2.5.7): the device reports the uploaded image
+/// IDs after executing a snapshot command.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename = "Notify")]
+pub struct UploadSnapShotFinished {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: String,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "SessionID")]
+    pub session_id: String,
+    #[serde(rename = "SnapShotList")]
+    pub snap_shot_list: SnapShotList,
+}
+
+impl UploadSnapShotFinished {
+    /// Serializes the notify body as a `<Notify>` document (caller wraps
+    /// it in a SIP MESSAGE).
+    pub fn to_xml(&self) -> anyhow::Result<String> {
+        // serde-xml-rs emits an XML declaration; the Go twin's encoder does
+        // not — strip it so both bodies are byte-identical on the wire.
+        let out = serde_xml_rs::to_string(self)?;
+        let body = out
+            .strip_prefix("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+            .unwrap_or(out.as_str());
+        Ok(body.to_string())
+    }
+}
+
+/// Parses an inbound DeviceControl snapshot body; `None` when the body is
+/// not a snapshot control.
+pub fn parse_control_snapshot(body: &str) -> Option<ControlSnapShot> {
+    let c = serde_xml_rs::from_str::<ControlSnapShot>(body).ok()?;
+    (c.cmd_type == "DeviceControl").then_some(c)
+}
+
+/// Builds the device-side completion report.
+pub fn build_upload_snapshot_finished(
+    sn: u32,
+    device_id: &str,
+    session_id: &str,
+    file_ids: &[String],
+) -> UploadSnapShotFinished {
+    UploadSnapShotFinished {
+        cmd_type: "UploadSnapShotFinished".to_string(),
+        sn: sn.to_string(),
+        device_id: device_id.to_string(),
+        session_id: session_id.to_string(),
+        snap_shot_list: SnapShotList {
+            snap_shot_file_id: file_ids.to_vec(),
+        },
+    }
+}
+
 /// Parses a `<Notify>` body in either child-element or attribute format,
 /// normalizing into [`Notify`].
-#[allow(dead_code)] // wired in R2 (dispatch from client.rs)
+#[allow(dead_code)]
+// wired in R2 (dispatch from client.rs)
 pub(crate) fn parse_notify_dual(body: &str) -> Option<Notify> {
     // Try child-element format first (matches live MiBee NVR).
     if let Ok(n) = serde_xml_rs::from_str::<Notify>(body) {
@@ -579,4 +683,70 @@ fn test_parse_gb_time_ms_invalid() {
     assert!(parse_gb_time_ms("garbage").is_none());
     assert!(parse_gb_time_ms("2026-13-15T14:30:00").is_none());
     assert!(parse_gb_time_ms("2026-08-15T14:30:00+8:0").is_none());
+}
+
+#[cfg(test)]
+mod snapshot_tests {
+    //! GB/T 28181-2022 snapshot wire types — the goldens are byte-identical
+    //! to the Go twin's (gb28181-go manscdp/snapshot_test.go, issue #49).
+
+    use super::*;
+
+    const SESSION_ID: &str = "0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn parse_control_snapshot_golden() {
+        let body = "<Control><CmdType>DeviceControl</CmdType><SN>17</SN><DeviceID>34020000001320000001</DeviceID>\
+<SnapShot><SnapNum>3</SnapNum><Interval>2</Interval>\
+<UploadURL>http://192.168.63.30:9090/api/gb28181/snapshot/upload</UploadURL>\
+<SessionID>0123456789abcdef0123456789abcdef</SessionID></SnapShot></Control>";
+        let c = parse_control_snapshot(body).expect("snapshot control parses");
+        assert_eq!(c.sn, "17");
+        assert_eq!(c.device_id, "34020000001320000001");
+        assert_eq!(c.snap_shot.snap_num, 3);
+        assert_eq!(c.snap_shot.interval, Some(2));
+        assert_eq!(
+            c.snap_shot.upload_url,
+            "http://192.168.63.30:9090/api/gb28181/snapshot/upload"
+        );
+        assert_eq!(c.snap_shot.session_id, SESSION_ID);
+
+        // Manual snapshot omits Interval.
+        let manual = "<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID>\
+<SnapShot><SnapNum>1</SnapNum><UploadURL>http://x/u</UploadURL><SessionID>0123456789abcdef0123456789abcdef</SessionID></SnapShot></Control>";
+        assert_eq!(
+            parse_control_snapshot(manual).unwrap().snap_shot.interval,
+            None
+        );
+
+        // Non-snapshot controls and garbage return None.
+        assert!(parse_control_snapshot("<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID><RecordCmd>Record</RecordCmd></Control>").is_none());
+        assert!(parse_control_snapshot("<not-xml").is_none());
+    }
+
+    #[test]
+    fn upload_snapshot_finished_roundtrip_golden() {
+        let n = build_upload_snapshot_finished(
+            18,
+            "34020000001320000001",
+            SESSION_ID,
+            &["f-1".to_string(), "f-2".to_string()],
+        );
+        let xml = n.to_xml().unwrap();
+        assert_eq!(
+            xml,
+            "<Notify><CmdType>UploadSnapShotFinished</CmdType><SN>18</SN>\
+<DeviceID>34020000001320000001</DeviceID><SessionID>0123456789abcdef0123456789abcdef</SessionID>\
+<SnapShotList><SnapShotFileID>f-1</SnapShotFileID><SnapShotFileID>f-2</SnapShotFileID></SnapShotList></Notify>"
+        );
+        // A platform (or the Go twin) re-parses byte-identically.
+        let back: UploadSnapShotFinished = serde_xml_rs::from_str(&xml).unwrap();
+        assert_eq!(back, n);
+
+        // Empty list = wholly/partially failed capture/upload.
+        let empty = build_upload_snapshot_finished(1, "d", SESSION_ID, &[]);
+        let xml = empty.to_xml().unwrap();
+        let back: UploadSnapShotFinished = serde_xml_rs::from_str(&xml).unwrap();
+        assert!(back.snap_shot_list.snap_shot_file_id.is_empty());
+    }
 }
