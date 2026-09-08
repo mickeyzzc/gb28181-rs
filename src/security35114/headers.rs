@@ -187,6 +187,54 @@ pub fn parse_challenge(www_authenticate: &str) -> Result<Challenge> {
     Ok(ch)
 }
 
+/// Builds the WWW-Authenticate header value of a GB35114 401 response for
+/// the given mode and random1 (platform side).
+pub fn build_challenge(mode: Mode, random1: &str) -> String {
+    format!(
+        "{} algorithm=\"A:SM2;H:SM3\", random1=\"{random1}\"",
+        mode.as_str()
+    )
+}
+
+/// The parsed Authorization header of the first GB35114 REGISTER
+/// (platform side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityAnnouncement {
+    pub algorithm: String,
+    pub key_version: String,
+    /// From `cnonce="devicecert:<base64>"`, empty when absent.
+    pub device_cert_pem: String,
+}
+
+/// Parses the Capability announcement of the first GB35114 REGISTER. The
+/// cnonce device certificate, when present, is decoded back to its PEM
+/// text.
+pub fn parse_capability_authorization(authorization: &str) -> Result<CapabilityAnnouncement> {
+    let (scheme, rest) = split_scheme(authorization);
+    if scheme != "Capability" {
+        bail!("not a GB35114 Capability announcement: {authorization}");
+    }
+    let params = parse_params(rest);
+    let algorithm = param(&params, "algorithm").to_string();
+    if algorithm.is_empty() {
+        bail!("Capability announcement missing algorithm");
+    }
+    let mut ann = CapabilityAnnouncement {
+        algorithm,
+        key_version: param(&params, "keyversion").to_string(),
+        device_cert_pem: String::new(),
+    };
+    let cnonce = param(&params, "cnonce");
+    if let Some(encoded) = cnonce.strip_prefix("devicecert:") {
+        use base64::Engine;
+        let der = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .map_err(|e| anyhow!("cnonce devicecert is not base64: {e}"))?;
+        ann.device_cert_pem = String::from_utf8_lossy(&der).into_owned();
+    }
+    Ok(ann)
+}
+
 /// Builds the Authorization header of the authenticated REGISTER.
 /// `server_id` is the SIP server ID; `device_id` is only emitted for
 /// Bidirection.
@@ -331,6 +379,40 @@ mod tests {
         assert_eq!(ch.mode, Mode::Unidirection);
         assert_eq!(ch.random1, GOLDEN_RANDOM1);
         assert_eq!(ch.algorithm, "A:SM2;H:SM3;S:SM1/OFB/PKCS5;SI:SM3-SM2");
+    }
+
+    #[test]
+    fn build_challenge_golden() {
+        // Same golden as the Go twin (gb28181-go/security35114).
+        assert_eq!(
+            build_challenge(Mode::Bidirection, GOLDEN_RANDOM1),
+            "Bidirection algorithm=\"A:SM2;H:SM3\", random1=\"PRAIIbutDbd5x/NKsbwwYw==\""
+        );
+        assert_eq!(
+            build_challenge(Mode::Unidirection, GOLDEN_RANDOM1),
+            "Unidirection algorithm=\"A:SM2;H:SM3\", random1=\"PRAIIbutDbd5x/NKsbwwYw==\""
+        );
+    }
+
+    #[test]
+    fn parse_capability_authorization_roundtrip() {
+        let ann = parse_capability_authorization(
+            "Capability algorithm=\"A:SM2;H:SM3;S:SM4/OFB/PKCS5;SI:SM3-SM2\", keyversion=\"2026-01-01T00:00:00.000\"",
+        )
+        .unwrap();
+        assert_eq!(ann.algorithm, CAPABILITY_ALGORITHM);
+        assert_eq!(ann.key_version, "2026-01-01T00:00:00.000");
+        assert_eq!(ann.device_cert_pem, "");
+
+        // With the cnonce certificate the announcement round-trips the
+        // exact PEM the device attached.
+        let cert_pem = include_str!("testdata/device_cert.pem");
+        let built = build_capability_authorization("2026-01-01T00:00:00.000", cert_pem);
+        let ann = parse_capability_authorization(&built).unwrap();
+        assert_eq!(ann.device_cert_pem, cert_pem);
+
+        assert!(parse_capability_authorization("Digest realm=\"x\"").is_err());
+        assert!(parse_capability_authorization("Capability keyversion=\"only\"").is_err());
     }
 
     #[test]

@@ -1,6 +1,8 @@
-//! GB 35114-2017 **A-level** device-side security for GB/T 28181:
-//! SM2-certificate mutual authentication during REGISTER and the keyed-SM3
-//! integrity header for subsequent SIP signaling.
+//! GB 35114-2017 **A-level** security for GB/T 28181, **both sides**:
+//! the device-side SM2-certificate mutual authentication during REGISTER
+//! ([`Authenticator`]) and the platform-side challenge/verify/Note state
+//! machine ([`Platform`]), plus the keyed-SM3 integrity header for
+//! subsequent SIP signaling.
 //!
 //! Only level A is implemented. Levels B/C additionally require signed and
 //! encrypted media built on GB/T 25724 (SVAC), which is a hardware codec —
@@ -24,6 +26,7 @@ pub mod authenticator;
 pub mod crypto;
 pub mod headers;
 pub mod integrity;
+pub mod platform;
 
 pub use authenticator::{Authenticator, Options};
 pub use crypto::{
@@ -31,13 +34,14 @@ pub use crypto::{
     sign_auth_payload, sign_message, verify_message, Certificate, Identity,
 };
 pub use headers::{
-    build_auth_authorization, build_capability_authorization, build_security_info,
-    parse_auth_authorization, parse_challenge, parse_security_info, AuthAuthorization, Challenge,
-    Mode, SecurityInfo, CAPABILITY_ALGORITHM,
+    build_auth_authorization, build_capability_authorization, build_challenge, build_security_info,
+    parse_auth_authorization, parse_capability_authorization, parse_challenge, parse_security_info,
+    AuthAuthorization, CapabilityAnnouncement, Challenge, Mode, SecurityInfo, CAPABILITY_ALGORITHM,
 };
 pub use integrity::{
     build_note_header, digest_payload, format_date, parse_note_header, verify_note_header,
 };
+pub use platform::{Platform, PlatformConfig, PlatformError};
 
 /// Selects how the random values enter the signed payload.
 ///

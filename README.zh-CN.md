@@ -19,7 +19,7 @@
 - **媒体推送** —— H.264/H.265 NALU → MPEG-2 PS → RTP（UDP + RTP over TCP 封帧），SSRC 处理，大帧有界 PES 分片；RTP 时间戳取自真实采集时间（任意帧率）
 - **语音对讲（接收侧）** —— audio-only INVITE（GB/T 28181-2022 §9.2）：临时端口接收 G.711 A/μ 律 RTP 并交付 `AudioTalkbackSink`（闭包即用）；非 G.711 或未注册 sink 的 offer 以 488 拒绝
 - **直播 + 回放 + 下载** —— INVITE 驱动的直播会话；RecordInfo 查询与按帧节奏的回放/下载，SIP INFO 回放控制（播放/暂停/倍速）
-- **GB 35114 A 级安全**（可选，`gb35114` feature）—— 基于 SM2 数字证书的 REGISTER 双向认证（`Capability`/`Unidirection`/`Bidirection` 头域）、`cryptkey` SM2 DER 信封内的 VKEK 协商、保活等外出请求的 keyed-SM3 `Note` 头完整性；与 Go 孪生库共享 golden 夹具，证明跨实现互通
+- **GB 35114 A 级安全，设备/平台两侧**（可选，`gb35114` feature）—— 设备侧基于 SM2 数字证书的 REGISTER 双向认证（`with_register_authenticator`）+ 平台侧挑战/验签/Note 校验状态机（`security35114::Platform`）；`cryptkey` SM2 DER 信封内的 VKEK 协商、keyed-SM3 `Note` 头完整性；与 Go 孪生库共享 golden 夹具，证明跨实现互通
 - **参考录像段格式** —— 裸 Annex-B H.264 + 每帧 `.ts.jsonl` 时间戳 sidecar（见 [`segment`](src/segment.rs)）
 
 设计上不包含：平台端（UAS）角色、SIP over TLS/WebSocket、GB 35114 B/C 级（依赖 GB/T 25724 SVAC 硬件媒体）。
@@ -91,13 +91,13 @@ async fn main() -> anyhow::Result<()> {
 
 `enabled` 是宿主侧开关 —— 本库从不读取它，由宿主决定是否调用 `start()`。
 
-## GB35114 A 级安全（v0.8.0，可选）
+## GB35114 A 级安全（v0.8.0 设备侧 / v0.9.0 平台侧，可选）
 
 [GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) 在 GB/T 28181 之上叠加基于 SM2 数字证书的安全层。本库只实现 **A级** —— B/C 级额外依赖 SVAC 媒体（GB/T 25724，硬件编解码器），设计上不在范围内。通过 `gb35114` feature 开启（需要 Rust ≥ 1.85；不开 feature 时 crate 的 MSRV 仍为 1.80）：
 
 ```toml
 [dependencies]
-gb28181-rs = { version = "0.8", features = ["gb35114"] }
+gb28181-rs = { version = "0.9", features = ["gb35114"] }
 ```
 
 ```rust
@@ -117,6 +117,25 @@ let server = Gb28181Server::with_recording_index(cfg, hub, None)
 握手流程按标准文本并以真实抓包交叉校准：`Capability` 能力宣告 → 401 携带 `random1` → 带 `sign1` 的重注册（SM2 签名 random2‖random1‖serverID）→ 200 OK `SecurityInfo` 携带 SM2 封装的 VKEK（`cryptkey`，DER C1‖C3‖C2 信封）；`Bidirection` 模式另含平台 `sign2`。注册成功后，所有外出请求（保活等）携带以 VKEK 为密钥的 `Date` + `Note: Digest nonce="…",algorithm=SM3`。密码学来自 RustCrypto 的 `sm2`/`sm3` crate（纯 Rust，`aarch64-musl` 交叉编译友好）；golden 测试与 Go 孪生库（`gb28181-go/security35114`）共享证书、向量与互通夹具——包括 gmsm 产出的签名/信封样本必须在本库验签、解封成功。
 
 两处跨实现歧义点做成可配置项（[`RandomEncoding`](src/security35114/mod.rs)、[`Sign2Order`](src/security35114/mod.rs)）：签名负载中随机数的表示形式、`sign2` 的 R1/R2 操作数顺序。默认值遵循标准文本。已知限制：设备侧尚未对平台发来的请求做 `Note` 校验。
+
+### 平台侧（UAS，v0.9.0）
+
+`security35114::Platform` 是面向 GB/T 28181 平台的镜像状态机，与 Go 孪生库的 `security35114.Platform` **API 对等、线格式互通**（Go 建平台 × Rust 设备、Rust 平台 × Go 设备均已实机完成 Bidirection 握手）。它下发 `Bidirection`/`Unidirection` 挑战、用预置（或 `cnonce` 宣告的）设备证书验签 `sign1`、封装 VKEK、签名 `sign2`，并校验后续所有 `Note`。本 crate 不含 UAS SIP 服务器（纯设备/UAC 角色）——请接入任意平台协议栈：
+
+```rust
+use gb28181_rs::security35114::{Platform, PlatformConfig};
+
+let mut cfg = PlatformConfig::new(server_id);             // 20 位平台 ID
+cfg.identity = Some(platform_identity);                   // 平台 SM2 签名身份 —— sign2
+cfg.device_certs.insert(device_id.to_string(), dev_cert); // 或信任 cnonce 宣告
+let platform = Platform::new(cfg)?;
+
+let www_auth = platform.challenge(&device_id, &capability_authorization)?; // 401 值
+let security_info = platform.verify_register(&device_id, &authorization)?; // 200 OK 值
+platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, &body)?;
+```
+
+`Platform` 并发安全，会话按设备 ID 索引；设备重注册期间旧 VKEK 继续可验；对 SIP-over-UDP 重传的已完成 REGISTER 幂等返回同一 `SecurityInfo`；对过期 `random1`、方案错配、未知/不匹配证书、外来 server ID 以 [`PlatformError`](src/security35114/platform.rs) 哨兵枚举拒绝（在 `anyhow` 链上 `err.downcast_ref::<PlatformError>()`），便于上层映射 4xx。模块内回环测试用真实设备侧 `Authenticator` 驱动——握手、双方 VKEK 一致、`Note` 篡改检测。
 
 ## 文档
 
