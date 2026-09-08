@@ -346,10 +346,6 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
     Some(era * 146_097 + doe - 719_468)
 }
 
-/// Parses a `<Notify>` body in either child-element or attribute format,
-/// normalizing into [`Notify`].
-#[allow(dead_code)]
-// wired in R2 (dispatch from client.rs)
 // ---------------------------------------------------------------------------
 // GB/T 28181-2022 image snapshot (A.2.1.24 / A.2.5.7) — twin-parity wire
 // types with gb28181-go (#49): the Control element is <SnapShot> with
@@ -453,6 +449,10 @@ pub fn build_upload_snapshot_finished(
     }
 }
 
+/// Parses a `<Notify>` body in either child-element or attribute format,
+/// normalizing into [`Notify`].
+#[allow(dead_code)]
+// wired in R2 (dispatch from client.rs)
 pub(crate) fn parse_notify_dual(body: &str) -> Option<Notify> {
     // Try child-element format first (matches live MiBee NVR).
     if let Ok(n) = serde_xml_rs::from_str::<Notify>(body) {
