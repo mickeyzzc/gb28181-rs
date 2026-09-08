@@ -78,6 +78,7 @@ pub mod config;
 pub mod device_id;
 pub mod frame;
 pub mod manscdp;
+pub mod metrics;
 pub mod mock;
 pub mod playback;
 pub mod ps;
