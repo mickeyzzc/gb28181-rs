@@ -19,7 +19,7 @@ Hand-written SIP (no SIP framework), MANSCDP XML codec, RTP/PS media push, and a
 - **Media push** — H.264/H.265 NALUs → MPEG-2 Program Stream → RTP (UDP + RTP-over-TCP framed), SSRC handling, bounded PES splitting for large access units; RTP timestamps derived from real capture time (any frame rate)
 - **Voice talkback (receive)** — audio-only INVITE (GB/T 28181-2022 §9.2): G.711 A/μ-law RTP received on an ephemeral port and delivered to an `AudioTalkbackSink` (closure-friendly); non-G.711 or no-sink offers are refused with 488
 - **Live + playback + download** — INVITE-driven live sessions; RecordInfo queries and paced playback/download from recorded segments, with SIP INFO playback control (play/pause/speed)
-- **GB 35114 A-level security** *(opt-in, `gb35114` feature)* — SM2-certificate mutual authentication over the REGISTER flow (`Capability`/`Unidirection`/`Bidirection` headers), VKEK negotiation inside the `cryptkey` SM2 DER envelope, keyed-SM3 `Note`-header integrity for keepalive and other outgoing requests; golden fixtures shared with the Go twin prove cross-implementation interop
+- **GB 35114 A-level security, both sides** *(opt-in, `gb35114` feature)* — device-side SM2-certificate mutual authentication over the REGISTER flow (`with_register_authenticator`) and platform-side challenge/verify/Note state machine (`security35114::Platform`); VKEK negotiation inside the `cryptkey` SM2 DER envelope, keyed-SM3 `Note`-header integrity; golden fixtures shared with the Go twin prove cross-implementation interop
 - **Reference segment format** — bare Annex-B H.264 + `.ts.jsonl` per-frame timestamp sidecar ([`segment`](src/segment.rs))
 
 Not included (by design): platform/UAS role, SIP over TLS/WebSocket, GB 35114 B/C levels (those require SVAC hardware media per GB/T 25724).
@@ -91,13 +91,13 @@ Identity fields (all optional, all neutral by default — this library never adv
 
 `enabled` is a host convenience switch — the library never reads it; the host gates `start()` on it.
 
-## GB35114 A-level security (v0.8.0, opt-in)
+## GB35114 A-level security (v0.8.0 device / v0.9.0 platform, opt-in)
 
 [GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) layers SM2-certificate security on top of GB/T 28181. This crate implements **A-level** only — levels B/C additionally require SVAC media (GB/T 25724, a hardware codec), which is out of scope by design. Enable with the `gb35114` feature (needs Rust ≥ 1.85; the crate's MSRV stays 1.80 without it):
 
 ```toml
 [dependencies]
-gb28181-rs = { version = "0.8", features = ["gb35114"] }
+gb28181-rs = { version = "0.9", features = ["gb35114"] }
 ```
 
 ```rust
@@ -117,6 +117,25 @@ let server = Gb28181Server::with_recording_index(cfg, hub, None)
 The handshake follows the published standard text cross-checked against real captures: `Capability` announcement → 401 with `random1` → signed re-REGISTER (`sign1` = SM2 over random2‖random1‖serverID) → 200 OK `SecurityInfo` carrying the SM2-sealed VKEK (`cryptkey`, DER C1‖C3‖C2 envelope) and, for `Bidirection`, the platform's `sign2`. After registration every outgoing request (keepalive, …) carries `Date` + `Note: Digest nonce="…",algorithm=SM3` keyed by the VKEK. Crypto comes from the RustCrypto `sm2`/`sm3` crates (pure Rust — `aarch64-musl` cross-compile friendly); the golden tests share their certificates, vectors, and interop fixtures with the Go twin (`gb28181-go/security35114`), including gmsm-produced signature/envelope samples that must verify and decrypt here.
 
 Two points are ambiguous across implementations and therefore configurable ([`RandomEncoding`](src/security35114/mod.rs), [`Sign2Order`](src/security35114/mod.rs)): the random representation inside the signed payload, and the R1/R2 operand order of `sign2`. Defaults match the standard text. Known limitation: incoming platform requests are not `Note`-verified on the device side yet.
+
+### Platform side (UAS, v0.9.0)
+
+`security35114::Platform` is the mirror-image state machine for GB/T 28181 platforms, at API parity with the Go twin's `security35114.Platform` (wire-compatible — a Go-built platform has completed live Bidirection handshakes with a Rust-built device and vice versa). It issues `Bidirection`/`Unidirection` challenges, verifies device `sign1` against the (pre-provisioned or `cnonce`-announced) certificate, seals the VKEK, signs `sign2`, and verifies every subsequent `Note`. This crate ships no UAS SIP server (device/UAC role only) — wire it into any platform stack:
+
+```rust
+use gb28181_rs::security35114::{Platform, PlatformConfig};
+
+let mut cfg = PlatformConfig::new(server_id);            // 20-digit platform ID
+cfg.identity = Some(platform_identity);                  // SM2 signing identity — sign2
+cfg.device_certs.insert(device_id.to_string(), dev_cert); // or trust the cnonce announcement
+let platform = Platform::new(cfg)?;
+
+let www_auth = platform.challenge(&device_id, &capability_authorization)?; // 401 value
+let security_info = platform.verify_register(&device_id, &authorization)?; // 200 OK value
+platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, &body)?;
+```
+
+`Platform` is concurrency-safe, keys sessions by device ID, keeps the previous VKEK verifying while a device re-registers, answers SIP-over-UDP retransmissions of the completed REGISTER idempotently, and rejects stale `random1`, scheme confusion, unknown/mismatched certificates, and foreign server IDs with the [`PlatformError`](src/security35114/platform.rs) sentinel enum (`err.downcast_ref::<PlatformError>()` on the `anyhow` chain) for 4xx mapping. The in-module loopback tests drive it against the real device-side `Authenticator` — handshake, VKEK agreement on both sides, and `Note` tamper detection.
 
 ## Documentation
 
