@@ -148,6 +148,8 @@ pub struct Gb28181Server {
     /// Optional replacement for Digest REGISTER authentication (GB 35114
     /// A-level via the `gb35114` feature). `None` keeps the Digest flow.
     authenticator: Option<Arc<dyn RegisterAuthenticator>>,
+    /// Observability hooks (no-op by default); see `metrics` module docs.
+    metrics: Arc<dyn crate::metrics::MetricsHooks>,
 }
 
 /// Information about an active INVITE dialog.
@@ -262,6 +264,7 @@ impl Gb28181Server {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            metrics: Arc::new(crate::metrics::NoopMetrics),
         }
     }
 
@@ -280,6 +283,14 @@ impl Gb28181Server {
     /// §9.2 voice talkback). Without it, audio-only INVITEs are refused
     /// with 488.
     #[must_use]
+    /// Sets the observability hooks (no-op by default). Hooks fire on the
+    /// REGISTER/keepalive lifecycle and the media paths; they must be
+    /// cheap and never block.
+    pub fn with_metrics(mut self, hooks: Arc<dyn crate::metrics::MetricsHooks>) -> Self {
+        self.metrics = hooks;
+        self
+    }
+
     pub fn with_audio_sink(mut self, sink: Arc<dyn AudioTalkbackSink>) -> Self {
         self.audio_sink = Some(sink);
         self
@@ -477,11 +488,13 @@ impl Gb28181Server {
         const MAX_REG_ATTEMPTS: u32 = 3;
         const REG_BACKOFF_SECS: u64 = 10;
         for attempt in 1..=MAX_REG_ATTEMPTS {
+            self.metrics.register_attempt();
             tokio::select! {
                 result = self.perform_register(&mut sip_client, platform_sip_addr) => {
                     match result {
                         Ok(()) => {
                             registered = true;
+                            self.metrics.register_ok();
                             log::info!(
                                 "gb28181: registered with platform {} (attempt {}/{})",
                                 platform_sip_addr,
@@ -491,6 +504,7 @@ impl Gb28181Server {
                             break;
                         }
                         Err(e) => {
+                            self.metrics.register_fail();
                             log::warn!(
                                 "gb28181: registration attempt {}/{} failed: {e}",
                                 attempt,
@@ -525,6 +539,7 @@ impl Gb28181Server {
             let keepalive_local_port = local_sip_port;
             let mut keepalive_shutdown = shutdown.clone();
             let keepalive_authenticator = self.authenticator.clone();
+            let keepalive_metrics = Arc::clone(&self.metrics);
             tokio::spawn(async move {
                 if let Err(e) = run_keepalive(
                     sip_socket_for_keepalive,
@@ -535,6 +550,7 @@ impl Gb28181Server {
                     keepalive_local_port,
                     keepalive_interval_secs,
                     keepalive_authenticator,
+                    Arc::clone(&keepalive_metrics),
                     &mut keepalive_shutdown,
                 )
                 .await
@@ -642,6 +658,7 @@ impl Gb28181Server {
                                 let keepalive_local_port = local_sip_port;
                                 let mut keepalive_shutdown = shutdown.clone();
                                 let keepalive_authenticator = self.authenticator.clone();
+                                let keepalive_metrics = Arc::clone(&self.metrics);
                                 tokio::spawn(async move {
                                     if let Err(e) = run_keepalive(
                                         sip_socket_for_keepalive,
@@ -652,6 +669,7 @@ impl Gb28181Server {
                                         keepalive_local_port,
                                         keepalive_interval_secs,
                                         keepalive_authenticator,
+                                        keepalive_metrics,
                                         &mut keepalive_shutdown,
                                     )
                                     .await
@@ -803,6 +821,7 @@ impl Gb28181Server {
                     *keepalive_failures = 0; // Reset failure counter on OK
                 } else if msg.status_code.is_some() && msg.status_code != Some(SipStatusCode::Ok) {
                     *keepalive_failures += 1;
+                    self.metrics.keepalive_fail();
                     if *keepalive_failures >= self.config.heartbeat_timeout_count {
                         log::warn!(
                             "gb28181: keepalive timeout after {} failures, re-registering",
@@ -1208,6 +1227,7 @@ impl Gb28181Server {
                 self.subscriber_id = Some(subscriber_id);
 
                 let media_task_conn = media_tcp_conn.clone();
+                let media_metrics = Arc::clone(&self.metrics);
                 tokio::spawn(async move {
                     if let Err(e) = run_media_task(
                         async_rx,
@@ -1216,6 +1236,7 @@ impl Gb28181Server {
                         ssrc,
                         &device_id,
                         media_dest,
+                        media_metrics,
                     )
                     .await
                     {
@@ -1700,6 +1721,7 @@ async fn run_keepalive(
     local_port: u16,
     interval_secs: u64,
     authenticator: Option<Arc<dyn RegisterAuthenticator>>,
+    metrics: Arc<dyn crate::metrics::MetricsHooks>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
@@ -1734,6 +1756,7 @@ async fn run_keepalive(
 
                 let data = serialize_wire(&notify);
                 if let Err(e) = sip_socket.send_to(&data, platform_addr).await {
+                    metrics.keepalive_fail();
                     log::error!("gb28181: keepalive send failed: {e}");
                 }
 
@@ -1759,7 +1782,16 @@ async fn run_media_task(
     ssrc: u32,
     device_id: &str,
     remote_addr: SocketAddr,
+    metrics: Arc<dyn crate::metrics::MetricsHooks>,
 ) -> Result<()> {
+    metrics.invite_session_started();
+    struct StopOnDrop(Arc<dyn crate::metrics::MetricsHooks>);
+    impl Drop for StopOnDrop {
+        fn drop(&mut self) {
+            self.0.invite_session_stopped();
+        }
+    }
+    let _media_stop = StopOnDrop(Arc::clone(&metrics));
     let mut rtp_pusher = RtpPusher::new(remote_addr, ssrc, PS_PAYLOAD_TYPE);
     let mut pts = 0u64;
     // Capture timestamp of the previous access unit — PTS deltas derive from
@@ -1795,6 +1827,8 @@ async fn run_media_task(
         // Send PS data as RTP packets
         // For PS, we just use the raw PS data as the RTP payload
         const MAX_RTP_PAYLOAD: usize = 1400;
+        metrics.ps_bytes_out(ps_data.len() as u64);
+        metrics.rtp_packets_out(1); // one RTP packet per chunk below
         let chunk_count = ps_data.len().div_ceil(MAX_RTP_PAYLOAD);
 
         for (i, chunk) in ps_data.chunks(MAX_RTP_PAYLOAD).enumerate() {
@@ -1913,6 +1947,7 @@ async fn handle_tcp_connection(
     let mut server = Gb28181Server {
         config,
         au_hub,
+        metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(placeholder_udp),
         tcp_conn: Some(write_half),
         media_socket: None,
@@ -2459,6 +2494,7 @@ async fn test_recordinfo_dispatch_with_source() {
     let server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
@@ -2541,6 +2577,7 @@ async fn test_recordinfo_dispatch_without_source() {
     let server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
@@ -2602,6 +2639,7 @@ async fn test_playback_invite_empty_range_returns_488() {
     let mut server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
@@ -2693,6 +2731,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
     let mut server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
@@ -2781,6 +2820,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
     let server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
@@ -2929,6 +2969,7 @@ async fn test_info_playback_control_live_session_noop() {
     let mut server = Gb28181Server {
         config,
         au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
         media_socket: None,
@@ -3020,6 +3061,7 @@ mod tcp_media_tests {
         let mut server = Gb28181Server {
             config,
             au_hub: hub.clone(),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
             media_socket: None,
@@ -3147,6 +3189,7 @@ mod tcp_media_tests {
         let mut server = Gb28181Server {
             config,
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
             media_socket: None,
@@ -3239,6 +3282,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            metrics: Arc::new(crate::metrics::NoopMetrics),
         };
 
         // Fake platform: sends a STALE 200 OK (wrong CSeq) before the real 401,
@@ -3353,6 +3397,7 @@ mod tcp_media_tests {
         let mut server = Gb28181Server {
             config,
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
             media_socket: None,
@@ -3411,6 +3456,7 @@ mod tcp_media_tests {
         let mut server = Gb28181Server {
             config,
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
             media_socket: None,
