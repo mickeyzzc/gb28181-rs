@@ -371,6 +371,37 @@ pub(crate) fn parse_notify_dual(body: &str) -> Option<Notify> {
 }
 
 #[cfg(test)]
+mod proptests {
+    //! Property tests: the dual-format XML parsers must never panic on
+    //! arbitrary input (issue #29) — malformed bodies surface as None/Err.
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest::proptest! {
+        #[test]
+        fn parse_query_dual_never_panics(body in proptest::collection::vec(any::<char>(), 0..512)) {
+            let s: String = body.into_iter().collect();
+            let _ = parse_query_dual(&s);
+        }
+
+        #[test]
+        fn parse_notify_dual_never_panics(body in proptest::collection::vec(any::<char>(), 0..512)) {
+            let s: String = body.into_iter().collect();
+            let _ = parse_notify_dual(&s);
+        }
+
+        #[test]
+        fn query_roundtrip_via_elements(cmd in "[A-Za-z]{1,16}", sn in "[0-9]{1,6}", id in "[0-9]{1,20}") {
+            let body = format!("<Query><CmdType>{cmd}</CmdType><SN>{sn}</SN><DeviceID>{id}</DeviceID></Query>");
+            let q = parse_query_dual(&body).expect("element form must parse");
+            prop_assert_eq!(q.cmd_type, cmd);
+            prop_assert_eq!(q.sn, sn);
+            prop_assert_eq!(q.device_id, id);
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
