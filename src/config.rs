@@ -50,6 +50,11 @@ pub struct Gb28181Config {
     pub heartbeat_interval_secs: u64,
     #[serde(default = "default_gb28181_heartbeat_timeout_count")]
     pub heartbeat_timeout_count: u32,
+    /// Strict mode (issue #32): when true, spec-example defaults that
+    /// would otherwise only log a warning refuse to start instead.
+    /// Host products opt in; labs may keep false (the default).
+    #[serde(default)]
+    pub strict_example_defaults: bool,
     #[serde(default)]
     pub transport: Transport,
     /// SIP `User-Agent` header value. `None` → neutral
@@ -109,29 +114,57 @@ impl Gb28181Config {
             .unwrap_or_else(|| env!("CARGO_PKG_VERSION").to_string())
     }
 
-    /// Log a warning when serde defaults that point at the spec's example
-    /// values survived into a running server — a mis-loaded host config
-    /// would otherwise silently target `192.168.1.1` with password
-    /// `12345678` and the spec-example device ID.
-    pub fn warn_on_example_defaults(&self) {
+    /// Check the spec-example defaults that a mis-loaded host config
+    /// would otherwise silently carry into production: platform
+    /// `192.168.1.1`, password `12345678`, and the spec-example device
+    /// ID (two devices sharing it collide on the platform).
+    ///
+    /// With `strict_example_defaults = false` (the default) each finding
+    /// logs a warning — the historical behavior. With strict mode on,
+    /// every finding is refused with an error naming the fields, so a
+    /// misconfigured product build fails fast at startup (issue #32).
+    ///
+    /// # Errors
+    /// Strict mode + at least one example default still in effect.
+    pub fn check_example_defaults(&self) -> Result<(), String> {
+        let mut offending: Vec<&str> = Vec::new();
         if self.platform_sip_address == default_gb28181_platform_sip_address() {
+            offending.push("platform_sip_address");
+        }
+        if self.password == default_gb28181_password() {
+            offending.push("password");
+        }
+        if self.device_id == default_gb28181_device_id() {
+            offending.push("device_id");
+        }
+        if offending.is_empty() {
+            return Ok(());
+        }
+        if self.strict_example_defaults {
+            return Err(format!(
+                "gb28181: strict_example_defaults: spec-example values still in effect for {} — set real values in the host config",
+                offending.join(", ")
+            ));
+        }
+        if offending.contains(&"platform_sip_address") {
             log::warn!(
                 "gb28181: platform_sip_address is the example default {} — set it explicitly in the host config",
                 default_gb28181_platform_sip_address()
             );
         }
-        if self.password == default_gb28181_password() {
+        if offending.contains(&"password") {
             log::warn!(
                 "gb28181: password is the example default {:?} — set it explicitly in the host config",
                 default_gb28181_password()
             );
         }
-        if self.device_id == default_gb28181_device_id() {
+        if offending.contains(&"device_id") {
             log::warn!(
                 "gb28181: device_id is the spec-example ID {} — two devices with it collide on the platform",
                 default_gb28181_device_id()
             );
         }
+        Ok(())
     }
 }
 
@@ -183,6 +216,7 @@ impl Default for Gb28181Config {
             register_interval_secs: default_gb28181_register_interval_secs(),
             heartbeat_interval_secs: default_gb28181_heartbeat_interval_secs(),
             heartbeat_timeout_count: default_gb28181_heartbeat_timeout_count(),
+            strict_example_defaults: false,
             transport: Transport::default(),
             user_agent: None,
             device_name: None,
@@ -196,6 +230,34 @@ impl Default for Gb28181Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Issue #32: strict mode turns the example-default warnings into a
+    /// startup refusal; non-strict keeps the historical warn-only path.
+    #[test]
+    fn strict_mode_check_example_defaults() {
+        // Defaults + strict → Err naming every offending field.
+        let cfg = Gb28181Config {
+            strict_example_defaults: true,
+            ..Gb28181Config::default()
+        };
+        let err = cfg.check_example_defaults().unwrap_err();
+        for field in ["platform_sip_address", "password", "device_id"] {
+            assert!(err.contains(field), "must name {field}: {err}");
+        }
+
+        // Defaults + non-strict → Ok (warn-only, historical behavior).
+        assert!(Gb28181Config::default().check_example_defaults().is_ok());
+
+        // Real values + strict → Ok.
+        let cfg = Gb28181Config {
+            strict_example_defaults: true,
+            platform_sip_address: "10.0.0.5".to_string(),
+            password: "real".to_string(),
+            device_id: "34020000001320000042".to_string(),
+            ..Gb28181Config::default()
+        };
+        assert!(cfg.check_example_defaults().is_ok());
+    }
 
     /// `Default` must stay in lockstep with the serde defaults so hosts that
     /// construct `Gb28181Config::default()` and hosts that deserialize an
@@ -215,6 +277,11 @@ mod tests {
         assert_eq!(d.register_interval_secs, s.register_interval_secs);
         assert_eq!(d.heartbeat_interval_secs, s.heartbeat_interval_secs);
         assert_eq!(d.heartbeat_timeout_count, s.heartbeat_timeout_count);
+        assert_eq!(d.strict_example_defaults, s.strict_example_defaults);
+        assert!(
+            !d.strict_example_defaults,
+            "strict mode must default to warn-only"
+        );
         assert!(matches!(d.transport, Transport::Udp));
         assert_eq!(d.user_agent, None);
         assert_eq!(d.device_name, None);
