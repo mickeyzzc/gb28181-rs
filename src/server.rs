@@ -302,6 +302,12 @@ impl Gb28181Server {
     /// Branches on `config.transport` exactly like `start`. Returns a
     /// [`ServerHandle`] for graceful shutdown.
     pub async fn spawn(self) -> Result<ServerHandle> {
+        // Fail fast on spec-example defaults in strict mode — before any
+        // socket is bound (issue #32). Non-strict keeps the warn-only
+        // behavior at the run paths.
+        if let Err(e) = self.config.check_example_defaults() {
+            return Err(anyhow!(e));
+        }
         match self.config.transport {
             Transport::Udp => self.spawn_udp().await,
             Transport::Tcp => self.spawn_tcp().await,
@@ -348,7 +354,7 @@ impl Gb28181Server {
     async fn run_bound(mut self) -> Result<ServerHandle> {
         let local_sip_port = self.config.local_sip_port;
         log::info!("gb28181: listening on SIP port {local_sip_port} (UDP)");
-        self.config.warn_on_example_defaults();
+        self.config.check_example_defaults().ok();
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
@@ -367,7 +373,7 @@ impl Gb28181Server {
     async fn run_tcp_bound(self, listener: TcpListener) -> Result<ServerHandle> {
         let local_sip_port = self.config.local_sip_port;
         log::info!("gb28181: listening on SIP port {local_sip_port} (TCP)");
-        self.config.warn_on_example_defaults();
+        self.config.check_example_defaults().ok();
 
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let au_hub = self.au_hub;

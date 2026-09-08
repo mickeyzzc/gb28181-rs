@@ -101,3 +101,46 @@ async fn tcp_server_shutdown_stops_accept_loop() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+/// Strict mode (issue #32): spec-example values that would otherwise only
+/// warn must refuse to start, naming every offending field — before any
+/// socket is bound.
+#[tokio::test]
+async fn strict_mode_refuses_example_defaults() {
+    // test_config deliberately carries the spec-example password/device_id.
+    let mut cfg = test_config(0, gb28181_rs::config::Transport::Udp);
+    cfg.strict_example_defaults = true;
+
+    let err = Gb28181Server::new(cfg, Arc::new(MockFrameHub::new()))
+        .spawn()
+        .await
+        .expect_err("strict mode must refuse spec-example values");
+    let msg = format!("{err:#}");
+    for field in ["password", "device_id"] {
+        assert!(msg.contains(field), "error must name {field}: {msg}");
+    }
+    // test_config overrides platform_sip_address to 127.0.0.1, so only
+    // password + device_id are expected in the finding list.
+    assert!(!msg.contains("platform_sip_address"), "unexpected: {msg}");
+}
+
+/// Strict mode with real values starts normally (and shuts down cleanly).
+#[tokio::test]
+async fn strict_mode_accepts_real_values() -> anyhow::Result<()> {
+    let cfg = Gb28181Config {
+        strict_example_defaults: true,
+        password: "real-password".to_string(),
+        device_id: "34020000001320000042".to_string(),
+        channel_id: "34020000001320000042".to_string(),
+        ..test_config(0, gb28181_rs::config::Transport::Udp)
+    };
+    let mut handle = Gb28181Server::new(cfg, Arc::new(MockFrameHub::new()))
+        .spawn()
+        .await
+        .expect("strict mode must accept real values");
+
+    tokio::time::timeout(Duration::from_secs(3), handle.shutdown())
+        .await
+        .expect("shutdown must complete within 3s")?;
+    Ok(())
+}
