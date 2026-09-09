@@ -11,6 +11,12 @@ released out of band.
 
 ## [Unreleased]
 
+- `docs` logging & tracing compatibility guide (#36): the decision
+  record for keeping the `log` facade (widest host compatibility —
+  `tracing` absorbs `log` automatically; native tracing would silence
+  plain-log hosts), the LogTracer bridge wiring, and the emitted-level
+  reference. Bilingual (docs/en + docs/zh).
+
 - `test` soak harness (#35): `cargo test --test soak -- --ignored`
   drives INVITE→200/BYE→200 cycles (default 50,
   `GB28181_SOAK_CYCLES` scales) over a registered, keepalive-flowing
