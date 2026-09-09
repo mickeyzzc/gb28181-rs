@@ -583,6 +583,66 @@ pub fn build_keepalive_notify(
     })
 }
 
+/// CSeq base for snapshot-finished notifies (device→platform MESSAGEs
+/// need monotonically increasing CSeq per dialog; keep clear of the
+/// keepalive counter's range).
+static SNAPSHOT_NOTIFY_CSEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(7000);
+
+/// Builds the device→platform UploadSnapShotFinished notify MESSAGE
+/// (GB/T 28181-2022 A.2.5.7), wrapping the manscdp body. Sent after a
+/// snapshot executor finishes its capture/upload exchange; `file_ids`
+/// empty reports the exchange as wholly/partially failed.
+pub fn build_upload_snapshot_finished_message(
+    sn: u32,
+    device_id: &str,
+    session_id: &str,
+    file_ids: &[String],
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+) -> Result<SipMessage> {
+    let body = super::manscdp::build_upload_snapshot_finished(sn, device_id, session_id, file_ids)
+        .to_xml()?;
+
+    let cseq = SNAPSHOT_NOTIFY_CSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut headers = Vec::new();
+    headers.push((
+        "Via".to_string(),
+        format!(
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
+        ),
+    ));
+    headers.push((
+        "From".to_string(),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
+    ));
+    headers.push(("To".to_string(), format!("<sip:{}@{}>", domain, domain)));
+    headers.push((
+        "Call-ID".to_string(),
+        format!("{}-snapshot-{}", device_id, cseq),
+    ));
+    headers.push(("CSeq".to_string(), format!("{} MESSAGE", cseq)));
+    headers.push(("Max-Forwards".to_string(), "70".to_string()));
+    headers.push((
+        "Content-Type".to_string(),
+        "Application/MANSCDP+xml".to_string(),
+    ));
+    headers.push(("Content-Length".to_string(), body.len().to_string()));
+
+    Ok(SipMessage {
+        start_line: format!("MESSAGE sip:{}@{} SIP/2.0", domain, domain),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some(format!("sip:{}@{}", domain, domain)),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body,
+    })
+}
+
 /// A single RecordInfo item (one recorded segment).
 #[derive(Debug, Clone)]
 pub struct RecordItem {
