@@ -104,3 +104,33 @@ let server = Gb28181Server::new(config, hub)
   对讲，反之亦然；BYE 走共享的媒体任务清理路径终结接收。
 
 设备麦克风音频的上行（发送侧）不在本修订内。
+
+## 快照指令（GB/T 28181-2022 A.2.1.24 + A.2.5.7）
+
+平台可用 `DeviceControl(SnapShot)` MESSAGE 下发按需抓拍。安装
+[`snapshot::SnapshotExecutor`](../../src/snapshot.rs) 即可执行：
+
+```rust
+struct MyExecutor;
+
+impl SnapshotExecutor for MyExecutor {
+    fn execute(&self, cmd: SnapshotCommand) -> SnapshotExchange {
+        Box::pin(async move {
+            // cmd.snap_num（1..=10）、cmd.interval、cmd.upload_url、
+            // cmd.session_id —— 抓 JPEG 并把每帧 body **原样** POST 到
+            // cmd.upload_url（URL 已带 session 参数）；每帧返回一个
+            // 上传文件 ID。
+            Ok(vec!["store/2026/09/09/a.jpg".to_string()])
+        })
+    }
+}
+
+let server = Gb28181Server::with_recording_index(cfg, hub, None)
+    .with_snapshot_executor(Some(Arc::new(MyExecutor)));
+```
+
+服务端先同步应答 200，在后台任务中执行交换，最后回
+`UploadSnapShotFinished` 通知——回带 SessionID，每个成功上传的文件
+对应一个 `SnapShotFileID`；空列表表示抓拍/上传全部或部分失败。
+仅支持 UDP 传输；TCP 传输、以及未安装执行器时，控制指令按标准
+control-reject 响应拒绝。
