@@ -26,7 +26,7 @@ config.transport = Transport::Tcp;
 | `device_id` | `String` | `"34020000001320000001"` | 20-digit GB/T 28181 device ID (spec-example default). |
 | `channel_id` | `String` | `"34020000001320000001"` | 20-digit channel ID reported in the catalog. |
 | `sip_domain` | `String` | `"3402000000"` | SIP domain (usually the platform's center code). |
-| `password` | `String` | `"12345678"` | SIP digest-auth password shared with the platform. |
+| `password` | `String` | `""` | SIP digest-auth password shared with the platform. No default — the server warns when it is empty or set to the well-known example value. |
 | `local_sip_port` | `u16` | `5060` | Local SIP listening port (UDP socket or TCP listener). |
 | `register_interval_secs` | `u64` | `60` | REGISTER refresh interval. |
 | `heartbeat_interval_secs` | `u64` | `60` | Keepalive (MESSAGE) interval. |
@@ -77,13 +77,13 @@ defaults.
 
 ## The example-default warning
 
-The spec-documentation defaults (`192.168.1.1`, `12345678`, the example
-device ID) are kept for wire-format stability with existing host configs.
-If a running server still sees them, `warn_on_example_defaults()` logs a
-warning — the server calls it automatically after binding. Two devices
-sharing the spec-example ID collide on the platform; a mis-loaded config
-silently targeting the example platform is the other failure this
-catches.
+`warn_on_example_defaults()` logs a warning — the server calls it
+automatically after binding — whenever a running server still carries a
+value a mis-loaded host config would silently produce: the spec-example
+address `192.168.1.1`, the spec-example device ID (two devices sharing
+it collide on the platform), an empty SIP password (digest auth cannot
+succeed), or a password explicitly set to the well-known example
+`12345678`. The password itself ships with no default.
 
 ## Device IDs
 

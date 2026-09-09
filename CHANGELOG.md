@@ -11,6 +11,14 @@ released out of band.
 
 ## [Unreleased]
 
+- `fix(config)` no default SIP password (#26): `password` now defaults to
+  empty instead of the spec-example `12345678` — a mis-loaded host config
+  can no longer silently authenticate with a publicly documented value.
+  `check_example_defaults()` flags an empty password (digest auth cannot
+  succeed) and a password explicitly set to the well-known example value;
+  strict mode (`strict_example_defaults`) refuses both at startup. Hosts
+  that relied on the serde default must set the password explicitly.
+
 ## [v0.10.0] — 2026-09-09
 
 - `docs` logging & tracing compatibility guide (#36): the decision
