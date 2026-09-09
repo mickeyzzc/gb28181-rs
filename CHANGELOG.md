@@ -11,6 +11,12 @@ released out of band.
 
 ## [Unreleased]
 
+- `test` soak harness (#35): `cargo test --test soak -- --ignored`
+  drives INVITE→200/BYE→200 cycles (default 50,
+  `GB28181_SOAK_CYCLES` scales) over a registered, keepalive-flowing
+  session, asserting no descriptor growth across per-session media
+  socket/task teardown. `#[ignore]`-gated so normal CI stays fast.
+
 - `bench` criterion benches (#34): `ps` (keyframe mux/demux/roundtrip),
   `rtp` (keyframe vs P-frame PS fragmentation), `sip` (REGISTER and
   catalog MESSAGE parse/serialize/roundtrip). Run via `cargo bench`;
