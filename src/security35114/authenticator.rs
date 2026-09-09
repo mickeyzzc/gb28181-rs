@@ -15,9 +15,9 @@
 //! ([`OutgoingSigner`](crate::authenticator::OutgoingSigner)).
 
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
 use rand::RngCore;
 
@@ -25,12 +25,17 @@ use super::headers::{
     build_auth_authorization, build_capability_authorization, parse_challenge, parse_security_info,
     Mode,
 };
-use super::integrity::{build_note_header, format_date};
+use super::integrity::{build_note_header, format_date, parse_note_date, verify_note_header};
 use super::{
     decrypt_vkek, sign2_payload, sign_auth_payload, sign_message, verify_message, Certificate,
     Identity, RandomEncoding, Sign2Order, VkekEncoding,
 };
 use crate::authenticator::RegisterAuthenticator;
+
+/// Bounds how old a signed request's Date header may be (and how far in
+/// the future): beyond it the Note is a replay. The digest alone is
+/// self-consistent, so the window is the replay guard.
+pub const NOTE_FRESHNESS_WINDOW: Duration = Duration::from_secs(5 * 60);
 
 /// Configures an [`Authenticator`]. `device`, `device_id` and `server_id`
 /// are required; the rest carry safe defaults.
@@ -248,6 +253,49 @@ impl RegisterAuthenticator for Authenticator {
         );
         (date, note)
     }
+
+    /// Verifies a platform→device request's Note against the negotiated
+    /// VKEK — the device-side mirror of `decorate_outgoing` (issue #41).
+    /// A request without a Note passes (mixed-mode Digest platforms). A
+    /// malformed or stale Date fails closed: the digest alone is
+    /// self-consistent, so the freshness window is the only replay
+    /// guard and a Date it cannot parse disables that guard.
+    fn verify_incoming_note(
+        &self,
+        method: &str,
+        from: &str,
+        to: &str,
+        call_id: &str,
+        date: &str,
+        note: &str,
+        body: &str,
+    ) -> Result<()> {
+        if note.is_empty() {
+            return Ok(());
+        }
+        let vkek = self.vkek().ok_or_else(|| {
+            anyhow!("security35114: incoming Note before the handshake completed")
+        })?;
+        let stamp = parse_note_date(date).context("security35114: incoming Note Date malformed")?;
+        let skew = SystemTime::now()
+            .duration_since(stamp)
+            .unwrap_or_else(|_| stamp.duration_since(SystemTime::now()).unwrap_or_default());
+        if skew > NOTE_FRESHNESS_WINDOW {
+            bail!("security35114: incoming Note Date {date} outside the freshness window");
+        }
+        verify_note_header(
+            note,
+            method,
+            from,
+            to,
+            call_id,
+            date,
+            &vkek,
+            body,
+            VkekEncoding::Raw,
+        )
+        .context("security35114: incoming Note rejected")
+    }
 }
 
 #[cfg(test)]
@@ -343,6 +391,116 @@ mod tests {
         // REGISTER never decorated.
         let (d2, n2) = a.decorate_outgoing("REGISTER", "", "", "", "");
         assert!(d2.is_empty() && n2.is_empty());
+
+        // --- device-side downstream Note verification (issue #41) ---
+        // Valid signature over a fresh Date passes.
+        let date_in = format_date(SystemTime::now());
+        let note_in = build_note_header(
+            "INVITE",
+            "<sip:p@d>",
+            "<sip:dev@d>",
+            "plat-1",
+            &date_in,
+            &GOLDEN_VKEK,
+            "body",
+            VkekEncoding::Raw,
+        );
+        assert!(
+            a.verify_incoming_note(
+                "INVITE",
+                "<sip:p@d>",
+                "<sip:dev@d>",
+                "plat-1",
+                &date_in,
+                &note_in,
+                "body"
+            )
+            .is_ok(),
+            "a valid Note must verify"
+        );
+        // Tampered body fails.
+        assert!(
+            a.verify_incoming_note(
+                "INVITE",
+                "<sip:p@d>",
+                "<sip:dev@d>",
+                "plat-1",
+                &date_in,
+                &note_in,
+                "tampered"
+            )
+            .is_err(),
+            "a tampered body must fail"
+        );
+        // No Note passes (mixed-mode Digest platforms).
+        assert!(
+            a.verify_incoming_note("MESSAGE", "f", "t", "c", &date_in, "", "")
+                .is_ok(),
+            "a Note-less request must pass"
+        );
+        // Stale Date fails the freshness window even though the digest
+        // is self-consistent.
+        let stale = format_date(SystemTime::now() - std::time::Duration::from_secs(2 * 3600));
+        let stale_note = build_note_header(
+            "INVITE",
+            "<sip:p@d>",
+            "<sip:dev@d>",
+            "plat-2",
+            &stale,
+            &GOLDEN_VKEK,
+            "b",
+            VkekEncoding::Raw,
+        );
+        assert!(
+            a.verify_incoming_note(
+                "INVITE",
+                "<sip:p@d>",
+                "<sip:dev@d>",
+                "plat-2",
+                &stale,
+                &stale_note,
+                "b"
+            )
+            .is_err(),
+            "a stale Date must fail the freshness window"
+        );
+        // Malformed Date fails closed.
+        let bad_note = build_note_header(
+            "INVITE",
+            "<sip:p@d>",
+            "<sip:dev@d>",
+            "plat-3",
+            "not-a-date",
+            &GOLDEN_VKEK,
+            "b",
+            VkekEncoding::Raw,
+        );
+        assert!(
+            a.verify_incoming_note(
+                "INVITE",
+                "<sip:p@d>",
+                "<sip:dev@d>",
+                "plat-3",
+                "not-a-date",
+                &bad_note,
+                "b"
+            )
+            .is_err(),
+            "a malformed Date must fail closed"
+        );
+        // Before the handshake completes, verification refuses.
+        let fresh = Authenticator::new(Options::new(
+            device_identity(),
+            GOLDEN_DEVICE,
+            GOLDEN_SERVER,
+        ))
+        .unwrap();
+        assert!(
+            fresh
+                .verify_incoming_note("MESSAGE", "f", "t", "c", &date_in, &note_in, "")
+                .is_err(),
+            "a Note before the handshake must not verify"
+        );
     }
 
     #[test]

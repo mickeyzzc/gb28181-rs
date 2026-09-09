@@ -36,6 +36,53 @@ pub fn format_date(t: std::time::SystemTime) -> String {
     format!("{year:04}-{month:02}-{d:02}T{h:02}:{m:02}:{s:02}.{ms:03}")
 }
 
+/// Parses a Date header rendered by [`format_date`] back to
+/// `SystemTime` — the freshness anchor for incoming Note verification.
+pub fn parse_note_date(date: &str) -> Result<std::time::SystemTime> {
+    let parse_field = |s: Option<&str>| -> Option<i64> { s?.parse().ok() };
+    // YYYY-MM-DDTHH:MM:SS.mmm (UTC, no zone suffix)
+    let bytes = date.as_bytes();
+    let bad = || anyhow!("malformed GB35114 Date header: {date}");
+    if bytes.len() != 23
+        || bytes[4] != b'-'
+        || bytes[7] != b'-'
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'.'
+    {
+        return Err(bad());
+    }
+    let year: i64 = parse_field(date.get(0..4)).ok_or_else(bad)?;
+    let month: i64 = parse_field(date.get(5..7)).ok_or_else(bad)?;
+    let day: i64 = parse_field(date.get(8..10)).ok_or_else(bad)?;
+    let hour: i64 = parse_field(date.get(11..13)).ok_or_else(bad)?;
+    let minute: i64 = parse_field(date.get(14..16)).ok_or_else(bad)?;
+    let second: i64 = parse_field(date.get(17..19)).ok_or_else(bad)?;
+    let millis: i64 = parse_field(date.get(20..23)).ok_or_else(bad)?;
+    if !(1..=12).contains(&month)
+        || !(1..=31).contains(&day)
+        || hour > 23
+        || minute > 59
+        || second > 59
+    {
+        return Err(bad());
+    }
+    // Days-from-civil (Howard Hinnant) — the inverse of format_date.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    let secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
+    Ok(std::time::SystemTime::UNIX_EPOCH
+        + std::time::Duration::from_millis(
+            secs.saturating_mul(1000).saturating_add(millis).max(0) as u64
+        ))
+}
+
 /// Computes the SM3 digest over the Note-header input.
 #[allow(clippy::too_many_arguments)] // mirrors the wire-signature fields
 pub fn digest_payload(
@@ -274,5 +321,28 @@ mod tests {
     fn format_date_golden() {
         let t = UNIX_EPOCH + Duration::from_millis(1_706_712_049_583);
         assert_eq!(format_date(t), GOLDEN_DATE);
+    }
+
+    #[test]
+    fn parse_note_date_roundtrip() {
+        let t = UNIX_EPOCH + Duration::from_millis(1_706_712_049_583);
+        let back = parse_note_date(&format_date(t)).unwrap();
+        let diff = back
+            .duration_since(t)
+            .or_else(|_| t.duration_since(back))
+            .unwrap();
+        assert!(
+            diff.as_millis() == 0,
+            "roundtrip must be lossless: {diff:?}"
+        );
+    }
+
+    #[test]
+    fn parse_note_date_rejects_malformed() {
+        assert!(parse_note_date("").is_err());
+        assert!(parse_note_date("not-a-date").is_err());
+        assert!(parse_note_date("2024-01-31T08:00:49.58").is_err()); // short millis
+        assert!(parse_note_date("2024-13-01T08:00:49.583").is_err()); // month 13
+        assert!(parse_note_date("2024-01-31T25:00:49.583").is_err()); // hour 25
     }
 }

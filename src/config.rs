@@ -57,6 +57,13 @@ pub struct Gb28181Config {
     pub strict_example_defaults: bool,
     #[serde(default)]
     pub transport: Transport,
+    /// Device-side failure behavior for incoming Note verification on
+    /// platform→device requests (GB 35114 §9.4; issue #41). Only active
+    /// when a `RegisterAuthenticator` overrides `verify_incoming_note`
+    /// (the security35114 A-level reference implementation does).
+    /// Default: reject with 403.
+    #[serde(default)]
+    pub incoming_note_policy: crate::authenticator::IncomingNotePolicy,
     /// SIP `User-Agent` header value. `None` → neutral
     /// `gb28181-rs/<version>` (never a product name).
     #[serde(default)]
@@ -218,6 +225,7 @@ impl Default for Gb28181Config {
             heartbeat_timeout_count: default_gb28181_heartbeat_timeout_count(),
             strict_example_defaults: false,
             transport: Transport::default(),
+            incoming_note_policy: crate::authenticator::IncomingNotePolicy::default(),
             user_agent: None,
             device_name: None,
             manufacturer: None,
@@ -278,6 +286,7 @@ mod tests {
         assert_eq!(d.heartbeat_interval_secs, s.heartbeat_interval_secs);
         assert_eq!(d.heartbeat_timeout_count, s.heartbeat_timeout_count);
         assert_eq!(d.strict_example_defaults, s.strict_example_defaults);
+        assert_eq!(d.incoming_note_policy, s.incoming_note_policy);
         assert!(
             !d.strict_example_defaults,
             "strict mode must default to warn-only"
