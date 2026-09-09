@@ -29,6 +29,19 @@ x509-parser = { version = "0.16", optional = true }
 proptest = "1.4"
 tempfile = "3"
 toml = "0.8"
+criterion = "0.5"
+
+[[bench]]
+name = "ps"
+harness = false
+
+[[bench]]
+name = "rtp"
+harness = false
+
+[[bench]]
+name = "sip"
+harness = false
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
