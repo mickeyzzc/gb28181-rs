@@ -116,7 +116,7 @@ let server = Gb28181Server::with_recording_index(cfg, hub, None)
 
 握手流程按标准文本并以真实抓包交叉校准：`Capability` 能力宣告 → 401 携带 `random1` → 带 `sign1` 的重注册（SM2 签名 random2‖random1‖serverID）→ 200 OK `SecurityInfo` 携带 SM2 封装的 VKEK（`cryptkey`，DER C1‖C3‖C2 信封）；`Bidirection` 模式另含平台 `sign2`。注册成功后，所有外出请求（保活等）携带以 VKEK 为密钥的 `Date` + `Note: Digest nonce="…",algorithm=SM3`。密码学来自 RustCrypto 的 `sm2`/`sm3` crate（纯 Rust，`aarch64-musl` 交叉编译友好）；golden 测试与 Go 孪生库（`gb28181-go/security35114`）共享证书、向量与互通夹具——包括 gmsm 产出的签名/信封样本必须在本库验签、解封成功。
 
-两处跨实现歧义点做成可配置项（[`RandomEncoding`](src/security35114/mod.rs)、[`Sign2Order`](src/security35114/mod.rs)）：签名负载中随机数的表示形式、`sign2` 的 R1/R2 操作数顺序。默认值遵循标准文本。已知限制：设备侧尚未对平台发来的请求做 `Note` 校验。
+两处跨实现歧义点做成可配置项（[`RandomEncoding`](src/security35114/mod.rs)、[`Sign2Order`](src/security35114/mod.rs)）：签名负载中随机数的表示形式、`sign2` 的 R1/R2 操作数顺序。默认值遵循标准文本。下行 `Note` 校验：握手完成后，平台发往设备的带 `Note` 请求会在设备侧用 VKEK 验签并检查 `Date` ±5 分钟新鲜度窗口——签名不符默认回 403（`Gb28181Config::incoming_note_policy` 可选 `warn`/`off` 便于灰度），无 `Note` 的请求照旧放行（兼容混跑的 Digest 平台）。
 
 ### 平台侧（UAS，v0.9.0）
 

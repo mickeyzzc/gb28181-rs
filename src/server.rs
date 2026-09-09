@@ -790,6 +790,13 @@ impl Gb28181Server {
         platform_addr: SocketAddr,
         keepalive_failures: &mut u32,
     ) -> Result<()> {
+        // GB35114 A-level: platform→device requests are Note-verified
+        // before any method dispatch (issue #41).
+        if msg.method.is_some() && !self.allow_incoming_note(msg) {
+            let forbidden = build_error_response(msg, 403, "Forbidden");
+            self.send_sip_message(&forbidden, peer_addr).await?;
+            return Ok(());
+        }
         match msg.method {
             Some(SipMethod::Invite) => {
                 self.handle_invite(msg, peer_addr).await?;
@@ -842,6 +849,47 @@ impl Gb28181Server {
             }
         }
         Ok(())
+    }
+
+    /// Runs device-side Note verification on a platform→device request
+    /// (issue #41). Requests without a Note pass (mixed-mode Digest
+    /// platforms); a Note that fails verification follows
+    /// `incoming_note_policy` (log-only under Warn, 403 under the
+    /// default Reject).
+    fn allow_incoming_note(&self, msg: &SipMessage) -> bool {
+        use crate::authenticator::IncomingNotePolicy;
+
+        if self.config.incoming_note_policy == IncomingNotePolicy::Off {
+            return true;
+        }
+        let Some(auth) = &self.authenticator else {
+            return true;
+        };
+        let note = msg.get_header("Note").unwrap_or("");
+        if note.is_empty() {
+            return true;
+        }
+        let method = msg.method.map(|m| m.to_string()).unwrap_or_default();
+        match auth.verify_incoming_note(
+            &method,
+            msg.get_header("From").unwrap_or(""),
+            msg.get_header("To").unwrap_or(""),
+            msg.get_header("Call-ID").unwrap_or(""),
+            msg.get_header("Date").unwrap_or(""),
+            note,
+            &msg.body,
+        ) {
+            Ok(()) => true,
+            Err(e) => {
+                if self.config.incoming_note_policy == IncomingNotePolicy::Warn {
+                    log::warn!("gb28181: incoming Note verification failed (warn policy, serving anyway): {e}");
+                    true
+                } else {
+                    log::warn!("gb28181: incoming Note verification failed, rejecting: {e}");
+                    false
+                }
+            }
+        }
     }
 
     /// Build a Catalog or DeviceInfo response MESSAGE for an inbound MANSCDP query.

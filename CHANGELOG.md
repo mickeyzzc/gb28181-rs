@@ -11,6 +11,17 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(gb35114)` device-side downstream `Note` verification (#41): after
+  the A-level handshake, platform→device requests carrying a Note are
+  verified against the negotiated VKEK with a ±5-minute Date freshness
+  window (the replay guard — the digest alone is self-consistent).
+  Failure behavior is `Gb28181Config::incoming_note_policy`: 403 under
+  the default `reject`, log-only `warn` for rollout observation, `off`.
+  Note-less requests keep passing (mixed-mode Digest platforms),
+  mirroring the platform-side verifier. New
+  `RegisterAuthenticator::verify_incoming_note` trait method (default
+  accepts); the security35114 Authenticator overrides it. Verified
+  end-to-end against a fake platform signing with the real crypto.
 - `feat(manscdp)` GB28181-2022 snapshot wire types (`SnapShot` control,
   `UploadSnapShotFinished` notify) — twin parity with gb28181-go (#40)
 - `feat(metrics)` library-neutral `MetricsHooks` observability seam (#39)
