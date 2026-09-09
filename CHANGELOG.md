@@ -11,6 +11,11 @@ released out of band.
 
 ## [Unreleased]
 
+- `bench` criterion benches (#34): `ps` (keyframe mux/demux/roundtrip),
+  `rtp` (keyframe vs P-frame PS fragmentation), `sip` (REGISTER and
+  catalog MESSAGE parse/serialize/roundtrip). Run via `cargo bench`;
+  dev-dependency only, no MSRV impact.
+
 - `feat(gb35114)` device-side downstream `Note` verification (#41): after
   the A-level handshake, platform→device requests carrying a Note are
   verified against the negotiated VKEK with a ±5-minute Date freshness
