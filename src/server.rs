@@ -148,6 +148,8 @@ pub struct Gb28181Server {
     /// Optional replacement for Digest REGISTER authentication (GB 35114
     /// A-level via the `gb35114` feature). `None` keeps the Digest flow.
     authenticator: Option<Arc<dyn RegisterAuthenticator>>,
+    /// Device-side snapshot executor (A.2.1.24). `None` = control reject.
+    snapshot_executor: Option<Arc<dyn crate::snapshot::SnapshotExecutor>>,
     /// Observability hooks (no-op by default); see `metrics` module docs.
     metrics: Arc<dyn crate::metrics::MetricsHooks>,
 }
@@ -264,6 +266,7 @@ impl Gb28181Server {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            snapshot_executor: None,
             metrics: Arc::new(crate::metrics::NoopMetrics),
         }
     }
@@ -276,6 +279,20 @@ impl Gb28181Server {
         authenticator: Option<Arc<dyn RegisterAuthenticator>>,
     ) -> Self {
         self.authenticator = authenticator;
+        self
+    }
+
+    /// Installs the device-side snapshot executor (GB/T 28181-2022
+    /// A.2.1.24): DeviceControl(SnapShot) commands run against it and
+    /// complete asynchronously with the A.2.5.7 UploadSnapShotFinished
+    /// notify. `None` (default) keeps the historical control-reject
+    /// behavior. Requires the UDP transport — over TCP the command is
+    /// rejected with a warning.
+    pub fn with_snapshot_executor(
+        mut self,
+        executor: Option<Arc<dyn crate::snapshot::SnapshotExecutor>>,
+    ) -> Self {
+        self.snapshot_executor = executor;
         self
     }
 
@@ -808,6 +825,27 @@ impl Gb28181Server {
                 // Dispatch inbound MESSAGE and respond
                 if let Ok((ok_response, _queued)) = super::client::dispatch_inbound_message(msg) {
                     self.send_sip_message(&ok_response, peer_addr).await?;
+                }
+
+                // DeviceControl(SnapShot) (A.2.1.24): with an executor
+                // installed the 200 above is the whole synchronous answer;
+                // the exchange runs in a spawned task and completes
+                // asynchronously via the A.2.5.7 notify. Without an
+                // executor — or over the TCP transport — the control
+                // reject below keeps the historical behavior.
+                if let Some(control) = crate::manscdp::parse_control_snapshot(&msg.body) {
+                    if let Some(executor) = self.snapshot_executor.clone() {
+                        // UDP only: the notify leaves through the shared
+                        // SIP UDP socket; per-connection TCP servers carry
+                        // a placeholder UDP socket, so key off tcp_conn.
+                        if self.tcp_conn.is_none() && self.sip_socket.is_some() {
+                            self.spawn_snapshot_exchange(&control, executor, platform_addr);
+                            return Ok(());
+                        }
+                        log::warn!(
+                            "gb28181: snapshot command over TCP transport — executor requires UDP, rejecting"
+                        );
+                    }
                 }
 
                 // Build and send Catalog/DeviceInfo response if this was a query
@@ -1573,6 +1611,66 @@ impl Gb28181Server {
         Ok(())
     }
 
+    /// Runs one snapshot exchange to completion in a background task: the
+    /// executor captures/uploads, then the UploadSnapShotFinished notify
+    /// (A.2.5.7) goes out over the SIP UDP socket — same source port as
+    /// every other device MESSAGE. Executor errors report a failed
+    /// exchange (empty SnapShotList); `file_ids` pass through verbatim.
+    fn spawn_snapshot_exchange(
+        &self,
+        control: &crate::manscdp::ControlSnapShot,
+        executor: Arc<dyn crate::snapshot::SnapshotExecutor>,
+        platform_addr: SocketAddr,
+    ) {
+        use crate::snapshot::SnapshotCommand;
+
+        let cmd = SnapshotCommand {
+            snap_num: control.snap_shot.snap_num,
+            interval: control.snap_shot.interval,
+            upload_url: control.snap_shot.upload_url.clone(),
+            session_id: control.snap_shot.session_id.clone(),
+        };
+        let sn = control.sn.parse::<u32>().unwrap_or(0);
+        let session_id = control.snap_shot.session_id.clone();
+        let device_id = self.config.device_id.clone();
+        let domain = self.config.sip_domain.clone();
+        let local_ip = self.local_ip.clone();
+        let local_port = self.config.local_sip_port;
+        let socket = self
+            .sip_socket
+            .clone()
+            .expect("caller checked UDP transport");
+
+        tokio::spawn(async move {
+            let file_ids = match executor.execute(cmd).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    log::warn!("gb28181: snapshot exchange failed: {e}");
+                    Vec::new()
+                }
+            };
+            let notify = match super::client::build_upload_snapshot_finished_message(
+                sn,
+                &device_id,
+                &session_id,
+                &file_ids,
+                &domain,
+                &local_ip,
+                local_port,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!("gb28181: snapshot-finished notify build failed: {e}");
+                    return;
+                }
+            };
+            let data = serialize_wire(&notify);
+            if let Err(e) = socket.send_to(&data, platform_addr).await {
+                log::error!("gb28181: snapshot-finished notify send failed: {e}");
+            }
+        });
+    }
+
     /// Receive the REGISTER response whose CSeq matches `expected_cseq`,
     /// skipping stale responses from previous cycles (issue #11).
     ///
@@ -2014,6 +2112,7 @@ async fn handle_tcp_connection(
         playback_ctl: None,
         audio_sink,
         authenticator: None,
+        snapshot_executor: None,
     };
 
     // Create SIP device client (User-Agent from config; neutral default)
@@ -2561,6 +2660,7 @@ async fn test_recordinfo_dispatch_with_source() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        snapshot_executor: None,
     };
 
     // Query times are derived from the segment's own ms via the same
@@ -2644,6 +2744,7 @@ async fn test_recordinfo_dispatch_without_source() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        snapshot_executor: None,
     };
 
     let body = "<Query><CmdType>RecordInfo</CmdType><SN>9</SN><DeviceID>34020000001320000001</DeviceID><StartTime>2026-08-15T14:00:00</StartTime><EndTime>2026-08-15T15:00:00</EndTime></Query>";
@@ -2706,6 +2807,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        snapshot_executor: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786807800\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -2798,6 +2900,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        snapshot_executor: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786804500\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -2887,6 +2990,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        snapshot_executor: None,
     };
     let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
     let peer_addr = peer.local_addr().expect("peer addr");
@@ -3036,6 +3140,7 @@ async fn test_info_playback_control_live_session_noop() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        snapshot_executor: None,
     };
 
     let body = "<Control><CmdType>PlaybackControl</CmdType><SN>1</SN><DeviceID>34020000001320000001</DeviceID><Info><ControlValue>PAUSE</ControlValue></Info></Control>";
@@ -3128,6 +3233,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            snapshot_executor: None,
         };
 
         // Platform stand-in: TCP listener on an ephemeral port.
@@ -3256,6 +3362,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            snapshot_executor: None,
         };
 
         let body = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 9 TCP/RTP/AVP 96\r\na=setup:active\r\ny=2000000001\r\n";
@@ -3336,6 +3443,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            snapshot_executor: None,
             metrics: Arc::new(crate::metrics::NoopMetrics),
         };
 
@@ -3464,6 +3572,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            snapshot_executor: None,
         };
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         let peer_addr = peer.local_addr().expect("peer addr");
@@ -3525,6 +3634,7 @@ mod tcp_media_tests {
                 sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
             })),
             authenticator: None,
+            snapshot_executor: None,
         };
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         let peer_addr = peer.local_addr().expect("peer addr");

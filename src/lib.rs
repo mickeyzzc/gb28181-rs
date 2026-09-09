@@ -88,6 +88,7 @@ pub mod security35114;
 pub mod segment;
 pub mod server;
 pub mod sip;
+pub mod snapshot;
 
 pub use client::{
     parse_401_challenge, parse_invite, AudioCodec, InviteInfo, MediaKind, SipDeviceClient,

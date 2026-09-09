@@ -11,6 +11,17 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(device)` snapshot command execution (mibee-eye-raspi#28 / GB/T
+  28181-2022 A.2.1.24 + A.2.5.7): a DeviceControl(SnapShot) MESSAGE is
+  answered 200, handed to the new `snapshot::SnapshotExecutor` seam
+  (`with_snapshot_executor`), and completes asynchronously with an
+  UploadSnapShotFinished notify echoing the SessionID plus one
+  SnapShotFileID per uploaded file — an empty list reports the exchange
+  as wholly/partially failed. The executor owns the product side
+  (capture + POST each JPEG body to the command's `upload_url`
+  verbatim). UDP transport only; over TCP — and without an executor —
+  the historical control-reject behavior is kept.
+
 - `fix(config)` no default SIP password (#26): `password` now defaults to
   empty instead of the spec-example `12345678` — a mis-loaded host config
   can no longer silently authenticate with a publicly documented value.
