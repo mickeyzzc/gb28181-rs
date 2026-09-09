@@ -11,6 +11,8 @@ released out of band.
 
 ## [Unreleased]
 
+## [v0.10.0] — 2026-09-09
+
 - `docs` logging & tracing compatibility guide (#36): the decision
   record for keeping the `log` facade (widest host compatibility —
   `tracing` absorbs `log` automatically; native tracing would silence
