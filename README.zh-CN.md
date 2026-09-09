@@ -153,6 +153,7 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 | [PS 封装与 RTP](docs/zh/psmux.md) | 独立使用 `mux_h264_to_ps`/`mux_h265_to_ps`、解析、`RtpPusher`、字节级金串保证 |
 | [消息与字符集](docs/zh/manscdp.md) | 消息类型、元素/属性双形态、UTF-8/GB18030 线上字符集、设备 ID |
 | [服务器生命周期](docs/zh/server.md) | 构造与 bind、UDP/TCP 传输、优雅停机、重试退避、日志 |
+| [日志与 tracing](docs/zh/logging.md) | `log` facade 决策、tracing 桥接、发出的级别 |
 
 ## 库卫生（v0.6.0 加固）
 
