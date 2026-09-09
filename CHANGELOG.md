@@ -11,6 +11,11 @@ released out of band.
 
 ## [Unreleased]
 
+## [v0.11.0] — 2026-09-09
+
+The device-snapshot capability package (mibee-eye-raspi#28): one
+complete user-valuable feature with tests and bilingual docs.
+
 - `feat(device)` snapshot command execution (mibee-eye-raspi#28 / GB/T
   28181-2022 A.2.1.24 + A.2.5.7): a DeviceControl(SnapShot) MESSAGE is
   answered 200, handed to the new `snapshot::SnapshotExecutor` seam

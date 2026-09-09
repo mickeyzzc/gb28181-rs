@@ -152,7 +152,7 @@ Topic guides live under [`docs/en/`](docs/en/) — each has a Chinese counterpar
 | [Recording & playback](docs/en/recording-playback.md) | `RecordingSource`, `SegmentMeta`, the reference segment format, RecordInfo/playback/download/control |
 | [PS muxing & RTP](docs/en/psmux.md) | standalone `mux_h264_to_ps`/`mux_h265_to_ps`, parsing, `RtpPusher`, byte-level golden guarantees |
 | [MANSCDP & charsets](docs/en/manscdp.md) | message types, dual element/attribute forms, UTF-8/GB18030 wire charsets, device IDs |
-| [Server lifecycle](docs/en/server.md) | constructors vs binding, UDP/TCP transports, graceful shutdown, retry/backoff, logging |
+| [Server lifecycle](docs/en/server.md) | constructors vs binding, UDP/TCP transports, graceful shutdown, retry/backoff, logging, snapshot commands (A.2.1.24 executor seam) |
 | [Logging & tracing](docs/en/logging.md) | the `log` facade decision, tracing bridge wiring, emitted levels |
 
 ## Library hygiene (v0.6.0 hardening)

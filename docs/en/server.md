@@ -112,3 +112,35 @@ Behavior:
 
 Sending the device's microphone audio back (the send half) is not part of
 this revision.
+
+## Snapshot commands (GB/T 28181-2022 A.2.1.24 + A.2.5.7)
+
+A platform can order on-demand captures with a
+`DeviceControl(SnapShot)` MESSAGE. Install a
+[`snapshot::SnapshotExecutor`](../../src/snapshot.rs) to execute them:
+
+```rust
+struct MyExecutor;
+
+impl SnapshotExecutor for MyExecutor {
+    fn execute(&self, cmd: SnapshotCommand) -> SnapshotExchange {
+        Box::pin(async move {
+            // cmd.snap_num (1..=10), cmd.interval, cmd.upload_url,
+            // cmd.session_id — capture JPEGs and POST each body to
+            // cmd.upload_url VERBATIM (it already carries the session
+            // parameter); return one ID per uploaded file.
+            Ok(vec!["store/2026/09/09/a.jpg".to_string()])
+        })
+    }
+}
+
+let server = Gb28181Server::with_recording_index(cfg, hub, None)
+    .with_snapshot_executor(Some(Arc::new(MyExecutor)));
+```
+
+The server answers the MESSAGE with 200 synchronously, runs the exchange
+in a background task, and completes with an `UploadSnapShotFinished`
+notify echoing the SessionID plus one `SnapShotFileID` per uploaded
+file — an empty list reports the exchange as wholly/partially failed.
+UDP transport only; over TCP — and without an executor — the control is
+rejected with the standard control-reject response.
