@@ -2,3 +2,19 @@
 tmp/
 
 AGENTS.md
+
+# Hygiene additions (2026-09-10, enforced by tools/check-repo-hygiene.sh)
+.omo/
+.codegraph/
+.claude/
+/-*
+.env
+.env.*
+!.env.example
+*.pcap
+*.pcapng
+*.sqlite
+*.sqlite3
+*.log
+config.local.*
+cookies.txt

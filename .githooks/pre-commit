@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# 提交前卫生闸：拒绝垃圾/敏感文件被 staged。安装：tools/setup-hooks.sh
+# 本地闸是软防线；硬防线在 CI（.github/workflows/ci.yml 的 hygiene job）。
+set -u
+REPO_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+
+"$REPO_DIR/tools/check-repo-hygiene.sh" --staged || {
+    echo
+    echo "✗ 提交被仓库卫生门禁拒绝。处理：不该入库 → unstage/移入 tmp/；"
+    echo "  确属合理 → 调整 tools/check-repo-hygiene.sh 规则并在提交说明中写明理由。"
+    exit 1
+}
