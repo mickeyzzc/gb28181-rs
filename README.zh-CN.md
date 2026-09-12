@@ -17,7 +17,7 @@
 - **注册生命周期** —— 401 摘要挑战（MD5 + SHA-256，qop=auth）、周期性重注册、保活心跳与超时判定
 - **MANSCDP XML** —— Catalog / DeviceInfo / DeviceStatus / RecordInfo / Keepalive，元素与属性双形式；入站报文接受 UTF-8 **或** GB2312/GBK/GB18030，出站声明 GB2312 的报文按声明正确编码
 - **媒体推送** —— H.264/H.265 NALU → MPEG-2 PS → RTP（UDP + RTP over TCP 封帧），SSRC 处理，大帧有界 PES 分片；RTP 时间戳取自真实采集时间（任意帧率）
-- **语音对讲（接收侧）** —— audio-only INVITE（GB/T 28181-2022 §9.2）：临时端口接收 G.711 A/μ 律 RTP 并交付 `AudioTalkbackSink`（闭包即用）；非 G.711 或未注册 sink 的 offer 以 488 拒绝
+- **语音对讲（接收侧）** —— audio-only INVITE（GB/T 28181-2022 §9.2）：临时端口接收 G.711 A/μ 律 RTP 并交付 `AudioTalkbackSink`（闭包即用；重写 `on_audio_codec` 可同时拿到协商出的 A 律/μ 律制式）。兼容真实平台的 offer 形态——仅 payload type 不带 `a=rtpmap` 的 PCMA、`y=` 前导零十进制 SSRC（由生产抓包逐字节 golden 用例锁定）；非 G.711 或未注册 sink 的 offer 以 488 拒绝
 - **直播 + 回放 + 下载** —— INVITE 驱动的直播会话；RecordInfo 查询与按帧节奏的回放/下载，SIP INFO 回放控制（播放/暂停/倍速）
 - **GB 35114 A 级安全，设备/平台两侧**（可选，`gb35114` feature）—— 设备侧基于 SM2 数字证书的 REGISTER 双向认证（`with_register_authenticator`）+ 平台侧挑战/验签/Note 校验状态机（`security35114::Platform`）；`cryptkey` SM2 DER 信封内的 VKEK 协商、keyed-SM3 `Note` 头完整性；与 Go 孪生库共享 golden 夹具，证明跨实现互通
 - **参考录像段格式** —— 裸 Annex-B H.264 + 每帧 `.ts.jsonl` 时间戳 sidecar（见 [`segment`](src/segment.rs)）

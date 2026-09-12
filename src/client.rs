@@ -1553,6 +1553,54 @@ mod media_transport_tests {
         assert_eq!(info.payload_type, 0);
     }
 
+    /// Golden: the audio-only talkback INVITE a production NVR (GoSIP,
+    /// MiBeeNvr M5) puts on the wire — byte-for-byte from a tcpdump
+    /// captured 2026-09-11 (MiBeeNvr#353). Real-stack quirks that must
+    /// keep parsing: no `a=rtpmap` (PT 8 implied by RTP convention),
+    /// `y=` SSRC with a leading zero, `o=` session-id/version `0 0` with
+    /// a numeric username, Via host `0.0.0.0`, quoted display names, no
+    /// From tag, and no trailing CRLF after the last SDP line
+    /// (Content-Length 144 = 7 CRLFs, not 8).
+    #[test]
+    fn real_nvr_talkback_invite_parses() {
+        let raw = "INVITE sip:34020000001310000003@192.168.63.174:5060 SIP/2.0\r\n\
+                   Via: SIP/2.0/UDP 0.0.0.0:5060;branch=z9hG4bK.Ot9zCQf07bLFwIQhoFUtpQpa1Sia4bx5;rport=\r\n\
+                   CSeq: 1 INVITE\r\n\
+                   From: \"34020000002000000001\" <sip:34020000002000000001@192.168.63.30>\r\n\
+                   To: \"34020000001310000003\" <sip:34020000001310000003@192.168.63.174:5060>\r\n\
+                   Call-ID: 4BS50Dp5zTahRVgCDQsCoDMkZzHy4hWB\r\n\
+                   Contact: <sip:34020000002000000001@192.168.63.30:5060>\r\n\
+                   Max-Forwards: 70\r\n\
+                   Content-Type: application/sdp\r\n\
+                   User-Agent: GoSIP\r\n\
+                   Subject: 34020000001310000003:0200006001,34020000002000000001:0\r\n\
+                   Content-Length: 144\r\n\
+                   Allow: INVITE, ACK, CANCEL, REGISTER, MESSAGE, BYE, INFO, NOTIFY, OPTIONS\r\n\
+                   \r\n\
+                   v=0\r\n\
+                   o=34020000002000000001 0 0 IN IP4 192.168.63.30\r\n\
+                   s=Play\r\n\
+                   c=IN IP4 192.168.63.30\r\n\
+                   t=0 0\r\n\
+                   m=audio 57411 RTP/AVP 8\r\n\
+                   a=sendrecv\r\n\
+                   y=0200006001";
+        let msg = SipMessage::parse(raw).expect("parse raw SIP bytes");
+        let info = parse_invite(&msg).expect("parse_invite");
+        assert_eq!(info.media_kind, MediaKind::Audio);
+        // PT 8 straight off the m= line — the offer has no rtpmap.
+        assert_eq!(info.audio_codec, Some(AudioCodec::Pcma));
+        assert_eq!(info.media_transport, MediaTransport::Udp);
+        assert_eq!(info.media_address, "192.168.63.30");
+        assert_eq!(info.media_port, 57411);
+        assert_eq!(info.payload_type, 8);
+        // y=0200006001 → decimal 200006001 (leading zero dropped).
+        assert_eq!(info.ssrc, 200006001);
+        assert_eq!(info.session_type, SessionType::Play);
+        assert_eq!(info.start_secs, None);
+        assert_eq!(info.end_secs, None);
+    }
+
     #[test]
     fn video_offer_stays_video_kind() {
         let msg = invite_with_sdp(
