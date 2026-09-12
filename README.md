@@ -143,18 +143,13 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 ## Documentation
 
-Topic guides live under [`docs/en/`](docs/en/) — each has a Chinese counterpart under `docs/zh/`:
+Topic guides now live in the MiBee documentation hub — the single
+source of truth for library manuals, bilingual:
 
-| Guide | Covers |
-|---|---|
-| [Configuration](docs/en/configuration.md) | every `Gb28181Config` field, identity defaults, the example-value warning, device-ID structure |
-| [Live streaming](docs/en/live-streaming.md) | the `FrameSource` seam, `Nalu`/`AccessUnit` shapes, INVITE lifecycle, PTS derivation |
-| [Recording & playback](docs/en/recording-playback.md) | `RecordingSource`, `SegmentMeta`, the reference segment format, RecordInfo/playback/download/control |
-| [PS muxing & RTP](docs/en/psmux.md) | standalone `mux_h264_to_ps`/`mux_h265_to_ps`, parsing, `RtpPusher`, byte-level golden guarantees |
-| [MANSCDP & charsets](docs/en/manscdp.md) | message types, dual element/attribute forms, UTF-8/GB18030 wire charsets, device IDs |
-| [Server lifecycle](docs/en/server.md) | constructors vs binding, UDP/TCP transports, graceful shutdown, retry/backoff, logging, snapshot commands (A.2.1.24 executor seam) |
-| [Logging & tracing](docs/en/logging.md) | the `log` facade decision, tracing bridge wiring, emitted levels |
+> **https://www.mlsbs.top/docs/mibeelibs**
 
+Manual changes go there by PR (review flow in the hub repo's GOVERNANCE).
+[`docs/README.md`](docs/README.md) keeps the redirect.
 ## Library hygiene (v0.6.0 hardening)
 
 v0.6.0 made the crate safe to embed as a neutral foundation library. The regression tests in [`tests/library_hygiene.rs`](tests/library_hygiene.rs) pin each guarantee:

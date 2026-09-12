@@ -143,18 +143,11 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 ## 文档
 
-专题教程在 [`docs/zh/`](docs/zh/) —— 每篇在 `docs/en/` 下有英文对照版：
+专题手册已迁移至 MiBee 文档中心——库手册唯一真源（双语）：
 
-| 教程 | 内容 |
-|---|---|
-| [配置](docs/zh/configuration.md) | `Gb28181Config` 全字段、身份默认值、示例值警告、设备 ID 结构 |
-| [直播推流](docs/zh/live-streaming.md) | `FrameSource` 接缝、`Nalu`/`AccessUnit` 形态、INVITE 生命周期、PTS 推导 |
-| [录像回放](docs/zh/recording-playback.md) | `RecordingSource`、`SegmentMeta`、参考录像段格式、RecordInfo/回放/下载/回放控制 |
-| [PS 封装与 RTP](docs/zh/psmux.md) | 独立使用 `mux_h264_to_ps`/`mux_h265_to_ps`、解析、`RtpPusher`、字节级金串保证 |
-| [消息与字符集](docs/zh/manscdp.md) | 消息类型、元素/属性双形态、UTF-8/GB18030 线上字符集、设备 ID |
-| [服务器生命周期](docs/zh/server.md) | 构造与 bind、UDP/TCP 传输、优雅停机、重试退避、日志、快照指令（A.2.1.24 执行器接缝） |
-| [日志与 tracing](docs/zh/logging.md) | `log` facade 决策、tracing 桥接、发出的级别 |
+> **https://www.mlsbs.top/docs/mibeelibs**
 
+手册修改向文档中心提 PR（流程见该仓 GOVERNANCE）。本仓 [`docs/README.md`](docs/README.md) 保留引导页。
 ## 库卫生（v0.6.0 加固）
 
 v0.6.0 把本 crate 打磨为可放心嵌入的中性基础库。[`tests/library_hygiene.rs`](tests/library_hygiene.rs) 中的回归测试逐条锁定以下保证：
