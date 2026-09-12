@@ -107,6 +107,15 @@ pub trait AudioTalkbackSink: Send + Sync {
     /// packet's SSRC (falls back to the session SSRC when the header
     /// carries 0).
     fn on_audio(&self, payload: &[u8], ssrc: u32);
+
+    /// Codec-aware delivery: the same packet plus the G.711 variant
+    /// negotiated for the session (from the offer's payload type).
+    /// Sinks that need to decode (A-law vs μ-law) override this; the
+    /// default forwards to [`AudioTalkbackSink::on_audio`], so
+    /// codec-agnostic sinks (closures) keep working unchanged.
+    fn on_audio_codec(&self, payload: &[u8], ssrc: u32, _codec: AudioCodec) {
+        self.on_audio(payload, ssrc);
+    }
 }
 
 impl<F: Fn(&[u8], u32) + Send + Sync> AudioTalkbackSink for F {
@@ -1460,9 +1469,10 @@ impl Gb28181Server {
                             continue;
                         }
                         let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-                        sink.on_audio(
+                        sink.on_audio_codec(
                             &buf[header_len..len],
                             if ssrc != 0 { ssrc } else { session_ssrc },
+                            codec,
                         );
                     }
                     Err(e) => {
@@ -3691,5 +3701,221 @@ mod tcp_media_tests {
             );
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Byte-exact production NVR talkback INVITE (GoSIP / MiBeeNvr M5,
+    /// tcpdump 2026-09-11, MiBeeNvr#353): no `a=rtpmap`, leading-zero
+    /// decimal `y=` SSRC, `o=` session-id/version `0 0`, Via host
+    /// `0.0.0.0`, quoted display names, no From tag, and no trailing
+    /// CRLF after `y=` (Content-Length 144).
+    fn real_nvr_talkback_invite() -> SipMessage {
+        let raw = "INVITE sip:34020000001310000003@192.168.63.174:5060 SIP/2.0\r\n\
+                   Via: SIP/2.0/UDP 0.0.0.0:5060;branch=z9hG4bK.Ot9zCQf07bLFwIQhoFUtpQpa1Sia4bx5;rport=\r\n\
+                   CSeq: 1 INVITE\r\n\
+                   From: \"34020000002000000001\" <sip:34020000002000000001@192.168.63.30>\r\n\
+                   To: \"34020000001310000003\" <sip:34020000001310000003@192.168.63.174:5060>\r\n\
+                   Call-ID: 4BS50Dp5zTahRVgCDQsCoDMkZzHy4hWB\r\n\
+                   Contact: <sip:34020000002000000001@192.168.63.30:5060>\r\n\
+                   Max-Forwards: 70\r\n\
+                   Content-Type: application/sdp\r\n\
+                   User-Agent: GoSIP\r\n\
+                   Subject: 34020000001310000003:0200006001,34020000002000000001:0\r\n\
+                   Content-Length: 144\r\n\
+                   Allow: INVITE, ACK, CANCEL, REGISTER, MESSAGE, BYE, INFO, NOTIFY, OPTIONS\r\n\
+                   \r\n\
+                   v=0\r\n\
+                   o=34020000002000000001 0 0 IN IP4 192.168.63.30\r\n\
+                   s=Play\r\n\
+                   c=IN IP4 192.168.63.30\r\n\
+                   t=0 0\r\n\
+                   m=audio 57411 RTP/AVP 8\r\n\
+                   a=sendrecv\r\n\
+                   y=0200006001";
+        SipMessage::parse(raw).expect("parse real NVR INVITE")
+    }
+
+    async fn audio_test_server(
+        device_id: &str,
+        local_ip: &str,
+        audio_sink: Option<Arc<dyn AudioTalkbackSink>>,
+    ) -> Gb28181Server {
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: device_id.to_string(),
+            channel_id: device_id.to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: local_ip.to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink,
+            authenticator: None,
+            snapshot_executor: None,
+        }
+    }
+
+    /// Golden full loop with the byte-exact production NVR offer: the
+    /// real message must answer 200 OK (not 488 — the deployed 488s were
+    /// the no-sink path, MiBeeNvr#353 ③(b) ruled out by this test) and
+    /// deliver RTP payload with the leading-zero SSRC parsed as 200006001.
+    #[tokio::test]
+    async fn test_real_nvr_talkback_invite_full_loop() {
+        use std::sync::Mutex;
+        type Collected = Arc<Mutex<Vec<(Vec<u8>, u32)>>>;
+        let received: Collected = Arc::new(Mutex::new(Vec::new()));
+        let sink_capture = Arc::clone(&received);
+        let mut server = audio_test_server(
+            "34020000001310000003",
+            "127.0.0.1",
+            Some(Arc::new(move |payload: &[u8], ssrc: u32| {
+                sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
+            })),
+        )
+        .await;
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        server
+            .handle_invite(&real_nvr_talkback_invite(), peer_addr)
+            .await
+            .expect("handle_invite should not error");
+
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 200 OK")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert_eq!(resp.status_code.map(|c| c.code()), Some(200));
+        assert!(resp.body.contains("m=audio "));
+        assert!(resp.body.contains("a=rtpmap:8 PCMA/8000"));
+        // Answer echoes the session SSRC numerically (leading zero dropped).
+        assert!(resp.body.contains("y=200006001"));
+        // To tag appended to the quoted display-name form.
+        assert!(resp
+            .get_header("To")
+            .expect("To header")
+            .starts_with("\"34020000001310000003\" <sip:"));
+        assert!(resp.get_header("To").unwrap().contains(";tag="));
+        let audio_port: u16 = resp
+            .body
+            .lines()
+            .find(|l| l.starts_with("m=audio "))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|p| p.parse().ok())
+            .expect("audio port in answer");
+
+        // RTP with SSRC 200006001 = 0x0BEBD971.
+        let mut pkt = vec![
+            0x80u8, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x0B, 0xEB, 0xD9, 0x71,
+        ];
+        pkt.extend_from_slice(&[0xD5u8, 0x5A, 0xA5]);
+        peer.send_to(&pkt, ("127.0.0.1", audio_port))
+            .await
+            .expect("send rtp");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            {
+                let got = received.lock().unwrap();
+                assert!(got.len() <= 1, "expected exactly one delivery");
+                if got.len() == 1 {
+                    assert_eq!(got[0].0, vec![0xD5, 0x5A, 0xA5]);
+                    assert_eq!(got[0].1, 200006001);
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sink never received the RTP payload"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+
+    /// The codec negotiated from the offer's payload type travels with
+    /// every delivered packet (`on_audio_codec`), so hosts can decode
+    /// A-law vs μ-law correctly.
+    #[tokio::test]
+    async fn test_audio_sink_receives_negotiated_codec() {
+        use std::sync::Mutex;
+        struct CodecSink {
+            seen: Mutex<Vec<AudioCodec>>,
+        }
+        impl AudioTalkbackSink for CodecSink {
+            fn on_audio(&self, _payload: &[u8], _ssrc: u32) {
+                panic!("codec-aware sink must not be called via on_audio");
+            }
+            fn on_audio_codec(&self, _payload: &[u8], _ssrc: u32, codec: AudioCodec) {
+                self.seen.lock().unwrap().push(codec);
+            }
+        }
+        let sink = Arc::new(CodecSink {
+            seen: Mutex::new(Vec::new()),
+        });
+        let mut server =
+            audio_test_server("34020000001310000003", "127.0.0.1", Some(sink.clone())).await;
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        server
+            .handle_invite(&real_nvr_talkback_invite(), peer_addr)
+            .await
+            .expect("handle_invite should not error");
+
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 200 OK")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert_eq!(resp.status_code.map(|c| c.code()), Some(200));
+        let audio_port: u16 = resp
+            .body
+            .lines()
+            .find(|l| l.starts_with("m=audio "))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|p| p.parse().ok())
+            .expect("audio port in answer");
+        let pkt = [
+            0x80u8, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x0B, 0xEB, 0xD9, 0x71, 0xD5,
+        ];
+        peer.send_to(&pkt, ("127.0.0.1", audio_port))
+            .await
+            .expect("send rtp");
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if sink.seen.lock().unwrap().len() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "sink never received the codec"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert_eq!(sink.seen.lock().unwrap().as_slice(), [AudioCodec::Pcma]);
     }
 }
