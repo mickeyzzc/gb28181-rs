@@ -59,6 +59,19 @@ jobs:
       - name: Check Windows target
         run: cargo check --target x86_64-pc-windows-msvc
 
+  ilp32-check:
+    # ILP32 targets must compile (issue #55): tm_gmtoff is i32 there while
+    # the local-offset API returns i64; check-only, no linking.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: armv7-unknown-linux-musleabihf
+      - uses: Swatinem/rust-cache@v2
+      - name: Check ILP32 target (armv7 musl)
+        run: cargo check --target armv7-unknown-linux-musleabihf
+
   coverage:
     # Line coverage summary via cargo-llvm-cov (issue #33). Report-only for
     # now — a gate threshold is a separate decision.

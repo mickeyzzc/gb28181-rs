@@ -308,12 +308,19 @@ pub(crate) fn parse_gb_time_ms_with(s: &str, local_offset_secs: i64) -> Option<u
 /// The libc `localtime_r` path is POSIX-only; non-Unix targets report UTC
 /// (offset 0) — std has no portable local-offset API, and the offset only
 /// decorates MANSCDP DeviceInfo/Keepalive timestamps.
+// tm_gmtoff is c_long: the widening conversion below is only "useless" on
+// LP64 hosts; ILP32 targets (issue #55) need it to compile.
+#[allow(clippy::useless_conversion)]
 pub fn device_local_offset_secs() -> i64 {
     #[cfg(unix)]
     {
+        // `as _` picks up libc::time_t from localtime_r's signature without
+        // naming the alias (deprecated on 32-bit musl ahead of the 64-bit
+        // time_t switch); truncation past 2038 only affects this decorative
+        // timestamp, matching the previous explicit cast.
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as libc::time_t)
+            .map(|d| d.as_secs() as _)
             .unwrap_or(0);
         // SAFETY: `tm` is a plain struct and `localtime_r` writes it without
         // retaining the pointer; a NULL return leaves the zeroed fallback.
@@ -322,7 +329,8 @@ pub fn device_local_offset_secs() -> i64 {
             if libc::localtime_r(&now, &mut tm).is_null() {
                 0
             } else {
-                tm.tm_gmtoff
+                // tm_gmtoff is i64 on LP64 but i32 on ILP32 targets (#55).
+                i64::from(tm.tm_gmtoff)
             }
         }
     }
