@@ -15,6 +15,7 @@
 
 - **SIP 信令** —— 手写 GB/T 28181 子集的解析/序列化（REGISTER + 摘要认证、INVITE、MESSAGE、BYE、ACK、OPTIONS），支持 UDP 与 TCP
 - **注册生命周期** —— 401 摘要挑战（MD5 + SHA-256，qop=auth）、周期性重注册、保活心跳与超时判定
+- **X-GB-Ver 协议版本**（2022 附录 I，可选）—— 配置 `protocol_version`（约定 `"3.0"` = 2022、`"2.0"` = 2016）后每条 REGISTER（初始与认证后）携带 `X-GB-Ver` 头；平台应答中带版本时经 `ServerHandle::platform_protocol_version()` 暴露。未配置（默认）省略该头——与 2022 前线格式逐字节一致。语义移植自 Go 孪生（gb28181-go #78）
 - **MANSCDP XML** —— Catalog / DeviceInfo / DeviceStatus / RecordInfo / Keepalive，元素与属性双形式；入站报文接受 UTF-8 **或** GB2312/GBK/GB18030，出站声明 GB2312 的报文按声明正确编码
 - **GB/T 28181-2022 信息查询** —— HomePositionQuery / CruiseTrackListQuery / CruiseTrackQuery / PTZPosition / SDCardStatus 以最小合规 Response 应答（A.2.4.10-14 / A.2.6.12-16）：必需的 `SumNum` 置零、可选能力块全部省略、CruiseTrackQuery 轨道号回显——语义与 golden 对齐 gb28181-go #78
 - **订阅（SUBSCRIBE/NOTIFY）** —— 设备应答平台订阅（Catalog / Alarm / MobilePosition），200 OK 回显 `Expires`，按事件簿记并支持续订/过期；在订阅会话上发送 SIP NOTIFY：`DeviceNotifier` 向宿主提供 `send_alarm` / `send_catalog_change` / `send_mobile_position`（未订阅时安全 no-op），可选 `MobilePositionSource` 按订阅 `Interval`（默认 5 秒）周期上报位置。线格式对齐 Go 孪生平台侧（subscribe.go / handleNotify）

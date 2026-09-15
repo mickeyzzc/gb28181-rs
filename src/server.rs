@@ -57,6 +57,9 @@ pub(super) const PS_PAYLOAD_TYPE: u8 = 96;
 pub struct ServerHandle {
     task: tokio::task::JoinHandle<()>,
     shutdown: watch::Sender<bool>,
+    /// Platform X-GB-Ver as last seen on a REGISTER response (Annex I),
+    /// shared with the server task.
+    platform_proto_ver: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl ServerHandle {
@@ -79,6 +82,13 @@ impl ServerHandle {
     /// of active media tasks is guaranteed).
     pub fn abort(&self) {
         self.task.abort();
+    }
+
+    /// The platform's `X-GB-Ver` as last seen on a REGISTER response
+    /// (GB/T 28181-2022 Annex I). `None` when the platform never
+    /// announced one.
+    pub fn platform_protocol_version(&self) -> Option<String> {
+        self.platform_proto_ver.lock().unwrap().clone()
     }
 }
 
@@ -156,6 +166,13 @@ pub trait DeviceControlHandler: Send + Sync {
     fn on_ptz(&self, _cmd: &crate::manscdp::PtzCommand) {}
 }
 
+/// Stamp the Annex I X-GB-Ver header on a REGISTER when configured.
+fn stamp_xgbver(register: &mut SipMessage, version: &Option<String>) {
+    if let Some(ver) = version {
+        register.headers.push(("X-GB-Ver".to_string(), ver.clone()));
+    }
+}
+
 /// Executes a decoded DeviceControl against the installed handler.
 fn dispatch_device_control(
     handler: Arc<dyn DeviceControlHandler>,
@@ -205,6 +222,9 @@ pub struct Gb28181Server {
     /// Optional replacement for Digest REGISTER authentication (GB 35114
     /// A-level via the `gb35114` feature). `None` keeps the Digest flow.
     authenticator: Option<Arc<dyn RegisterAuthenticator>>,
+    /// Platform X-GB-Ver as last seen on a REGISTER response (Annex I).
+    /// Shared with the [`ServerHandle`] accessor.
+    platform_proto_ver: Arc<std::sync::Mutex<Option<String>>>,
     /// Device-side snapshot executor (A.2.1.24). `None` = control reject.
     snapshot_executor: Option<Arc<dyn crate::snapshot::SnapshotExecutor>>,
     /// DeviceControl sub-command handler (issue #58). `None` = recognized
@@ -338,6 +358,7 @@ impl Gb28181Server {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -493,6 +514,7 @@ impl Gb28181Server {
         log::info!("gb28181: listening on SIP port {local_sip_port} (UDP)");
         self.config.check_example_defaults().ok();
 
+        let platform_proto_ver = Arc::clone(&self.platform_proto_ver);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
             if let Err(e) = self.run_udp(&mut shutdown_rx).await {
@@ -503,6 +525,7 @@ impl Gb28181Server {
         Ok(ServerHandle {
             task: handle,
             shutdown: shutdown_tx,
+            platform_proto_ver,
         })
     }
 
@@ -517,6 +540,7 @@ impl Gb28181Server {
         let config = self.config;
         let recording_index = self.recording_index;
         let audio_sink = self.audio_sink;
+        let platform_proto_ver = Arc::clone(&self.platform_proto_ver);
 
         let handle = tokio::spawn(async move {
             // Accept loop for TCP connections
@@ -566,6 +590,7 @@ impl Gb28181Server {
         Ok(ServerHandle {
             task: handle,
             shutdown: shutdown_tx,
+            platform_proto_ver,
         })
     }
 
@@ -868,6 +893,19 @@ impl Gb28181Server {
         Ok(())
     }
 
+    /// Record the platform's X-GB-Ver off a REGISTER response (Annex I).
+    /// An absent header (2016-era platforms) keeps the previous value.
+    fn note_platform_protocol_version(&self, resp: &SipMessage) {
+        let Some(ver) = resp.get_header("X-GB-Ver") else {
+            return;
+        };
+        let mut guard = self.platform_proto_ver.lock().unwrap();
+        if guard.as_deref() != Some(ver) {
+            log::info!("gb28181: platform protocol version (X-GB-Ver): {ver}");
+            *guard = Some(ver.to_string());
+        }
+    }
+
     /// Perform REGISTER lifecycle.
     async fn perform_register(
         &mut self,
@@ -884,6 +922,7 @@ impl Gb28181Server {
                 register.headers.push(("Authorization".to_string(), authz));
             }
         }
+        stamp_xgbver(&mut register, &self.config.protocol_version);
         let initial_cseq = client.cseq;
         self.send_sip_message(&register, platform_addr).await?;
 
@@ -894,6 +933,7 @@ impl Gb28181Server {
         let msg = self
             .receive_register_response(initial_cseq, Duration::from_secs(5))
             .await?;
+        self.note_platform_protocol_version(&msg);
         if msg.status_code != Some(SipStatusCode::Unauthorized) {
             bail!("Expected 401 Unauthorized, got {:?}", msg.status_code);
         }
@@ -902,7 +942,7 @@ impl Gb28181Server {
         // installed, classic Digest otherwise.
         client.inc_cseq();
         let authed_cseq = client.cseq;
-        let authed_register = if let Some(auth) = &self.authenticator {
+        let mut authed_register = if let Some(auth) = &self.authenticator {
             let www_auth = msg
                 .get_header("WWW-Authenticate")
                 .ok_or_else(|| anyhow!("401 response missing WWW-Authenticate header"))?;
@@ -914,6 +954,7 @@ impl Gb28181Server {
             let auth = parse_401_challenge(&msg)?;
             client.build_register_with_auth(&auth)
         };
+        stamp_xgbver(&mut authed_register, &self.config.protocol_version);
         self.send_sip_message(&authed_register, platform_addr)
             .await?;
 
@@ -921,6 +962,7 @@ impl Gb28181Server {
         let msg = self
             .receive_register_response(authed_cseq, Duration::from_secs(5))
             .await?;
+        self.note_platform_protocol_version(&msg);
         if msg.status_code != Some(SipStatusCode::Ok) {
             bail!("Expected 200 OK, got {:?}", msg.status_code);
         }
@@ -2414,6 +2456,7 @@ async fn handle_tcp_connection(
         playback_ctl: None,
         audio_sink,
         authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         // DeviceControl dispatch over TCP is a follow-up (issue #58);
         // controls keep the reject path here.
@@ -3061,6 +3104,7 @@ async fn test_recordinfo_dispatch_with_source() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -3151,6 +3195,7 @@ async fn test_subscribe_books_and_echoes_expires() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -3248,6 +3293,7 @@ async fn test_gb2022_information_queries_dispatch() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -3319,6 +3365,7 @@ async fn test_recordinfo_dispatch_without_source() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -3387,6 +3434,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -3485,6 +3533,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -3580,6 +3629,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -3735,6 +3785,7 @@ async fn test_info_playback_control_live_session_noop() {
         playback_ctl: None,
         audio_sink: None,
         authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -3833,6 +3884,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -3967,6 +4019,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4053,6 +4106,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4119,6 +4173,217 @@ mod tcp_media_tests {
             .await
             .expect("register must succeed despite stale interleaved responses");
         sender.await.unwrap();
+    }
+
+    /// GB/T 28181-2022 Annex I X-GB-Ver: configured REGISTERs carry the
+    /// version header (initial AND authenticated), and the platform's
+    /// version off the 200 OK is recorded (go twin: device/gbver_test.go).
+    #[tokio::test]
+    async fn register_lifecycle_xgbver() {
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config: Gb28181Config {
+                enabled: true,
+                platform_sip_address: "127.0.0.1".to_string(),
+                platform_sip_port: 5060,
+                device_id: "34020000001320000001".to_string(),
+                channel_id: "34020000001320000001".to_string(),
+                sip_domain: "3402000000".to_string(),
+                password: "12345678".to_string(),
+                local_sip_port: 5060,
+                register_interval_secs: 3600,
+                heartbeat_interval_secs: 3600,
+                heartbeat_timeout_count: 3,
+                transport: Transport::Udp,
+                protocol_version: Some("3.0".to_string()),
+                ..Gb28181Config::default()
+            },
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+        };
+
+        let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
+        let platform_addr = platform.local_addr().expect("addr");
+        let server_addr = server
+            .sip_socket
+            .as_ref()
+            .expect("socket bound")
+            .local_addr()
+            .expect("server addr");
+
+        // 401 challenge without a version (2016-era), then 200 OK
+        // announcing the platform's version.
+        let fresh_401 = "SIP/2.0 401 Unauthorized\r\nCSeq: 1 REGISTER\r\nWWW-Authenticate: Digest realm=\"3402000000\", nonce=\"abc\", algorithm=MD5\r\nContent-Length: 0\r\n\r\n";
+        let fresh_200 =
+            "SIP/2.0 200 OK\r\nCSeq: 2 REGISTER\r\nX-GB-Ver: 2.0\r\nContent-Length: 0\r\n\r\n";
+
+        let sender = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (n, _) = platform.recv_from(&mut buf).await.expect("recv REGISTER 1");
+            let reg1 = String::from_utf8_lossy(&buf[..n]).to_string();
+            platform
+                .send_to(fresh_401.as_bytes(), server_addr)
+                .await
+                .unwrap();
+            let (n, _) = platform.recv_from(&mut buf).await.expect("recv REGISTER 2");
+            let reg2 = String::from_utf8_lossy(&buf[..n]).to_string();
+            platform
+                .send_to(fresh_200.as_bytes(), server_addr)
+                .await
+                .unwrap();
+            (reg1, reg2)
+        });
+
+        let mut client = SipDeviceClient::new(
+            "34020000001320000001",
+            platform_addr,
+            "127.0.0.1",
+            5060,
+            "3402000000",
+            "12345678",
+            3600,
+        );
+        server
+            .perform_register(&mut client, platform_addr)
+            .await
+            .expect("register must succeed");
+        let (reg1, reg2) = sender.await.unwrap();
+        assert!(reg1.contains("X-GB-Ver: 3.0"), "initial REGISTER: {reg1}");
+        assert!(reg2.contains("X-GB-Ver: 3.0"), "authed REGISTER: {reg2}");
+        assert_eq!(
+            *server.platform_proto_ver.lock().unwrap(),
+            Some("2.0".to_string())
+        );
+    }
+
+    /// Without configuration the header is omitted (byte-identical to the
+    /// pre-2022 wire form) and an absent platform version stays None.
+    #[tokio::test]
+    async fn register_lifecycle_omits_xgbver_when_unset() {
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config: Gb28181Config {
+                enabled: true,
+                platform_sip_address: "127.0.0.1".to_string(),
+                platform_sip_port: 5060,
+                device_id: "34020000001320000001".to_string(),
+                channel_id: "34020000001320000001".to_string(),
+                sip_domain: "3402000000".to_string(),
+                password: "12345678".to_string(),
+                local_sip_port: 5060,
+                register_interval_secs: 3600,
+                heartbeat_interval_secs: 3600,
+                heartbeat_timeout_count: 3,
+                transport: Transport::Udp,
+                ..Gb28181Config::default()
+            },
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+        };
+
+        let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
+        let platform_addr = platform.local_addr().expect("addr");
+        let server_addr = server
+            .sip_socket
+            .as_ref()
+            .expect("socket bound")
+            .local_addr()
+            .expect("server addr");
+
+        let fresh_401 = "SIP/2.0 401 Unauthorized\r\nCSeq: 1 REGISTER\r\nWWW-Authenticate: Digest realm=\"3402000000\", nonce=\"abc\", algorithm=MD5\r\nContent-Length: 0\r\n\r\n";
+        let fresh_200 = "SIP/2.0 200 OK\r\nCSeq: 2 REGISTER\r\nContent-Length: 0\r\n\r\n";
+
+        let sender = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (n, _) = platform.recv_from(&mut buf).await.expect("recv REGISTER 1");
+            let reg1 = String::from_utf8_lossy(&buf[..n]).to_string();
+            platform
+                .send_to(fresh_401.as_bytes(), server_addr)
+                .await
+                .unwrap();
+            let (n, _) = platform.recv_from(&mut buf).await.expect("recv REGISTER 2");
+            let reg2 = String::from_utf8_lossy(&buf[..n]).to_string();
+            platform
+                .send_to(fresh_200.as_bytes(), server_addr)
+                .await
+                .unwrap();
+            (reg1, reg2)
+        });
+
+        let mut client = SipDeviceClient::new(
+            "34020000001320000001",
+            platform_addr,
+            "127.0.0.1",
+            5060,
+            "3402000000",
+            "12345678",
+            3600,
+        );
+        server
+            .perform_register(&mut client, platform_addr)
+            .await
+            .expect("register must succeed");
+        let (reg1, reg2) = sender.await.unwrap();
+        assert!(!reg1.contains("X-GB-Ver"), "initial REGISTER: {reg1}");
+        assert!(!reg2.contains("X-GB-Ver"), "authed REGISTER: {reg2}");
+        assert_eq!(*server.platform_proto_ver.lock().unwrap(), None);
+    }
+
+    /// The ServerHandle accessor reads the same shared slot the server
+    /// task writes (Annex I plumbing).
+    #[tokio::test]
+    async fn server_handle_exposes_platform_protocol_version() {
+        let slot = Arc::new(std::sync::Mutex::new(Some("3.0".to_string())));
+        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _ = shutdown_rx;
+        });
+        let handle = ServerHandle {
+            task,
+            shutdown: _shutdown_tx,
+            platform_proto_ver: Arc::clone(&slot),
+        };
+        assert_eq!(handle.platform_protocol_version(), Some("3.0".to_string()));
+        *slot.lock().unwrap() = Some("2.0".to_string());
+        assert_eq!(handle.platform_protocol_version(), Some("2.0".to_string()));
     }
     // ─── audio talkback receive (GB/T 28181-2022 §9.2) ─────────────────────
 
@@ -4187,6 +4452,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink: None,
             authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4254,6 +4520,7 @@ mod tcp_media_tests {
                 sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
             })),
             authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4386,6 +4653,7 @@ mod tcp_media_tests {
             playback_ctl: None,
             audio_sink,
             authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
