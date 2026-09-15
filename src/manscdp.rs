@@ -48,6 +48,14 @@ pub struct Query {
     /// echoed in the response's `<Number>`.
     #[serde(rename = "Number", default, deserialize_with = "empty_string_as_none")]
     pub number: Option<String>,
+    /// Config types requested by a ConfigDownload query (A.2.4.7) —
+    /// multiple types arrive "/"-separated.
+    #[serde(
+        rename = "ConfigType",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    pub config_type: Option<String>,
 }
 
 /// Query in attribute format — older platforms put CmdType/SN/DeviceID on the
@@ -80,6 +88,12 @@ pub struct QueryAttr {
         deserialize_with = "empty_string_as_none"
     )]
     pub stream_type: Option<String>,
+    #[serde(
+        rename = "@ConfigType",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    pub config_type: Option<String>,
 }
 
 /// Response — device sends back to platform (Catalog, DeviceInfo)
@@ -216,6 +230,7 @@ pub(crate) fn parse_query_dual(body: &str) -> Option<Query> {
                 r#type: qa.r#type,
                 stream_type: qa.stream_type,
                 number: None,
+                config_type: qa.config_type,
             });
         }
     }
@@ -647,6 +662,16 @@ pub enum DeviceControlKind {
     /// `<PTZCmd>` — A.3/A.4 command, bit-level decoded ([`PtzCommand`],
     /// issue #57).
     Ptz(PtzCommand),
+    /// `<HomePosition>` — 看守位 control (A.2.3.1.10): auto-return to a
+    /// preset after inactivity.
+    HomePosition {
+        /// 1 = enabled, 0 = disabled.
+        enabled: u32,
+        /// Auto-reset interval in seconds (absent = keep current).
+        reset_time: Option<u32>,
+        /// Preset index to return to, 0-255 (absent = keep current).
+        preset_index: Option<u32>,
+    },
 }
 
 /// An inbound DeviceControl body with a recognized sub-command.
@@ -701,6 +726,27 @@ struct DeviceControlBody {
     tele_boot: Option<String>,
     #[serde(rename = "PTZCmd", default, deserialize_with = "empty_string_as_none")]
     ptz_cmd: Option<String>,
+    #[serde(rename = "HomePosition", default)]
+    home_position: Option<HomePositionBody>,
+}
+
+/// `<HomePosition>` body (A.2.3.1.10).
+#[derive(Debug, Deserialize)]
+struct HomePositionBody {
+    #[serde(rename = "Enabled", default)]
+    enabled: String,
+    #[serde(
+        rename = "ResetTime",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    reset_time: Option<String>,
+    #[serde(
+        rename = "PresetIndex",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    preset_index: Option<String>,
 }
 
 /// Parses an inbound DeviceControl body; `None` when the body is not a
@@ -738,11 +784,147 @@ pub fn parse_device_control(body: &str) -> Option<DeviceControl> {
             "Boot" => Some(DeviceControlKind::TeleBoot),
             _ => None,
         }
+    } else if let Some(hp) = c.home_position {
+        let enabled = hp.enabled.trim().parse::<u32>().ok()?;
+        Some(DeviceControlKind::HomePosition {
+            enabled,
+            reset_time: hp.reset_time.and_then(|v| v.trim().parse::<u32>().ok()),
+            preset_index: hp.preset_index.and_then(|v| v.trim().parse::<u32>().ok()),
+        })
     } else {
         c.ptz_cmd
             .map(|hex| DeviceControlKind::Ptz(parse_ptz_command(&hex)))
     }?;
     Some(DeviceControl {
+        sn: c.sn,
+        device_id: c.device_id,
+        kind,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// DeviceConfig sub-command decode (GB/T 28181-2022 §9.3.3 / A.2.3.2,
+// issue #57 minimum). The command family carries one sub-command child
+// (A.2.3.2.2-12); this crate decodes the subset a fixed camera can act
+// on — BasicParam, FrameMirror, AlarmReport — everything else keeps the
+// control-reject behavior. 校时 is NOT part of this family (2022 §9.10.2
+// does it via the REGISTER response's SIP Date header).
+// ---------------------------------------------------------------------------
+
+/// A decoded DeviceConfig sub-command (issue #57).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceConfigKind {
+    /// A.2.3.2.2 基本参数配置 — device name + registration tuning. The
+    /// library does NOT hot-apply these; hosts decide what sticks.
+    BasicParam {
+        name: Option<String>,
+        expiration: Option<u64>,
+        heartbeat_interval: Option<u64>,
+        heartbeat_count: Option<u32>,
+    },
+    /// A.2.3.2.9 画面翻转配置 — 0 none, 1 horizontal, 2 vertical, 3 both
+    /// (A.2.1.22 frameMirrorCfgType).
+    FrameMirror(u32),
+    /// A.2.3.2.10 报警上报开关配置 — motion-detection / field-detection
+    /// event report switches (0 off, 1 on).
+    AlarmReport {
+        motion_detection: u32,
+        field_detection: u32,
+    },
+}
+
+/// An inbound DeviceConfig command with a recognized sub-command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceConfig {
+    pub sn: String,
+    pub device_id: String,
+    pub kind: DeviceConfigKind,
+}
+
+#[derive(Deserialize)]
+struct DeviceConfigBody {
+    #[serde(rename = "CmdType", default)]
+    cmd_type: String,
+    #[serde(rename = "SN", default)]
+    sn: String,
+    #[serde(rename = "DeviceID", default)]
+    device_id: String,
+    #[serde(rename = "BasicParam", default)]
+    basic_param: Option<BasicParamBody>,
+    #[serde(
+        rename = "FrameMirror",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    frame_mirror: Option<String>,
+    #[serde(rename = "AlarmReport", default)]
+    alarm_report: Option<AlarmReportBody>,
+}
+
+#[derive(Deserialize)]
+struct BasicParamBody {
+    #[serde(rename = "Name", default, deserialize_with = "empty_string_as_none")]
+    name: Option<String>,
+    #[serde(
+        rename = "Expiration",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    expiration: Option<String>,
+    #[serde(
+        rename = "HeartBeatInterval",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    heartbeat_interval: Option<String>,
+    #[serde(
+        rename = "HeartBeatCount",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    heartbeat_count: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AlarmReportBody {
+    #[serde(rename = "MotionDetection", default)]
+    motion_detection: String,
+    #[serde(rename = "FieldDetection", default)]
+    field_detection: String,
+}
+
+/// Parses an inbound DeviceConfig body; `None` when the body is not a
+/// DeviceConfig or carries no recognized sub-command (the caller keeps
+/// the reject behavior for those).
+pub fn parse_device_config(body: &str) -> Option<DeviceConfig> {
+    let c: DeviceConfigBody = serde_xml_rs::from_str(body).ok()?;
+    if c.cmd_type != "DeviceConfig" {
+        return None;
+    }
+    let kind = if let Some(bp) = c.basic_param {
+        Some(DeviceConfigKind::BasicParam {
+            name: bp.name,
+            expiration: bp.expiration.and_then(|v| v.trim().parse().ok()),
+            heartbeat_interval: bp.heartbeat_interval.and_then(|v| v.trim().parse().ok()),
+            heartbeat_count: bp.heartbeat_count.and_then(|v| v.trim().parse().ok()),
+        })
+    } else if let Some(fm) = c
+        .frame_mirror
+        .as_deref()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        Some(DeviceConfigKind::FrameMirror(fm))
+    } else if let Some(ar) = c.alarm_report {
+        let motion_detection = ar.motion_detection.trim().parse().ok()?;
+        let field_detection = ar.field_detection.trim().parse().ok()?;
+        Some(DeviceConfigKind::AlarmReport {
+            motion_detection,
+            field_detection,
+        })
+    } else {
+        None
+    }?;
+    Some(DeviceConfig {
         sn: c.sn,
         device_id: c.device_id,
         kind,
@@ -1174,6 +1356,99 @@ mod tests {
                 data: [0x11, 0x22, 0x33]
             }
         );
+    }
+
+    #[test]
+    fn device_control_home_position_decodes() {
+        // A.2.3.1.10 看守位 control: Enabled required, ResetTime /
+        // PresetIndex optional (absent = keep current).
+        let c = parse_device_control(
+            "<Control><CmdType>DeviceControl</CmdType><SN>9</SN><DeviceID>d</DeviceID>\
+             <HomePosition><Enabled>1</Enabled><ResetTime>300</ResetTime>\
+             <PresetIndex>7</PresetIndex></HomePosition></Control>",
+        )
+        .expect("HomePosition must parse");
+        assert_eq!(
+            c.kind,
+            DeviceControlKind::HomePosition {
+                enabled: 1,
+                reset_time: Some(300),
+                preset_index: Some(7),
+            }
+        );
+        let c = parse_device_control(
+            "<Control><CmdType>DeviceControl</CmdType><SN>10</SN><DeviceID>d</DeviceID>\
+             <HomePosition><Enabled>0</Enabled></HomePosition></Control>",
+        )
+        .expect("minimal HomePosition must parse");
+        assert_eq!(
+            c.kind,
+            DeviceControlKind::HomePosition {
+                enabled: 0,
+                reset_time: None,
+                preset_index: None,
+            }
+        );
+        // Non-numeric Enabled is not a command we recognize.
+        assert!(parse_device_control(
+            "<Control><CmdType>DeviceControl</CmdType><SN>11</SN><DeviceID>d</DeviceID>\
+             <HomePosition><Enabled>on</Enabled></HomePosition></Control>"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn device_config_kinds_decode() {
+        // A.2.3.2.2 BasicParam (every child optional).
+        let c = parse_device_config(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>71</SN><DeviceID>d</DeviceID>\
+             <BasicParam><Name>Dome</Name><Expiration>120</Expiration>\
+             <HeartBeatInterval>15</HeartBeatInterval><HeartBeatCount>5</HeartBeatCount>\
+             </BasicParam></Control>",
+        )
+        .expect("BasicParam must parse");
+        assert_eq!(
+            c.kind,
+            DeviceConfigKind::BasicParam {
+                name: Some("Dome".to_string()),
+                expiration: Some(120),
+                heartbeat_interval: Some(15),
+                heartbeat_count: Some(5),
+            }
+        );
+        // A.2.3.2.9 FrameMirror (A.2.1.22: 0-3).
+        let c = parse_device_config(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>72</SN><DeviceID>d</DeviceID>\
+             <FrameMirror>1</FrameMirror></Control>",
+        )
+        .expect("FrameMirror must parse");
+        assert_eq!(c.kind, DeviceConfigKind::FrameMirror(1));
+        // A.2.3.2.10 AlarmReport switches.
+        let c = parse_device_config(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>73</SN><DeviceID>d</DeviceID>\
+             <AlarmReport><MotionDetection>1</MotionDetection>\
+             <FieldDetection>0</FieldDetection></AlarmReport></Control>",
+        )
+        .expect("AlarmReport must parse");
+        assert_eq!(
+            c.kind,
+            DeviceConfigKind::AlarmReport {
+                motion_detection: 1,
+                field_detection: 0,
+            }
+        );
+        // Unrecognized sub-commands (SVAC, OSD, …) and other CmdTypes
+        // yield None — the server keeps its reject behavior.
+        assert!(parse_device_config(
+            "<Control><CmdType>DeviceConfig</CmdType><SN>74</SN><DeviceID>d</DeviceID>\
+             <OSDConfig><OSDText>x</OSDText></OSDConfig></Control>"
+        )
+        .is_none());
+        assert!(parse_device_config(
+            "<Control><CmdType>DeviceControl</CmdType><SN>75</SN><DeviceID>d</DeviceID>\
+             <IFrameCmd>Send</IFrameCmd></Control>"
+        )
+        .is_none());
     }
 
     #[test]
