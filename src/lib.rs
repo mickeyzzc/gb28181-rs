@@ -111,6 +111,7 @@ pub use sip::{
     parse_digest_auth, DigestAuthParams, SdpMedia, SdpSession, SessionType, SipMessage, SipMethod,
     SipStatusCode, Transport,
 };
+pub use subscribe::DeviceNotifier;
 
 /// Shared flag reflecting whether local recording is currently active.
 ///

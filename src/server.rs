@@ -465,6 +465,16 @@ impl Gb28181Server {
         self
     }
 
+    /// The host-facing SUBSCRIBE/NOTIFY sender (issue #57): hold this
+    /// before/after [`Self::spawn`] and call `send_alarm` /
+    /// `send_catalog_change` / `send_mobile_position` whenever the
+    /// business side has something to report — no-ops until the
+    /// platform subscribes (and safe before the socket is bound).
+    #[must_use]
+    pub fn notifier(&self) -> Arc<crate::subscribe::DeviceNotifier> {
+        Arc::clone(&self.notifier)
+    }
+
     /// Attach the audio talkback sink (receive half of GB/T 28181-2022
     /// §9.2 voice talkback). Without it, audio-only INVITEs are refused
     /// with 488.
@@ -4782,6 +4792,25 @@ mod tcp_media_tests {
         *slot.lock().unwrap() = Some("2.0".to_string());
         assert_eq!(handle.platform_protocol_version(), Some("2.0".to_string()));
     }
+    /// notifier() hands the host the same live slot the server task
+    /// uses (issue #57): safe before spawn — send_* are no-ops until a
+    /// platform subscribes.
+    #[test]
+    fn notifier_accessor_returns_live_slot() {
+        let sip_socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server = Gb28181Server::with_recording_index(
+            Gb28181Config::default(),
+            Arc::new(crate::mock::MockFrameHub::new()),
+            None,
+        );
+        let n1 = server.notifier();
+        let n2 = server.notifier();
+        assert!(Arc::ptr_eq(&n1, &n2));
+        // No subscription, no socket: a no-op, not a panic.
+        assert!(!n1.send_alarm("4", "5", "2026-09-15T15:30:00", "2", "test"));
+        let _ = sip_socket;
+    }
+
     // ─── audio talkback receive (GB/T 28181-2022 §9.2) ─────────────────────
 
     fn audio_invite_msg(call_id: &str, pt: u8) -> SipMessage {
