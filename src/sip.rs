@@ -497,6 +497,77 @@ impl SdpSession {
 /// The branch MUST be unique per transaction (RFC 3261 §8.1.1.7) — deriving
 /// it from the CSeq counter (the historical behavior) made branches
 /// predictable and colliding across restarts.
+/// Parses a SIP `Date` header (GB/T 28181-2022 §9.10.2 time sync: the
+/// REGISTER response's Date header is the device's time source) in any
+/// of the RFC 3261 §25.1 forms: IMF-fixdate (`Mon, 15 Sep 2026
+/// 07:29:00 GMT`), RFC850 (`Monday, 15-Sep-26 07:29:00 GMT`, 2-digit
+/// year) or asctime (`Mon Sep 15 07:29:00 2026`). Returns Unix seconds
+/// (UTC). The SIP grammar fixes the zone to GMT — anything else is
+/// rejected (None), as is anything unparseable.
+#[must_use]
+pub fn parse_sip_date(value: &str) -> Option<i64> {
+    let v = value.trim();
+    // IMF-fixdate: "Wkd, DD Mon YYYY HH:MM:SS GMT"
+    let parts: Vec<&str> = v
+        .split(|c: char| c == ',' || c.is_whitespace() || c == '-')
+        .filter(|p| !p.is_empty())
+        .collect();
+    match parts.as_slice() {
+        // Wkd, DD Mon YYYY HH:MM:SS GMT — and the RFC850 2-digit-year
+        // variant (Monday, 15-Sep-26 …) which splits to the same shape.
+        [_, day, mon, year, hms, tz] if *tz == "GMT" => {
+            let year: String = if year.len() == 2 {
+                format!("20{year}")
+            } else {
+                (*year).to_string()
+            };
+            civil_to_unix(&year, mon, day, hms)
+        }
+        // asctime: Wkd Mon DD HH:MM:SS YYYY
+        [_, mon, day, hms, year] => civil_to_unix(year, mon, day, hms),
+        _ => None,
+    }
+}
+
+/// `YYYY Mon-name DD HH:MM:SS` → Unix seconds (days_from_civil).
+fn civil_to_unix(year: &str, mon: &str, day: &str, hms: &str) -> Option<i64> {
+    let month = match mon {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let y: i64 = year.parse().ok()?;
+    let d: i64 = day.parse().ok()?;
+    let t: Vec<&str> = hms.split(':').collect();
+    if t.len() != 3 {
+        return None;
+    }
+    let (hh, mm, ss) = (t[0], t[1], t[2]);
+    let (hh, mm, ss): (i64, i64, i64) = (hh.parse().ok()?, mm.parse().ok()?, ss.parse().ok()?);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&d) || hh > 23 || mm > 59 || ss > 60 {
+        return None;
+    }
+    // days_from_civil (Howard Hinnant's algorithm).
+    let y = y - if month <= 2 { 1 } else { 0 };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    Some(days * 86_400 + hh * 3_600 + mm * 60 + ss)
+}
+
 pub fn random_branch() -> String {
     format!("z9hG4bK{:08x}", rand::random::<u32>())
 }
@@ -939,6 +1010,34 @@ fn generate_cnonce() -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// SIP Date parsing (GB/T 28181-2022 §9.10.2 time sync): all three
+    /// RFC 3261 §25.1 forms; epoch value cross-checked with
+    /// `date -u -d "2026-09-15 07:29:00" +%s` = 1789457340.
+    #[test]
+    fn sip_date_forms_parse() {
+        assert_eq!(
+            parse_sip_date("Tue, 15 Sep 2026 07:29:00 GMT"),
+            Some(1_789_457_340)
+        );
+        // RFC850 2-digit year.
+        assert_eq!(
+            parse_sip_date("Tuesday, 15-Sep-26 07:29:00 GMT"),
+            Some(1_789_457_340)
+        );
+        // asctime.
+        assert_eq!(
+            parse_sip_date("Tue Sep 15 07:29:00 2026"),
+            Some(1_789_457_340)
+        );
+        // Whitespace/case tolerance is NOT grammar-mandated for month
+        // names — reject garbage, non-GMT forms without offsets, and
+        // empty values.
+        assert_eq!(parse_sip_date("not a date"), None);
+        assert_eq!(parse_sip_date(""), None);
+        assert_eq!(parse_sip_date("Tue, 15 Sep 2026 07:29:00 +0800"), None);
+    }
+
     use super::*;
 
     #[test]
