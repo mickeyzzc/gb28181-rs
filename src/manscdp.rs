@@ -457,6 +457,133 @@ pub fn build_upload_snapshot_finished(
     }
 }
 
+// ---------------------------------------------------------------------------
+// DeviceControl sub-command decode (GB/T 28181-2016 §9.3.2 / 2022 §9.3,
+// issue #58). The family shares one `<Control><CmdType>DeviceControl…`
+// body with exactly one sub-command child element. DragZoom (2022 拉框
+// 放大/缩小) is deferred until its wire form is verified against the
+// standard text; PTZCmd passes through as raw A.3/A505 hex — bit-level
+// decode is tracked in issue #57.
+// ---------------------------------------------------------------------------
+
+/// A decoded DeviceControl sub-command (issue #58).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceControlKind {
+    /// `<IFrameCmd>Send</IFrameCmd>` — force the next encoded frame to be
+    /// an IDR. Platforms send this when starting a pull or after loss.
+    ForceIFrame,
+    /// `<RecordCmd>` — `Record` / `StopRecord` toggles platform-requested
+    /// local recording.
+    Record(bool),
+    /// `<GuardCmd>` — `SetGuard` / `ResetGuard` arm/disarm.
+    Guard(bool),
+    /// `<AlarmCmd>ResetAlarm</AlarmCmd>` — clear the active alarm.
+    ResetAlarm,
+    /// `<TeleBoot>Boot</TeleBoot>` — remote restart.
+    TeleBoot,
+    /// `<PTZCmd>` — A.3 A505 command, raw hex passthrough (#57 decodes).
+    Ptz(String),
+}
+
+/// An inbound DeviceControl body with a recognized sub-command.
+///
+/// Only the child-element form is parsed (the production-validated form
+/// for controls, matching [`parse_control_snapshot`]); unknown or absent
+/// sub-commands yield `None` so the server keeps its reject behavior.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceControl {
+    pub sn: String,
+    pub device_id: String,
+    pub kind: DeviceControlKind,
+}
+
+#[derive(Deserialize)]
+struct DeviceControlBody {
+    #[serde(rename = "CmdType", default)]
+    cmd_type: String,
+    #[serde(rename = "SN", default)]
+    sn: String,
+    #[serde(rename = "DeviceID", default)]
+    device_id: String,
+    #[serde(
+        rename = "IFrameCmd",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    i_frame_cmd: Option<String>,
+    #[serde(
+        rename = "RecordCmd",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    record_cmd: Option<String>,
+    #[serde(
+        rename = "GuardCmd",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    guard_cmd: Option<String>,
+    #[serde(
+        rename = "AlarmCmd",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    alarm_cmd: Option<String>,
+    #[serde(
+        rename = "TeleBoot",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    tele_boot: Option<String>,
+    #[serde(rename = "PTZCmd", default, deserialize_with = "empty_string_as_none")]
+    ptz_cmd: Option<String>,
+}
+
+/// Parses an inbound DeviceControl body; `None` when the body is not a
+/// DeviceControl or carries no recognized sub-command (the caller keeps
+/// its control-reject behavior for those).
+pub fn parse_device_control(body: &str) -> Option<DeviceControl> {
+    let c: DeviceControlBody = serde_xml_rs::from_str(body).ok()?;
+    if c.cmd_type != "DeviceControl" {
+        return None;
+    }
+    let kind = if let Some(v) = c.i_frame_cmd {
+        match v.as_str() {
+            "Send" => Some(DeviceControlKind::ForceIFrame),
+            _ => None,
+        }
+    } else if let Some(v) = c.record_cmd {
+        match v.as_str() {
+            "Record" => Some(DeviceControlKind::Record(true)),
+            "StopRecord" => Some(DeviceControlKind::Record(false)),
+            _ => None,
+        }
+    } else if let Some(v) = c.guard_cmd {
+        match v.as_str() {
+            "SetGuard" => Some(DeviceControlKind::Guard(true)),
+            "ResetGuard" => Some(DeviceControlKind::Guard(false)),
+            _ => None,
+        }
+    } else if let Some(v) = c.alarm_cmd {
+        match v.as_str() {
+            "ResetAlarm" => Some(DeviceControlKind::ResetAlarm),
+            _ => None,
+        }
+    } else if let Some(v) = c.tele_boot {
+        match v.as_str() {
+            "Boot" => Some(DeviceControlKind::TeleBoot),
+            _ => None,
+        }
+    } else {
+        c.ptz_cmd.map(DeviceControlKind::Ptz)
+    }?;
+    Some(DeviceControl {
+        sn: c.sn,
+        device_id: c.device_id,
+        kind,
+    })
+}
+
 /// Parses a `<Notify>` body in either child-element or attribute format,
 /// normalizing into [`Notify`].
 #[allow(dead_code)]
@@ -516,6 +643,102 @@ mod proptests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── DeviceControl sub-command decode (#58) ────────────────────────────
+
+    fn control_body(sub: &str) -> String {
+        format!(
+            "<Control><CmdType>DeviceControl</CmdType><SN>17</SN>\
+             <DeviceID>34020000001320000001</DeviceID>{sub}</Control>"
+        )
+    }
+
+    #[test]
+    fn device_control_iframe_cmd_send_decodes() {
+        let c = parse_device_control(&control_body("<IFrameCmd>Send</IFrameCmd>"))
+            .expect("IFrameCmd Send must decode");
+        assert_eq!(c.sn, "17");
+        assert_eq!(c.device_id, "34020000001320000001");
+        assert_eq!(c.kind, DeviceControlKind::ForceIFrame);
+    }
+
+    #[test]
+    fn device_control_iframe_cmd_unknown_value_is_rejected() {
+        // An unrecognized IFrameCmd value must fall to the reject path,
+        // never silently execute.
+        assert!(parse_device_control(&control_body("<IFrameCmd>Later</IFrameCmd>")).is_none());
+    }
+
+    #[test]
+    fn device_control_record_cmd_both_values() {
+        let c = parse_device_control(&control_body("<RecordCmd>Record</RecordCmd>"))
+            .expect("RecordCmd Record must decode");
+        assert_eq!(c.kind, DeviceControlKind::Record(true));
+        let c = parse_device_control(&control_body("<RecordCmd>StopRecord</RecordCmd>"))
+            .expect("RecordCmd StopRecord must decode");
+        assert_eq!(c.kind, DeviceControlKind::Record(false));
+        assert!(parse_device_control(&control_body("<RecordCmd>Bogus</RecordCmd>")).is_none());
+    }
+
+    #[test]
+    fn device_control_guard_and_alarm_and_teleboot() {
+        assert_eq!(
+            parse_device_control(&control_body("<GuardCmd>SetGuard</GuardCmd>"))
+                .unwrap()
+                .kind,
+            DeviceControlKind::Guard(true)
+        );
+        assert_eq!(
+            parse_device_control(&control_body("<GuardCmd>ResetGuard</GuardCmd>"))
+                .unwrap()
+                .kind,
+            DeviceControlKind::Guard(false)
+        );
+        assert_eq!(
+            parse_device_control(&control_body("<AlarmCmd>ResetAlarm</AlarmCmd>"))
+                .unwrap()
+                .kind,
+            DeviceControlKind::ResetAlarm
+        );
+        assert_eq!(
+            parse_device_control(&control_body("<TeleBoot>Boot</TeleBoot>"))
+                .unwrap()
+                .kind,
+            DeviceControlKind::TeleBoot
+        );
+        // Unknown GuardCmd value falls to reject.
+        assert!(parse_device_control(&control_body("<GuardCmd>Nope</GuardCmd>")).is_none());
+    }
+
+    #[test]
+    fn device_control_ptz_cmd_passthrough() {
+        // A.3 A505 command carried verbatim; bit-level decode is #57.
+        let c = parse_device_control(&control_body("<PTZCmd>A50F01021F00</PTZCmd>"))
+            .expect("PTZCmd must pass through");
+        assert_eq!(c.kind, DeviceControlKind::Ptz("A50F01021F00".to_string()));
+    }
+
+    #[test]
+    fn device_control_unknown_subcommand_is_none() {
+        // No recognized sub-command (e.g. DragZoom, deferred, or an empty
+        // body) → None so the server keeps the control-reject behavior.
+        assert!(parse_device_control(&control_body("<DragZoomIn/>")).is_none());
+        assert!(parse_device_control(&control_body("")).is_none());
+    }
+
+    #[test]
+    fn device_control_ignores_non_control_bodies() {
+        // Snapshot controls route through parse_control_snapshot; a Keepalive
+        // Notify is not a Control at all.
+        let snap = "<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID>\
+                    <SnapShot><SnapNum>1</SnapNum><UploadURL>u</UploadURL>\
+                    <SessionID>s</SessionID></SnapShot></Control>";
+        assert!(parse_device_control(snap).is_none());
+        assert!(
+            parse_device_control("<Notify><CmdType>Keepalive</CmdType><SN>1</SN></Notify>")
+                .is_none()
+        );
+    }
 
     #[test]
     fn test_channel_item_serialize() {

@@ -124,6 +124,48 @@ impl<F: Fn(&[u8], u32) + Send + Sync> AudioTalkbackSink for F {
     }
 }
 
+/// Host-side handling of decoded DeviceControl sub-commands
+/// (GB/T 28181-2016 §9.3.2 / 2022 §9.3, issue #58). Every method has a
+/// no-op default so hosts implement only what their hardware can do.
+///
+/// Callbacks fire on the SIP receive task — keep them cheap (copy and
+/// forward into a channel); a blocking handler stalls signaling.
+pub trait DeviceControlHandler: Send + Sync {
+    /// `<IFrameCmd>Send</IFrameCmd>` — force the next encoded frame to be
+    /// an IDR (platforms send this when starting a pull or after loss).
+    fn on_force_iframe(&self) {}
+    /// `<RecordCmd>Record|StopRecord</RecordCmd>` — toggle
+    /// platform-requested local recording.
+    fn on_record(&self, _start: bool) {}
+    /// `<GuardCmd>SetGuard|ResetGuard</GuardCmd>` — arm/disarm.
+    fn on_guard(&self, _arm: bool) {}
+    /// `<AlarmCmd>ResetAlarm</AlarmCmd>` — clear the active alarm.
+    fn on_reset_alarm(&self) {}
+    /// `<TeleBoot>Boot</TeleBoot>` — remote restart. Gate the actual
+    /// reboot behind an explicit host opt-in; the default no-op makes the
+    /// command a safe ack-only.
+    fn on_teleboot(&self) {}
+    /// `<PTZCmd>` — raw A.3/A505 hex string; bit-level decode stays with
+    /// the host until #57 lands a shared decoder.
+    fn on_ptz(&self, _a505_hex: &str) {}
+}
+
+/// Executes a decoded DeviceControl against the installed handler.
+fn dispatch_device_control(
+    handler: Arc<dyn DeviceControlHandler>,
+    control: &crate::manscdp::DeviceControl,
+) {
+    use crate::manscdp::DeviceControlKind;
+    match &control.kind {
+        DeviceControlKind::ForceIFrame => handler.on_force_iframe(),
+        DeviceControlKind::Record(start) => handler.on_record(*start),
+        DeviceControlKind::Guard(arm) => handler.on_guard(*arm),
+        DeviceControlKind::ResetAlarm => handler.on_reset_alarm(),
+        DeviceControlKind::TeleBoot => handler.on_teleboot(),
+        DeviceControlKind::Ptz(hex) => handler.on_ptz(hex),
+    }
+}
+
 pub struct Gb28181Server {
     /// Configuration for the GB28181 server
     config: Gb28181Config,
@@ -159,6 +201,9 @@ pub struct Gb28181Server {
     authenticator: Option<Arc<dyn RegisterAuthenticator>>,
     /// Device-side snapshot executor (A.2.1.24). `None` = control reject.
     snapshot_executor: Option<Arc<dyn crate::snapshot::SnapshotExecutor>>,
+    /// DeviceControl sub-command handler (issue #58). `None` = recognized
+    /// sub-commands keep the control-reject behavior.
+    control_handler: Option<Arc<dyn DeviceControlHandler>>,
     /// Observability hooks (no-op by default); see `metrics` module docs.
     metrics: Arc<dyn crate::metrics::MetricsHooks>,
 }
@@ -276,6 +321,7 @@ impl Gb28181Server {
             audio_sink: None,
             authenticator: None,
             snapshot_executor: None,
+            control_handler: None,
             metrics: Arc::new(crate::metrics::NoopMetrics),
         }
     }
@@ -319,6 +365,17 @@ impl Gb28181Server {
 
     pub fn with_audio_sink(mut self, sink: Arc<dyn AudioTalkbackSink>) -> Self {
         self.audio_sink = Some(sink);
+        self
+    }
+
+    /// Installs the DeviceControl sub-command handler (issue #58):
+    /// recognized controls (IFrameCmd force-IDR, RecordCmd, GuardCmd,
+    /// AlarmCmd, TeleBoot, PTZCmd passthrough) execute against it and the
+    /// 200 OK is the whole answer. `None` (default) keeps the
+    /// control-reject behavior. UDP transport only for now; TCP dispatch
+    /// is a follow-up.
+    pub fn with_control_handler(mut self, handler: Option<Arc<dyn DeviceControlHandler>>) -> Self {
+        self.control_handler = handler;
         self
     }
 
@@ -855,6 +912,25 @@ impl Gb28181Server {
                             "gb28181: snapshot command over TCP transport — executor requires UDP, rejecting"
                         );
                     }
+                }
+
+                // DeviceControl sub-commands (issue #58): a recognized
+                // command executes the installed handler and the 200 OK
+                // above is the whole synchronous answer. Without a
+                // handler — or for not-yet-decoded kinds (DragZoom is
+                // deferred; PTZ passes through as raw A505) — fall
+                // through to the control reject, preserving the
+                // historical behavior. UDP transport only for now.
+                if let Some(control) = crate::manscdp::parse_device_control(&msg.body) {
+                    if let Some(handler) = self.control_handler.clone() {
+                        log::info!("gb28181: DeviceControl {:?} executed", control.kind);
+                        dispatch_device_control(handler, &control);
+                        return Ok(());
+                    }
+                    log::warn!(
+                        "gb28181: DeviceControl {:?} without a control handler — rejecting",
+                        control.kind
+                    );
                 }
 
                 // Build and send Catalog/DeviceInfo response if this was a query
@@ -2123,6 +2199,9 @@ async fn handle_tcp_connection(
         audio_sink,
         authenticator: None,
         snapshot_executor: None,
+        // DeviceControl dispatch over TCP is a follow-up (issue #58);
+        // controls keep the reject path here.
+        control_handler: None,
     };
 
     // Create SIP device client (User-Agent from config; neutral default)
@@ -2245,6 +2324,90 @@ fn random_cseq() -> u32 {
 mod tests {
     use super::*;
     use anyhow::anyhow;
+
+    // ── DeviceControl dispatch (issue #58) ─────────────────────────────
+
+    /// Recording mock: captures which trait methods fired and with what
+    /// arguments, so tests assert the exact kind→handler mapping.
+    struct RecordingControl(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl DeviceControlHandler for RecordingControl {
+        fn on_force_iframe(&self) {
+            self.0.lock().unwrap().push("iframe".into());
+        }
+        fn on_record(&self, start: bool) {
+            self.0.lock().unwrap().push(format!("record:{start}"));
+        }
+        fn on_guard(&self, arm: bool) {
+            self.0.lock().unwrap().push(format!("guard:{arm}"));
+        }
+        fn on_reset_alarm(&self) {
+            self.0.lock().unwrap().push("alarm".into());
+        }
+        fn on_teleboot(&self) {
+            self.0.lock().unwrap().push("boot".into());
+        }
+        fn on_ptz(&self, a505_hex: &str) {
+            self.0.lock().unwrap().push(format!("ptz:{a505_hex}"));
+        }
+    }
+
+    fn dispatch_of(body: &str) -> Vec<String> {
+        let control = crate::manscdp::parse_device_control(body).expect("control must parse");
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        dispatch_device_control(Arc::new(RecordingControl(Arc::clone(&calls))), &control);
+        let mut out = calls.lock().unwrap().clone();
+        out.sort();
+        out
+    }
+
+    #[test]
+    fn device_control_dispatch_fires_matching_handler() {
+        // Wire path: parse (the same function the UDP MESSAGE arm calls)
+        // → dispatch. One golden per kind proves the mapping.
+        assert_eq!(
+            dispatch_of(
+                "<Control><CmdType>DeviceControl</CmdType><SN>1</SN>\
+                 <DeviceID>d</DeviceID><IFrameCmd>Send</IFrameCmd></Control>"
+            ),
+            vec!["iframe".to_string()]
+        );
+        assert_eq!(
+            dispatch_of(
+                "<Control><CmdType>DeviceControl</CmdType><SN>1</SN>\
+                 <DeviceID>d</DeviceID><RecordCmd>StopRecord</RecordCmd></Control>"
+            ),
+            vec!["record:false".to_string()]
+        );
+        assert_eq!(
+            dispatch_of(
+                "<Control><CmdType>DeviceControl</CmdType><SN>1</SN>\
+                 <DeviceID>d</DeviceID><GuardCmd>SetGuard</GuardCmd></Control>"
+            ),
+            vec!["guard:true".to_string()]
+        );
+        assert_eq!(
+            dispatch_of(
+                "<Control><CmdType>DeviceControl</CmdType><SN>1</SN>\
+                 <DeviceID>d</DeviceID><AlarmCmd>ResetAlarm</AlarmCmd></Control>"
+            ),
+            vec!["alarm".to_string()]
+        );
+        assert_eq!(
+            dispatch_of(
+                "<Control><CmdType>DeviceControl</CmdType><SN>1</SN>\
+                 <DeviceID>d</DeviceID><TeleBoot>Boot</TeleBoot></Control>"
+            ),
+            vec!["boot".to_string()]
+        );
+        assert_eq!(
+            dispatch_of(
+                "<Control><CmdType>DeviceControl</CmdType><SN>1</SN>\
+                 <DeviceID>d</DeviceID><PTZCmd>A50F01</PTZCmd></Control>"
+            ),
+            vec!["ptz:A50F01".to_string()]
+        );
+    }
 
     // -- local IP probe retry (boot network race) ---------------------------
 
@@ -2671,6 +2834,7 @@ async fn test_recordinfo_dispatch_with_source() {
         audio_sink: None,
         authenticator: None,
         snapshot_executor: None,
+        control_handler: None,
     };
 
     // Query times are derived from the segment's own ms via the same
@@ -2755,6 +2919,7 @@ async fn test_recordinfo_dispatch_without_source() {
         audio_sink: None,
         authenticator: None,
         snapshot_executor: None,
+        control_handler: None,
     };
 
     let body = "<Query><CmdType>RecordInfo</CmdType><SN>9</SN><DeviceID>34020000001320000001</DeviceID><StartTime>2026-08-15T14:00:00</StartTime><EndTime>2026-08-15T15:00:00</EndTime></Query>";
@@ -2818,6 +2983,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         audio_sink: None,
         authenticator: None,
         snapshot_executor: None,
+        control_handler: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786807800\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -2911,6 +3077,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         audio_sink: None,
         authenticator: None,
         snapshot_executor: None,
+        control_handler: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786804500\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -3001,6 +3168,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         audio_sink: None,
         authenticator: None,
         snapshot_executor: None,
+        control_handler: None,
     };
     let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
     let peer_addr = peer.local_addr().expect("peer addr");
@@ -3151,6 +3319,7 @@ async fn test_info_playback_control_live_session_noop() {
         audio_sink: None,
         authenticator: None,
         snapshot_executor: None,
+        control_handler: None,
     };
 
     let body = "<Control><CmdType>PlaybackControl</CmdType><SN>1</SN><DeviceID>34020000001320000001</DeviceID><Info><ControlValue>PAUSE</ControlValue></Info></Control>";
@@ -3244,6 +3413,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             snapshot_executor: None,
+            control_handler: None,
         };
 
         // Platform stand-in: TCP listener on an ephemeral port.
@@ -3373,6 +3543,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             snapshot_executor: None,
+            control_handler: None,
         };
 
         let body = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 9 TCP/RTP/AVP 96\r\na=setup:active\r\ny=2000000001\r\n";
@@ -3454,6 +3625,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             snapshot_executor: None,
+            control_handler: None,
             metrics: Arc::new(crate::metrics::NoopMetrics),
         };
 
@@ -3583,6 +3755,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             snapshot_executor: None,
+            control_handler: None,
         };
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         let peer_addr = peer.local_addr().expect("peer addr");
@@ -3645,6 +3818,7 @@ mod tcp_media_tests {
             })),
             authenticator: None,
             snapshot_executor: None,
+            control_handler: None,
         };
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         let peer_addr = peer.local_addr().expect("peer addr");
@@ -3772,6 +3946,7 @@ mod tcp_media_tests {
             audio_sink,
             authenticator: None,
             snapshot_executor: None,
+            control_handler: None,
         }
     }
 
