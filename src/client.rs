@@ -750,6 +750,81 @@ pub fn build_recordinfo_response(
     })
 }
 
+/// Build the minimal valid Response for the GB/T 28181-2022 information
+/// queries (A.2.4.10-14, answered per A.2.6.12-16): identity fields plus
+/// the required `SumNum`/`Number` echoes, every optional capability block
+/// omitted — no home position, cruise tracks, PTZ telemetry or storage
+/// card. Semantics and wire bytes mirror gb28181-go #78
+/// (`BuildGB2022QueryResponseMessage`): attribute-form `CmdType`/`SN`,
+/// compact body, no XML declaration; `SumNum` is 0 for
+/// CruiseTrackListQuery/CruiseTrackQuery/SDCardStatus only, and the
+/// CruiseTrackQuery track index is echoed via `number`.
+// Same SIP-wrapping parameter set as the sibling response builders.
+#[allow(clippy::too_many_arguments)]
+pub fn build_gb2022_query_response(
+    cmd_type: &str,
+    sn: &str,
+    device_id: &str,
+    number: Option<&str>,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+) -> Result<SipMessage> {
+    let mut body = format!(
+        "<Response CmdType=\"{cmd_type}\" SN=\"{sn}\"><DeviceID>{device_id}</DeviceID>",
+        cmd_type = xml_escape(cmd_type),
+        sn = xml_escape(sn),
+        device_id = xml_escape(device_id),
+    );
+    if matches!(
+        cmd_type,
+        "CruiseTrackListQuery" | "CruiseTrackQuery" | "SDCardStatus"
+    ) {
+        body.push_str("<SumNum>0</SumNum>");
+    }
+    if cmd_type == "CruiseTrackQuery" {
+        if let Some(n) = number.and_then(|s| s.parse::<u32>().ok()) {
+            body.push_str(&format!("<Number>{n}</Number>"));
+        }
+    }
+    body.push_str("</Response>");
+
+    let mut headers = Vec::new();
+    headers.push((
+        "Via".to_string(),
+        format!(
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
+        ),
+    ));
+    headers.push((
+        "From".to_string(),
+        format!("<sip:{device_id}@{domain}>;tag={}", random_tag()),
+    ));
+    headers.push(("To".to_string(), format!("<sip:{domain}@{domain}>")));
+    headers.push(("Call-ID".to_string(), format!("{device_id}-gb2022-{cseq}")));
+    headers.push(("CSeq".to_string(), format!("{cseq} MESSAGE")));
+    headers.push(("Max-Forwards".to_string(), "70".to_string()));
+    headers.push((
+        "Content-Type".to_string(),
+        "Application/MANSCDP+xml".to_string(),
+    ));
+    headers.push(("Content-Length".to_string(), body.len().to_string()));
+
+    Ok(SipMessage {
+        start_line: format!("MESSAGE sip:{domain}@{domain} SIP/2.0"),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some(format!("sip:{domain}@{domain}")),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body,
+    })
+}
+
 /// Format an epoch-millisecond timestamp as a GB/T 28181 time string
 /// (`YYYY-MM-DDTHH:MM:SS`, device-local timezone — naive form, matching
 /// how platforms send queries and how the Go repo formats via `time.Local`).
@@ -1060,6 +1135,81 @@ fn build_200_ok_response(request: &SipMessage) -> Result<(SipMessage, Option<Sip
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── GB/T 28181-2022 information-query minimal responses (#59) ────────
+    // Semantics + wire bytes mirror gb28181-go #78 (compact body,
+    // attribute-form CmdType/SN, SumNum only for the three list/status
+    // queries, CruiseTrackQuery track index echoed).
+
+    fn gb2022_body(cmd_type: &str, sn: &str, number: Option<&str>) -> String {
+        build_gb2022_query_response(
+            cmd_type,
+            sn,
+            "34020000001320000001",
+            number,
+            "3402000000",
+            "192.0.2.10",
+            5060,
+            9,
+        )
+        .expect("build")
+        .body
+    }
+
+    #[test]
+    fn gb2022_home_position_query_minimal_golden() {
+        assert_eq!(
+            gb2022_body("HomePositionQuery", "61", None),
+            "<Response CmdType=\"HomePositionQuery\" SN=\"61\"><DeviceID>34020000001320000001</DeviceID></Response>"
+        );
+    }
+
+    #[test]
+    fn gb2022_cruise_track_list_query_golden() {
+        assert_eq!(
+            gb2022_body("CruiseTrackListQuery", "62", None),
+            "<Response CmdType=\"CruiseTrackListQuery\" SN=\"62\"><DeviceID>34020000001320000001</DeviceID><SumNum>0</SumNum></Response>"
+        );
+    }
+
+    #[test]
+    fn gb2022_cruise_track_query_echoes_number_golden() {
+        assert_eq!(
+            gb2022_body("CruiseTrackQuery", "63", Some("1")),
+            "<Response CmdType=\"CruiseTrackQuery\" SN=\"63\"><DeviceID>34020000001320000001</DeviceID><SumNum>0</SumNum><Number>1</Number></Response>"
+        );
+        // A non-numeric track index is dropped, not echoed (go-parity).
+        assert_eq!(
+            gb2022_body("CruiseTrackQuery", "63", Some("x")),
+            "<Response CmdType=\"CruiseTrackQuery\" SN=\"63\"><DeviceID>34020000001320000001</DeviceID><SumNum>0</SumNum></Response>"
+        );
+    }
+
+    #[test]
+    fn gb2022_ptz_position_query_minimal_golden() {
+        assert_eq!(
+            gb2022_body("PTZPosition", "64", None),
+            "<Response CmdType=\"PTZPosition\" SN=\"64\"><DeviceID>34020000001320000001</DeviceID></Response>"
+        );
+    }
+
+    #[test]
+    fn gb2022_sd_card_status_query_golden() {
+        assert_eq!(
+            gb2022_body("SDCardStatus", "65", None),
+            "<Response CmdType=\"SDCardStatus\" SN=\"65\"><DeviceID>34020000001320000001</DeviceID><SumNum>0</SumNum></Response>"
+        );
+        // None of the minimal answers may carry a capability payload.
+        for absent in [
+            "<HomePosition",
+            "<CruiseTrackList",
+            "<CruisePointList",
+            "<SDCardStatusInfo",
+            "<Pan>",
+        ] {
+            assert!(!gb2022_body("SDCardStatus", "65", None).contains(absent));
+        }
+    }
 
     #[test]
     fn test_catalog_response_xml_well_formed() {
