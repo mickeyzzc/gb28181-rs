@@ -1029,6 +1029,165 @@ pub fn build_control_reject_response(
     })
 }
 
+/// Basic-parameter block of a ConfigDownload response (A.2.6.9 /
+/// A.2.1.19 basicParamCfgType): every child is optional; `None` children
+/// are omitted.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BasicParamBlock {
+    /// Device name (设备名称).
+    pub name: Option<String>,
+    /// Registration expiry in seconds (注册过期时间).
+    pub expiration: Option<u64>,
+    /// Keepalive interval in seconds (心跳间隔时间).
+    pub heartbeat_interval: Option<u64>,
+    /// Keepalive timeout count (心跳超时次数).
+    pub heartbeat_count: Option<u32>,
+}
+
+/// Build the SIP MESSAGE answering a DeviceConfig command (A.2.6.8):
+/// `Response` with `CmdType=DeviceConfig`, the SN echoed and the
+/// execution `Result` (OK when a handler executed, ERROR otherwise).
+#[allow(clippy::too_many_arguments)]
+pub fn build_device_config_response(
+    ok: bool,
+    sn: &str,
+    device_id: &str,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+) -> Result<SipMessage> {
+    let result = if ok { "OK" } else { "ERROR" };
+    let body = format!(
+        "<?xml version=\"1.0\" encoding=\"GB2312\"?>\
+        <Response CmdType=\"DeviceConfig\" SN=\"{}\">\
+        <DeviceID>{}</DeviceID>\
+        <Result>{}</Result>\
+        </Response>",
+        xml_escape(sn),
+        xml_escape(device_id),
+        result
+    );
+
+    let mut headers = Vec::new();
+    headers.push((
+        "Via".to_string(),
+        format!(
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
+        ),
+    ));
+    headers.push((
+        "From".to_string(),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
+    ));
+    headers.push(("To".to_string(), format!("<sip:{}@{ }>", domain, domain)));
+    headers.push((
+        "Call-ID".to_string(),
+        format!("{}-config-{}", device_id, cseq),
+    ));
+    headers.push(("CSeq".to_string(), format!("{} MESSAGE", cseq)));
+    headers.push(("Max-Forwards".to_string(), "70".to_string()));
+    headers.push((
+        "Content-Type".to_string(),
+        "Application/MANSCDP+xml".to_string(),
+    ));
+    headers.push(("Content-Length".to_string(), body.len().to_string()));
+
+    Ok(SipMessage {
+        start_line: format!("MESSAGE sip:{}@{} SIP/2.0", domain, domain),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some(format!("sip:{}@{ }", domain, domain)),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body,
+    })
+}
+
+/// Build the SIP MESSAGE answering a ConfigDownload query (A.2.6.9):
+/// `Response` with `CmdType=ConfigDownload`, `Result=OK` and the
+/// optional `BasicParam` block (every other config block is optional
+/// and omitted — the minimal valid answer, same stance as the 2022
+/// five-query responses).
+#[allow(clippy::too_many_arguments)]
+pub fn build_config_download_response(
+    sn: &str,
+    device_id: &str,
+    basic: Option<&BasicParamBlock>,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+) -> Result<SipMessage> {
+    let mut body = format!(
+        "<?xml version=\"1.0\" encoding=\"GB2312\"?>\
+        <Response CmdType=\"ConfigDownload\" SN=\"{}\">\
+        <DeviceID>{}</DeviceID>\
+        <Result>OK</Result>",
+        xml_escape(sn),
+        xml_escape(device_id)
+    );
+    if let Some(bp) = basic {
+        body.push_str("<BasicParam>");
+        if let Some(name) = &bp.name {
+            body.push_str(&format!("<Name>{}</Name>", xml_escape(name)));
+        }
+        if let Some(expiration) = bp.expiration {
+            body.push_str(&format!("<Expiration>{expiration}</Expiration>"));
+        }
+        if let Some(interval) = bp.heartbeat_interval {
+            body.push_str(&format!(
+                "<HeartBeatInterval>{interval}</HeartBeatInterval>"
+            ));
+        }
+        if let Some(count) = bp.heartbeat_count {
+            body.push_str(&format!("<HeartBeatCount>{count}</HeartBeatCount>"));
+        }
+        body.push_str("</BasicParam>");
+    }
+    body.push_str("</Response>");
+
+    let mut headers = Vec::new();
+    headers.push((
+        "Via".to_string(),
+        format!(
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
+        ),
+    ));
+    headers.push((
+        "From".to_string(),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
+    ));
+    headers.push(("To".to_string(), format!("<sip:{}@{ }>", domain, domain)));
+    headers.push((
+        "Call-ID".to_string(),
+        format!("{}-config-{}", device_id, cseq),
+    ));
+    headers.push(("CSeq".to_string(), format!("{} MESSAGE", cseq)));
+    headers.push(("Max-Forwards".to_string(), "70".to_string()));
+    headers.push((
+        "Content-Type".to_string(),
+        "Application/MANSCDP+xml".to_string(),
+    ));
+    headers.push(("Content-Length".to_string(), body.len().to_string()));
+
+    Ok(SipMessage {
+        start_line: format!("MESSAGE sip:{}@{} SIP/2.0", domain, domain),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some(format!("sip:{}@{ }", domain, domain)),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body,
+    })
+}
+
 /// Dispatch an inbound MESSAGE request from the platform.
 ///
 /// Parses the XML body to determine the command type and returns
@@ -1154,6 +1313,92 @@ mod tests {
         )
         .expect("build")
         .body
+    }
+
+    /// DeviceConfig answer body golden (A.2.6.8): attribute-form
+    /// Response, SN echoed, Result OK/ERROR. Byte-identical shape to the
+    /// Go twin's builder.
+    #[test]
+    fn device_config_response_body_golden() {
+        for (ok, result) in [(true, "OK"), (false, "ERROR")] {
+            let msg = build_device_config_response(
+                ok,
+                "71",
+                "34020000001320000001",
+                "3402000000",
+                "192.168.62.104",
+                5060,
+                9,
+            )
+            .expect("build");
+            assert_eq!(
+                msg.body,
+                format!(
+                    "<?xml version=\"1.0\" encoding=\"GB2312\"?>\
+                    <Response CmdType=\"DeviceConfig\" SN=\"71\">\
+                    <DeviceID>34020000001320000001</DeviceID>\
+                    <Result>{}</Result>\
+                    </Response>",
+                    result
+                )
+            );
+            assert_eq!(
+                msg.get_header("Content-Type").unwrap(),
+                "Application/MANSCDP+xml"
+            );
+            assert_eq!(
+                msg.get_header("Content-Length").unwrap(),
+                msg.body.len().to_string()
+            );
+        }
+    }
+
+    /// ConfigDownload answer body golden (A.2.6.9): OK plus the optional
+    /// BasicParam block, `None` children omitted.
+    #[test]
+    fn config_download_response_body_golden() {
+        let bare = build_config_download_response(
+            "74",
+            "34020000001320000001",
+            None,
+            "3402000000",
+            "192.168.62.104",
+            5060,
+            10,
+        )
+        .expect("build");
+        assert_eq!(
+            bare.body,
+            "<?xml version=\"1.0\" encoding=\"GB2312\"?>\
+            <Response CmdType=\"ConfigDownload\" SN=\"74\">\
+            <DeviceID>34020000001320000001</DeviceID>\
+            <Result>OK</Result></Response>"
+        );
+        let with_basic = build_config_download_response(
+            "75",
+            "34020000001320000001",
+            Some(&BasicParamBlock {
+                name: Some("Dome".to_string()),
+                expiration: Some(3600),
+                heartbeat_interval: Some(61),
+                heartbeat_count: Some(4),
+            }),
+            "3402000000",
+            "192.168.62.104",
+            5060,
+            11,
+        )
+        .expect("build");
+        assert_eq!(
+            with_basic.body,
+            "<?xml version=\"1.0\" encoding=\"GB2312\"?>\
+            <Response CmdType=\"ConfigDownload\" SN=\"75\">\
+            <DeviceID>34020000001320000001</DeviceID>\
+            <Result>OK</Result>\
+            <BasicParam><Name>Dome</Name><Expiration>3600</Expiration>\
+            <HeartBeatInterval>61</HeartBeatInterval><HeartBeatCount>4</HeartBeatCount>\
+            </BasicParam></Response>"
+        );
     }
 
     #[test]

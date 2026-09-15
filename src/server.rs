@@ -167,6 +167,39 @@ pub trait DeviceControlHandler: Send + Sync {
     /// hex arrives as `PtzCommand::Invalid` with the raw string
     /// preserved.
     fn on_ptz(&self, _cmd: &crate::manscdp::PtzCommand) {}
+    /// `<HomePosition>` — 看守位 control (A.2.3.1.10): auto-return to a
+    /// preset after `reset_time` seconds of inactivity (enabled=0
+    /// disables). Absent optional fields mean "keep current".
+    fn on_home_position(
+        &self,
+        _enabled: u32,
+        _reset_time: Option<u32>,
+        _preset_index: Option<u32>,
+    ) {
+    }
+}
+
+/// Host seam for DeviceConfig sub-commands (GB/T 28181-2022 §9.3.3 /
+/// A.2.3.2, issue #57 minimum). Every method has a no-op default —
+/// install only what your hardware acts on; a command whose handler is
+/// the no-op default keeps the reject answer.
+pub trait DeviceConfigHandler: Send + Sync {
+    /// A.2.3.2.2 基本参数配置 — device name and registration tuning.
+    /// The library never hot-applies these; hosts decide what sticks.
+    fn on_basic_param(
+        &self,
+        _name: Option<&str>,
+        _expiration: Option<u64>,
+        _heartbeat_interval: Option<u64>,
+        _heartbeat_count: Option<u32>,
+    ) {
+    }
+    /// A.2.3.2.9 画面翻转配置 — 0 none, 1 horizontal, 2 vertical,
+    /// 3 both (A.2.1.22 frameMirrorCfgType).
+    fn on_frame_mirror(&self, _mode: u32) {}
+    /// A.2.3.2.10 报警上报开关配置 — motion-detection /
+    /// field-detection event report switches (0 off, 1 on).
+    fn on_alarm_report(&self, _motion_detection: u32, _field_detection: u32) {}
 }
 
 /// Stamp the Annex I X-GB-Ver header on a REGISTER when configured.
@@ -189,6 +222,37 @@ fn dispatch_device_control(
         DeviceControlKind::ResetAlarm => handler.on_reset_alarm(),
         DeviceControlKind::TeleBoot => handler.on_teleboot(),
         DeviceControlKind::Ptz(cmd) => handler.on_ptz(cmd),
+        DeviceControlKind::HomePosition {
+            enabled,
+            reset_time,
+            preset_index,
+        } => handler.on_home_position(*enabled, *reset_time, *preset_index),
+    }
+}
+
+/// Executes a decoded DeviceConfig against the installed handler.
+fn dispatch_device_config(
+    handler: Arc<dyn DeviceConfigHandler>,
+    config: &crate::manscdp::DeviceConfig,
+) {
+    use crate::manscdp::DeviceConfigKind;
+    match &config.kind {
+        DeviceConfigKind::BasicParam {
+            name,
+            expiration,
+            heartbeat_interval,
+            heartbeat_count,
+        } => handler.on_basic_param(
+            name.as_deref(),
+            *expiration,
+            *heartbeat_interval,
+            *heartbeat_count,
+        ),
+        DeviceConfigKind::FrameMirror(mode) => handler.on_frame_mirror(*mode),
+        DeviceConfigKind::AlarmReport {
+            motion_detection,
+            field_detection,
+        } => handler.on_alarm_report(*motion_detection, *field_detection),
     }
 }
 
@@ -233,6 +297,9 @@ pub struct Gb28181Server {
     /// DeviceControl sub-command handler (issue #58). `None` = recognized
     /// sub-commands keep the control-reject behavior.
     control_handler: Option<Arc<dyn DeviceControlHandler>>,
+    /// Host seam for DeviceConfig sub-commands (issue #57); `None` keeps
+    /// the reject behavior.
+    config_handler: Option<Arc<dyn DeviceConfigHandler>>,
     /// SUBSCRIBE/NOTIFY bookkeeping + host-facing notifier (issue #57's
     /// subscription half). Shared with the host via [`Self::device_notifier`].
     notifier: Arc<crate::subscribe::DeviceNotifier>,
@@ -364,6 +431,7 @@ impl Gb28181Server {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
+            config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
             position_source: None,
             position_cancel: None,
@@ -422,6 +490,13 @@ impl Gb28181Server {
     /// is a follow-up.
     pub fn with_control_handler(mut self, handler: Option<Arc<dyn DeviceControlHandler>>) -> Self {
         self.control_handler = handler;
+        self
+    }
+
+    /// Installs the DeviceConfig host seam (issue #57). `None` (default)
+    /// keeps every DeviceConfig command rejected with `Result=ERROR`.
+    pub fn with_config_handler(mut self, handler: Option<Arc<dyn DeviceConfigHandler>>) -> Self {
+        self.config_handler = handler;
         self
     }
 
@@ -1049,6 +1124,34 @@ impl Gb28181Server {
                     );
                 }
 
+                // DeviceConfig sub-commands (issue #57, A.2.3.2): unlike
+                // controls, the answer is a Response body with Result
+                // (A.2.6.8) — OK when a handler executed, ERROR (the
+                // historical reject below) otherwise.
+                if let Some(config) = crate::manscdp::parse_device_config(&msg.body) {
+                    if let Some(handler) = self.config_handler.clone() {
+                        log::info!("gb28181: DeviceConfig {:?} executed", config.kind);
+                        dispatch_device_config(handler, &config);
+                        let cseq = random_cseq();
+                        let response = super::client::build_device_config_response(
+                            true,
+                            &config.sn,
+                            &config.device_id,
+                            &self.config.sip_domain,
+                            &self.local_ip,
+                            self.config.local_sip_port,
+                            cseq,
+                        )?;
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                        self.send_sip_message(&response, peer_addr).await?;
+                        return Ok(());
+                    }
+                    log::warn!(
+                        "gb28181: DeviceConfig {:?} without a config handler — rejecting",
+                        config.kind
+                    );
+                }
+
                 // Build and send Catalog/DeviceInfo response if this was a query
                 if let Some(response_msg) = self.build_query_response(msg)? {
                     // Small delay to let 200 OK be processed first
@@ -1264,6 +1367,36 @@ impl Gb28181Server {
                     &query.sn,
                     &query.device_id,
                     query.number.as_deref(),
+                    &self.config.sip_domain,
+                    &self.local_ip,
+                    self.config.local_sip_port,
+                    cseq,
+                )?;
+                Ok(Some(response))
+            }
+            "ConfigDownload" => {
+                // A.2.4.7 / A.2.6.9: answer the minimal valid Response —
+                // OK plus the BasicParam block (name + registration
+                // tuning from the live config) when the request asked
+                // for it; every other config block is optional and
+                // omitted. ConfigType may list several types
+                // "/"-separated.
+                let requested_basic = query
+                    .config_type
+                    .as_deref()
+                    .unwrap_or("")
+                    .split('/')
+                    .any(|t| t.trim() == "BasicParam");
+                let basic = requested_basic.then(|| super::client::BasicParamBlock {
+                    name: Some(self.config.effective_device_name()),
+                    expiration: Some(self.config.register_interval_secs),
+                    heartbeat_interval: Some(self.config.heartbeat_interval_secs),
+                    heartbeat_count: Some(self.config.heartbeat_timeout_count),
+                });
+                let response = super::client::build_config_download_response(
+                    &query.sn,
+                    &query.device_id,
+                    basic.as_ref(),
                     &self.config.sip_domain,
                     &self.local_ip,
                     self.config.local_sip_port,
@@ -2467,6 +2600,7 @@ async fn handle_tcp_connection(
         // DeviceControl dispatch over TCP is a follow-up (issue #58);
         // controls keep the reject path here.
         control_handler: None,
+        config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,
@@ -3113,6 +3247,7 @@ async fn test_recordinfo_dispatch_with_source() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
+        config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,
@@ -3204,6 +3339,7 @@ async fn test_subscribe_books_and_echoes_expires() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
+        config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,
@@ -3302,6 +3438,7 @@ async fn test_gb2022_information_queries_dispatch() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
+        config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,
@@ -3333,6 +3470,250 @@ async fn test_gb2022_information_queries_dispatch() {
             .unwrap_or_else(|| panic!("{cmd_type} must produce a response"));
         assert!(response.body.contains(want), "{cmd_type} body: {}", response.body);
     }
+}
+
+/// DeviceConfig dispatch (issue #57, A.2.3.2): a recognized sub-command
+/// with an installed handler answers 200 OK + `Result=OK`; without a
+/// handler the historical reject `Result=ERROR` stands. ConfigDownload
+/// (A.2.4.7) answers OK with the BasicParam block only when requested.
+#[tokio::test]
+async fn test_deviceconfig_and_configdownload_dispatch() {
+    use std::sync::Mutex;
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let seen = Arc::clone(&calls);
+    struct RecordingConfig(Arc<Mutex<Vec<String>>>);
+    impl DeviceConfigHandler for RecordingConfig {
+        fn on_basic_param(
+            &self,
+            name: Option<&str>,
+            expiration: Option<u64>,
+            heartbeat_interval: Option<u64>,
+            heartbeat_count: Option<u32>,
+        ) {
+            self.0.lock().unwrap().push(format!(
+                "basic:{name:?}/{expiration:?}/{heartbeat_interval:?}/{heartbeat_count:?}"
+            ));
+        }
+        fn on_frame_mirror(&self, mode: u32) {
+            self.0.lock().unwrap().push(format!("mirror:{mode}"));
+        }
+        fn on_alarm_report(&self, motion: u32, field: u32) {
+            self.0
+                .lock()
+                .unwrap()
+                .push(format!("alarm:{motion}/{field}"));
+        }
+    }
+
+    let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+    let _server_addr = sip_socket.local_addr().expect("addr");
+    let mut server = Gb28181Server {
+        config: Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 3600,
+            heartbeat_interval_secs: 61,
+            heartbeat_timeout_count: 4,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        },
+        au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
+        sip_socket: Some(sip_socket),
+        tcp_conn: None,
+        media_socket: None,
+        media_tcp_conn: None,
+        media_task: None,
+        subscriber_id: None,
+        invite_info: None,
+        local_ip: "127.0.0.1".to_string(),
+        recording_index: None,
+        playback_ctl: None,
+        audio_sink: None,
+        authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        snapshot_executor: None,
+        control_handler: None,
+        config_handler: Some(Arc::new(RecordingConfig(seen))),
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
+    };
+
+    let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer bind");
+    let peer_addr = peer.local_addr().expect("peer addr");
+    let mut client = SipDeviceClient::new(
+        "34020000001320000001",
+        peer_addr,
+        "127.0.0.1",
+        5060,
+        "3402000000",
+        "12345678",
+        3600,
+    );
+    let mut keepalive_failures = 0u32;
+
+    let mut buf = vec![0u8; 65535];
+
+    async fn read_peer(peer: &UdpSocket, buf: &mut [u8]) -> String {
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(buf))
+            .await
+            .expect("timed out")
+            .expect("recv");
+        String::from_utf8_lossy(&buf[..len]).to_string()
+    }
+
+    let message = |body: &str| SipMessage {
+        start_line: "MESSAGE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some("sip:34020000001320000001@3402000000".to_string()),
+        version: "SIP/2.0".to_string(),
+        headers: vec![
+            ("Call-ID".to_string(), "cfg-1".to_string()),
+            ("CSeq".to_string(), "1 MESSAGE".to_string()),
+            (
+                "Content-Type".to_string(),
+                "Application/MANSCDP+xml".to_string(),
+            ),
+        ],
+        body: body.to_string(),
+    };
+
+    // 1) BasicParam with a handler: 200 OK, then Result=OK, handler fired.
+    server
+        .handle_message(
+            &message(
+                "<Control><CmdType>DeviceConfig</CmdType><SN>71</SN>\
+                 <DeviceID>34020000001320000001</DeviceID>\
+                 <BasicParam><Name>Dome</Name><Expiration>120</Expiration>\
+                 <HeartBeatInterval>15</HeartBeatInterval><HeartBeatCount>5</HeartBeatCount>\
+                 </BasicParam></Control>",
+            ),
+            peer_addr,
+            &mut client,
+            peer_addr,
+            &mut keepalive_failures,
+        )
+        .await
+        .expect("handle");
+    let ok = read_peer(&peer, &mut buf).await;
+    assert!(ok.starts_with("SIP/2.0 200 OK"), "first reply: {ok}");
+    let resp = read_peer(&peer, &mut buf).await;
+    assert!(
+        resp.contains("<Response CmdType=\"DeviceConfig\" SN=\"71\">")
+            && resp.contains("<Result>OK</Result>"),
+        "config OK response: {resp}"
+    );
+    assert_eq!(
+        calls.lock().unwrap().as_slice(),
+        ["basic:Some(\"Dome\")/Some(120)/Some(15)/Some(5)"]
+    );
+
+    // 2) FrameMirror: handler fired, Result=OK.
+    calls.lock().unwrap().clear();
+    server
+        .handle_message(
+            &message(
+                "<Control><CmdType>DeviceConfig</CmdType><SN>72</SN>\
+                 <DeviceID>34020000001320000001</DeviceID>\
+                 <FrameMirror>1</FrameMirror></Control>",
+            ),
+            peer_addr,
+            &mut client,
+            peer_addr,
+            &mut keepalive_failures,
+        )
+        .await
+        .expect("handle");
+    let _ = read_peer(&peer, &mut buf).await; // 200 OK
+    let resp = read_peer(&peer, &mut buf).await;
+    assert!(
+        resp.contains("SN=\"72\"") && resp.contains("<Result>OK</Result>"),
+        "{resp}"
+    );
+    assert_eq!(calls.lock().unwrap().as_slice(), ["mirror:1"]);
+
+    // 3) Without a handler the historical reject stands (Result=ERROR).
+    server.config_handler = None;
+    server
+        .handle_message(
+            &message(
+                "<Control><CmdType>DeviceConfig</CmdType><SN>73</SN>\
+                 <DeviceID>34020000001320000001</DeviceID>\
+                 <AlarmReport><MotionDetection>1</MotionDetection>\
+                 <FieldDetection>0</FieldDetection></AlarmReport></Control>",
+            ),
+            peer_addr,
+            &mut client,
+            peer_addr,
+            &mut keepalive_failures,
+        )
+        .await
+        .expect("handle");
+    let _ = read_peer(&peer, &mut buf).await; // 200 OK
+    let resp = read_peer(&peer, &mut buf).await;
+    assert!(
+        resp.contains("<Response CmdType=\"DeviceConfig\" SN=\"73\">")
+            && resp.contains("<Result>ERROR</Result>"),
+        "config reject: {resp}"
+    );
+
+    // 4) ConfigDownload query: BasicParam block when requested (values
+    // from the live config), bare OK otherwise.
+    server.config_handler = Some(Arc::new(RecordingConfig(Arc::clone(&calls))));
+    let query = |config_type: &str| SipMessage {
+        start_line: "MESSAGE sip:3402000000@3402000000 SIP/2.0".to_string(),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some("sip:3402000000@3402000000".to_string()),
+        version: "SIP/2.0".to_string(),
+        headers: vec![(
+            "Content-Type".to_string(),
+            "Application/MANSCDP+xml".to_string(),
+        )],
+        body: format!(
+            "<Query><CmdType>ConfigDownload</CmdType><SN>74</SN>\
+             <DeviceID>34020000001320000001</DeviceID>\
+             <ConfigType>{config_type}</ConfigType></Query>"
+        ),
+    };
+    let with_basic = server
+        .build_query_response(&query("BasicParam/FrameMirror"))
+        .expect("dispatch")
+        .expect("response");
+    assert!(
+        with_basic
+            .body
+            .contains("<Response CmdType=\"ConfigDownload\" SN=\"74\">")
+            && with_basic.body.contains("<Result>OK</Result>")
+            && with_basic.body.contains("<BasicParam><Name>")
+            && with_basic.body.contains("<Expiration>3600</Expiration>")
+            && with_basic
+                .body
+                .contains("<HeartBeatInterval>61</HeartBeatInterval>")
+            && with_basic
+                .body
+                .contains("<HeartBeatCount>4</HeartBeatCount>"),
+        "configdownload body: {}",
+        with_basic.body
+    );
+    let without = server
+        .build_query_response(&query("OSDConfig"))
+        .expect("dispatch")
+        .expect("response");
+    assert!(
+        without.body.contains("<Result>OK</Result>") && !without.body.contains("<BasicParam>"),
+        "bare OK body: {}",
+        without.body
+    );
 }
 
 /// Without a recording source, a RecordInfo query yields the empty golden
@@ -3374,6 +3755,7 @@ async fn test_recordinfo_dispatch_without_source() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
+        config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,
@@ -3443,6 +3825,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
+        config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,
@@ -3542,6 +3925,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
+        config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,
@@ -3638,6 +4022,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
+        config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,
@@ -3794,6 +4179,7 @@ async fn test_info_playback_control_live_session_noop() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
+        config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,
@@ -3893,6 +4279,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
+            config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
             position_source: None,
             position_cancel: None,
@@ -4028,6 +4415,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
+            config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
             position_source: None,
             position_cancel: None,
@@ -4115,6 +4503,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
+            config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
             position_source: None,
             position_cancel: None,
@@ -4220,6 +4609,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
+            config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
             position_source: None,
             position_cancel: None,
@@ -4318,6 +4708,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
+            config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
             position_source: None,
             position_cancel: None,
@@ -4461,6 +4852,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
+            config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
             position_source: None,
             position_cancel: None,
@@ -4529,6 +4921,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
+            config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
             position_source: None,
             position_cancel: None,
@@ -4662,6 +5055,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
+            config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
             position_source: None,
             position_cancel: None,
