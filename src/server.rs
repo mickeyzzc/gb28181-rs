@@ -30,7 +30,10 @@ use super::manscdp::{ChannelItem, DeviceItem};
 use super::playback::{parse_playback_control, run_playback_task, PlaybackControl};
 use super::ps::mux_h264_to_ps;
 use super::rtp_pusher::RtpPusher;
-use super::sip::{build_invite_response, SessionType, SipMessage, SipMethod, SipStatusCode};
+use super::sip::{
+    build_invite_response, build_media_status_info_request, SessionType, SipMessage, SipMethod,
+    SipStatusCode,
+};
 use crate::RecordingSource;
 
 // Maximum UDP packet size for SIP (should handle most messages)
@@ -1359,6 +1362,38 @@ impl Gb28181Server {
             Some((source, segments, start_ms, end_ms)) => {
                 let paced = invite_info.session_type == SessionType::Playback;
                 let media_task_conn = media_tcp_conn.clone();
+                // §9.4.2 media-end notify (issue #60): on natural
+                // completion the task sends the in-dialog MediaStatus
+                // INFO itself. UDP SIP only — over TCP-SIP the dialog's
+                // write half stays with the connection handler (deferred,
+                // see #60). Everything is captured here because the task
+                // owns only the media socket.
+                let end_info = match (&self.sip_socket, self.tcp_conn.is_none()) {
+                    (Some(sock), true) => {
+                        let remote_id = msg
+                            .get_header("From")
+                            .and_then(|f| f.split('@').next())
+                            .and_then(|f| f.strip_prefix("<sip:"))
+                            .map(str::to_string)
+                            .unwrap_or_else(|| self.config.sip_domain.clone());
+                        Some(super::playback::MediaEndInfo {
+                            sip_socket: Arc::clone(sock),
+                            platform_sip_addr: peer_addr,
+                            info: build_media_status_info_request(
+                                &self.config.device_id,
+                                &self.local_ip,
+                                self.config.local_sip_port,
+                                &remote_id,
+                                &self.config.platform_sip_address,
+                                &call_id,
+                                cseq.wrapping_add(1),
+                                local_tag,
+                                invite_info.session_type == SessionType::Download,
+                            ),
+                        })
+                    }
+                    _ => None,
+                };
                 // Control channel for SIP INFO PlaybackControl on this session.
                 let (playback_tx, playback_rx) = mpsc::channel::<PlaybackControl>(8);
                 self.playback_ctl = Some(playback_tx);
@@ -1375,6 +1410,7 @@ impl Gb28181Server {
                         media_dest,
                         paced,
                         playback_rx,
+                        end_info,
                     )
                     .await
                     {

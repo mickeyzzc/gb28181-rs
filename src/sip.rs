@@ -621,6 +621,70 @@ pub fn build_bye_request(
     }
 }
 
+/// Build the in-dialog SIP INFO that reports natural end of a
+/// playback/download session (GB/T 28181-2016 §9.4.2, kept in 2022):
+/// a MANSRTSP-style `MediaStatus: Play Finished` / `Download Finished`
+/// body on the fetch dialog so the platform can tear the session down
+/// promptly instead of waiting out stall timeouts. `download` picks the
+/// variant; `from_tag` is the local tag of the INVITE dialog.
+// Mirrors build_bye_request's parameter set (same dialog plumbing).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn build_media_status_info_request(
+    local_id: &str,
+    local_addr: &str,
+    local_port: u16,
+    remote_id: &str,
+    remote_addr: &str,
+    call_id: &str,
+    cseq: u32,
+    from_tag: u32,
+    download: bool,
+) -> SipMessage {
+    let status = if download {
+        "Download Finished"
+    } else {
+        "Play Finished"
+    };
+    let mut headers = Vec::new();
+    headers.push((
+        "Via".to_string(),
+        format!(
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_addr,
+            local_port,
+            random_branch()
+        ),
+    ));
+    headers.push((
+        "From".to_string(),
+        format!("<sip:{}@{}>;tag={}", local_id, local_addr, from_tag),
+    ));
+    headers.push((
+        "To".to_string(),
+        format!("<sip:{}@{}>", remote_id, remote_addr),
+    ));
+    headers.push(("Call-ID".to_string(), call_id.to_string()));
+    headers.push(("CSeq".to_string(), format!("{} INFO", cseq)));
+    headers.push(("Max-Forwards".to_string(), "70".to_string()));
+    headers.push((
+        "Content-Type".to_string(),
+        "Application/MANSRTSP".to_string(),
+    ));
+    // serialize_wire rewrites Content-Length from the wire body.
+    headers.push(("Content-Length".to_string(), "0".to_string()));
+
+    SipMessage {
+        start_line: format!("INFO sip:{}@{} SIP/2.0", remote_id, remote_addr),
+        method: Some(SipMethod::Info),
+        status_code: None,
+        uri: Some(format!("sip:{}@{}", remote_id, remote_addr)),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body: format!("MediaStatus: {status}\r\n"),
+    }
+}
+
 /// Build a SIP 200 OK response to an INVITE request.
 ///
 /// # Arguments
@@ -948,6 +1012,51 @@ mod tests {
         assert_eq!(method.to_string(), "OPTIONS");
     }
 
+    fn wire(msg: &SipMessage) -> String {
+        String::from_utf8(crate::server::serialize_wire(msg)).unwrap()
+    }
+
+    #[test]
+    fn media_status_info_play_finished_golden() {
+        let msg = build_media_status_info_request(
+            "34020000001320000001",
+            "192.0.2.10",
+            5060,
+            "34020000002000000001",
+            "3402000000",
+            "call-1@192.0.2.10",
+            2,
+            4242,
+            false,
+        );
+        let out = wire(&msg);
+        assert!(out.starts_with("INFO sip:34020000002000000001@3402000000 SIP/2.0\r\n"));
+        assert!(out.contains("CSeq: 2 INFO\r\n"));
+        assert!(out.contains("Content-Type: Application/MANSRTSP\r\n"));
+        assert!(out.contains(";tag=4242\r\n"));
+        // §9.4.2 body: single MANSRTSP-style status line, CRLF-terminated.
+        assert!(out.ends_with("MediaStatus: Play Finished\r\n"));
+        assert!(out.contains("Content-Length: 28\r\n"));
+    }
+
+    #[test]
+    fn media_status_info_download_finished_golden() {
+        let msg = build_media_status_info_request(
+            "34020000001320000001",
+            "192.0.2.10",
+            5060,
+            "34020000002000000001",
+            "3402000000",
+            "call-2@192.0.2.10",
+            3,
+            99,
+            true,
+        );
+        let out = wire(&msg);
+        assert!(out.ends_with("MediaStatus: Download Finished\r\n"));
+        assert!(out.contains("Content-Length: 32\r\n"));
+    }
+
     /// Regression: Via and Contact must advertise the port the device
     /// actually listens on, not a hardcoded 5060.
     #[test]
@@ -1011,6 +1120,8 @@ mod tests {
     /// BYE also carries the local port and a random branch.
     #[test]
     fn test_bye_advertises_local_port() {
+        // ── §9.4.2 MediaStatus INFO goldens (#60) ────────────────────────────
+
         let msg = build_bye_request(
             "34020000001320000001",
             "192.168.62.104",
