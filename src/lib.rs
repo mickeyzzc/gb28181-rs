@@ -89,6 +89,7 @@ pub mod segment;
 pub mod server;
 pub mod sip;
 pub mod snapshot;
+pub mod subscribe;
 
 pub use client::{
     parse_401_challenge, parse_invite, AudioCodec, InviteInfo, MediaKind, SipDeviceClient,
