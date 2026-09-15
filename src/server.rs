@@ -207,6 +207,18 @@ pub struct Gb28181Server {
     /// DeviceControl sub-command handler (issue #58). `None` = recognized
     /// sub-commands keep the control-reject behavior.
     control_handler: Option<Arc<dyn DeviceControlHandler>>,
+    /// SUBSCRIBE/NOTIFY bookkeeping + host-facing notifier (issue #57's
+    /// subscription half). Shared with the host via [`Self::device_notifier`].
+    notifier: Arc<crate::subscribe::DeviceNotifier>,
+    /// Periodic MobilePosition source; installed via
+    /// [`Self::with_position_source`] (None = position NOTIFYs only via
+    /// the notifier's direct sends).
+    position_source: Option<Arc<dyn crate::subscribe::MobilePositionSource>>,
+    /// Cancels the running position report task (replaced on re-SUBSCRIBE).
+    position_cancel: Option<tokio::sync::mpsc::Sender<()>>,
+    /// Blocking clone of the SIP UDP socket handed to the notifier in
+    /// run_udp (std send_to — safe from non-async host threads).
+    notifier_std_sock: Option<std::sync::Arc<std::net::UdpSocket>>,
     /// Observability hooks (no-op by default); see `metrics` module docs.
     metrics: Arc<dyn crate::metrics::MetricsHooks>,
 }
@@ -325,6 +337,10 @@ impl Gb28181Server {
             authenticator: None,
             snapshot_executor: None,
             control_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
             metrics: Arc::new(crate::metrics::NoopMetrics),
         }
     }
@@ -382,6 +398,28 @@ impl Gb28181Server {
         self
     }
 
+    /// The host-facing NOTIFY sender (issue #57): hold this `Arc` and call
+    /// `send_alarm` / `send_catalog_change` / `send_mobile_position`
+    /// whenever the business side has something to report — no-ops until
+    /// the platform subscribes.
+    #[must_use]
+    pub fn device_notifier(&self) -> Arc<crate::subscribe::DeviceNotifier> {
+        Arc::clone(&self.notifier)
+    }
+
+    /// Installs the periodic MobilePosition source: while a
+    /// MobilePosition subscription is live, the server pulls the source
+    /// on the SUBSCRIBE's `Interval` (default 5s, matching the Go
+    /// platform's request cadence) and sends position NOTIFYs.
+    #[must_use]
+    pub fn with_position_source(
+        mut self,
+        source: Option<Arc<dyn crate::subscribe::MobilePositionSource>>,
+    ) -> Self {
+        self.position_source = source;
+        self
+    }
+
     /// Bind the SIP socket and run this server (instance flavor of
     /// [`Gb28181Server::start`]).
     ///
@@ -402,10 +440,20 @@ impl Gb28181Server {
 
     async fn spawn_udp(mut self) -> Result<ServerHandle> {
         let sip_addr = format!("0.0.0.0:{}", self.config.local_sip_port);
-        let sip_socket = UdpSocket::bind(&sip_addr)
-            .await
+        // Bind the std socket first so the notifier can hold a blocking
+        // clone (NOTIFY sends fire from host threads that may not run in
+        // a tokio context; tokio's try_send_to returns WouldBlock there).
+        let std_sock = std::net::UdpSocket::bind(&sip_addr)
             .context(format!("gb28181: failed to bind SIP socket on {sip_addr}"))?;
+        std_sock
+            .set_nonblocking(true)
+            .context("gb28181: set_nonblocking on SIP socket")?;
+        let notifier_std_sock = std_sock
+            .try_clone()
+            .context("gb28181: clone SIP socket for notifier")?;
+        let sip_socket = UdpSocket::from_std(std_sock)?;
         self.sip_socket = Some(Arc::new(sip_socket));
+        self.notifier_std_sock = Some(std::sync::Arc::new(notifier_std_sock));
         self.run_bound().await
     }
 
@@ -560,6 +608,20 @@ impl Gb28181Server {
             .sip_socket
             .clone()
             .ok_or_else(|| anyhow::anyhow!("gb28181: SIP socket not bound"))?;
+
+        // SUBSCRIBE/NOTIFY (issue #57): give the host-facing notifier the
+        // sending context before the loop starts answering SUBSCRIBEs.
+        // The std clone keeps NOTIFY sends blocking-safe from any host
+        // thread (tokio's try_send_to would return WouldBlock off-runtime).
+        self.notifier.bind(
+            self.notifier_std_sock.clone().unwrap_or_else(|| {
+                Arc::new(std::net::UdpSocket::bind("0.0.0.0:0").expect("fallback notifier socket"))
+            }),
+            self.config.device_id.clone(),
+            self.config.sip_domain.clone(),
+            local_ip.clone(),
+            local_sip_port,
+        );
 
         // Create SIP device client (User-Agent from config; neutral default).
         let mut sip_client = SipDeviceClient::new(
@@ -946,7 +1008,11 @@ impl Gb28181Server {
             Some(SipMethod::Info) => {
                 self.handle_info(msg, peer_addr).await?;
             }
-            Some(SipMethod::Subscribe) | Some(SipMethod::Notify) | Some(SipMethod::Options) => {
+            Some(SipMethod::Subscribe) => {
+                let response = self.handle_subscribe(msg, peer_addr)?;
+                self.send_sip_message(&response, peer_addr).await?;
+            }
+            Some(SipMethod::Notify) | Some(SipMethod::Options) => {
                 log::warn!(
                     "gb28181: received {}, responding 200 OK",
                     msg.method.map(|m| m.to_string()).unwrap_or_default()
@@ -1708,6 +1774,93 @@ impl Gb28181Server {
     /// Always answers 200 OK. If a playback session is active, the parsed
     /// control is forwarded to its task; otherwise (live session or none) it
     /// is a logged no-op.
+    /// Answers an inbound SUBSCRIBE (issue #57): supported subjects
+    /// (Catalog / Alarm / MobilePosition) are booked with their dialog
+    /// snapshot and refreshed on re-SUBSCRIBE; every subject answers
+    /// 200 OK with the request's `Expires` echoed (unknown subjects stay
+    /// answered-but-unbooked — legacy-platform safe). A MobilePosition
+    /// subscription with an installed position source also starts (or
+    /// re-cadences) the periodic report task on the SUBSCRIBE's
+    /// `Interval` (default 5s).
+    fn handle_subscribe(&mut self, msg: &SipMessage, peer_addr: SocketAddr) -> Result<SipMessage> {
+        let event_str = msg
+            .get_header("Event")
+            .map(str::to_string)
+            .or_else(|| {
+                // Some platforms only carry the subject in the body's
+                // CmdType (the SUBSCRIBE body mirrors the MANSCDP form).
+                crate::manscdp::parse_query_dual(&msg.body).map(|q| q.cmd_type)
+            })
+            .unwrap_or_default();
+        let expires = msg
+            .get_header("Expires")
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(3600);
+
+        if let Some(event) = crate::subscribe::SubscribeEvent::parse(&event_str) {
+            let from = msg.get_header("From").unwrap_or_default().to_string();
+            let to = msg.get_header("To").unwrap_or_default().to_string();
+            let call_id = msg.get_header("Call-ID").unwrap_or_default().to_string();
+            let cseq = msg
+                .get_header("CSeq")
+                .and_then(|c| c.split_whitespace().next())
+                .and_then(|c| c.parse::<u32>().ok())
+                .unwrap_or(1);
+            self.notifier
+                .registry()
+                .upsert(event, expires, peer_addr, from, to, call_id, cseq);
+            log::info!(
+                "gb28181: SUBSCRIBE {event_str} booked (expires {expires}s) from {peer_addr}"
+            );
+
+            if event == crate::subscribe::SubscribeEvent::MobilePosition
+                && self.position_source.is_some()
+            {
+                let interval = crate::subscribe::parse_subscribe_interval(&msg.body).unwrap_or(5);
+                self.spawn_position_task(interval);
+            }
+        } else {
+            log::warn!(
+                "gb28181: SUBSCRIBE with unsupported Event {event_str:?} — answered, not booked"
+            );
+        }
+
+        let mut response = build_error_response(msg, 200, "OK");
+        if let Some(exp) = msg.get_header("Expires") {
+            response
+                .headers
+                .push(("Expires".to_string(), exp.trim().to_string()));
+        }
+        Ok(response)
+    }
+
+    /// Periodic MobilePosition reports while the subscription is live.
+    fn spawn_position_task(&mut self, interval_secs: u64) {
+        // One task at a time: a fresh SUBSCRIBE re-cadences by replacing
+        // the sender (the old task exits on the closed channel).
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        if let Some(old) = self.position_cancel.take() {
+            let _ = old.try_send(());
+        }
+        self.position_cancel = Some(tx);
+        let notifier = Arc::clone(&self.notifier);
+        let source = self.position_source.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(interval_secs.max(1))) => {}
+                    _ = rx.recv() => break,
+                }
+                if !notifier.subscribed(crate::subscribe::SubscribeEvent::MobilePosition) {
+                    continue;
+                }
+                if let Some(report) = source.as_ref().and_then(|s| s.current_position()) {
+                    notifier.send_mobile_position(&report);
+                }
+            }
+        });
+    }
+
     async fn handle_info(&mut self, msg: &SipMessage, peer_addr: SocketAddr) -> Result<()> {
         let ok_response = build_error_response(msg, 200, "OK");
         self.send_sip_message(&ok_response, peer_addr).await?;
@@ -2262,6 +2415,10 @@ async fn handle_tcp_connection(
         // DeviceControl dispatch over TCP is a follow-up (issue #58);
         // controls keep the reject path here.
         control_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
     };
 
     // Create SIP device client (User-Agent from config; neutral default)
@@ -2895,6 +3052,10 @@ async fn test_recordinfo_dispatch_with_source() {
         authenticator: None,
         snapshot_executor: None,
         control_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
     };
 
     // Query times are derived from the segment's own ms via the same
@@ -2942,6 +3103,103 @@ async fn test_recordinfo_dispatch_with_source() {
     assert!(response.body.contains("<Type>time</Type>"));
 }
 
+/// SUBSCRIBE handling (issue #57): supported subjects are booked and the
+/// 200 OK echoes the request's Expires; unsupported subjects are answered
+/// but not booked; renewal refreshes.
+#[tokio::test]
+async fn test_subscribe_books_and_echoes_expires() {
+    let config = Gb28181Config {
+        enabled: true,
+        platform_sip_address: "127.0.0.1".to_string(),
+        platform_sip_port: 5060,
+        device_id: "34020000001320000001".to_string(),
+        channel_id: "34020000001320000001".to_string(),
+        sip_domain: "3402000000".to_string(),
+        password: "12345678".to_string(),
+        local_sip_port: 5060,
+        register_interval_secs: 60,
+        heartbeat_interval_secs: 60,
+        heartbeat_timeout_count: 3,
+        transport: Transport::Udp,
+        ..Gb28181Config::default()
+    };
+    let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+    let mut server = Gb28181Server {
+        config,
+        au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
+        sip_socket: Some(sip_socket),
+        tcp_conn: None,
+        media_socket: None,
+        media_tcp_conn: None,
+        media_task: None,
+        subscriber_id: None,
+        invite_info: None,
+        local_ip: "192.168.62.104".to_string(),
+        recording_index: None,
+        playback_ctl: None,
+        audio_sink: None,
+        authenticator: None,
+        snapshot_executor: None,
+        control_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
+    };
+
+    let sub = SipMessage {
+        start_line: "SUBSCRIBE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+        method: Some(SipMethod::Subscribe),
+        status_code: None,
+        uri: Some("sip:34020000001320000001@3402000000".to_string()),
+        version: "SIP/2.0".to_string(),
+        headers: vec![
+            ("Event".to_string(), "Alarm".to_string()),
+            ("Expires".to_string(), "1800".to_string()),
+            ("From".to_string(), "<sip:p@3402000000>;tag=x".to_string()),
+            (
+                "To".to_string(),
+                "<sip:34020000001320000001@3402000000>".to_string(),
+            ),
+            ("Call-ID".to_string(), "s-1".to_string()),
+            ("CSeq".to_string(), "1 SUBSCRIBE".to_string()),
+        ],
+        body: String::new(),
+    };
+    let resp = server
+        .handle_subscribe(&sub, "127.0.0.1:9".parse().unwrap())
+        .expect("handle_subscribe");
+    assert_eq!(resp.start_line, "SIP/2.0 200 OK");
+    assert!(resp.get_header("Expires").is_some_and(|v| v == "1800"));
+    assert!(server
+        .notifier
+        .subscribed(crate::subscribe::SubscribeEvent::Alarm));
+    assert!(!server
+        .notifier
+        .subscribed(crate::subscribe::SubscribeEvent::Catalog));
+
+    // Unsupported subject: answered, not booked.
+    let mut other = sub.clone();
+    other.headers[0].1 = "Presence".to_string();
+    let resp = server
+        .handle_subscribe(&other, "127.0.0.1:9".parse().unwrap())
+        .expect("handle_subscribe");
+    assert_eq!(resp.start_line, "SIP/2.0 200 OK");
+    assert!(!server
+        .notifier
+        .subscribed(crate::subscribe::SubscribeEvent::MobilePosition));
+
+    // Renewal keeps the event booked.
+    let resp = server
+        .handle_subscribe(&sub, "127.0.0.1:9".parse().unwrap())
+        .expect("handle_subscribe");
+    assert_eq!(resp.start_line, "SIP/2.0 200 OK");
+    assert!(server
+        .notifier
+        .subscribed(crate::subscribe::SubscribeEvent::Alarm));
+}
+
 /// GB/T 28181-2022 information queries (A.2.4.10-14) must answer with
 /// the minimal valid Response (issue #59) — previously they fell through
 /// to the unknown-CmdType warn + silence.
@@ -2981,6 +3239,10 @@ async fn test_gb2022_information_queries_dispatch() {
         authenticator: None,
         snapshot_executor: None,
         control_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
     };
 
     for (cmd_type, body, want) in [
@@ -3048,6 +3310,10 @@ async fn test_recordinfo_dispatch_without_source() {
         authenticator: None,
         snapshot_executor: None,
         control_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
     };
 
     let body = "<Query><CmdType>RecordInfo</CmdType><SN>9</SN><DeviceID>34020000001320000001</DeviceID><StartTime>2026-08-15T14:00:00</StartTime><EndTime>2026-08-15T15:00:00</EndTime></Query>";
@@ -3112,6 +3378,10 @@ async fn test_playback_invite_empty_range_returns_488() {
         authenticator: None,
         snapshot_executor: None,
         control_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786807800\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -3206,6 +3476,10 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         authenticator: None,
         snapshot_executor: None,
         control_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
     };
 
     let body = "v=0\r\no=- 0 0 IN IP4 192.168.63.197\r\ns=Playback\r\nc=IN IP4 192.168.63.197\r\nt=1786804200 1786804500\r\nm=video 10000 RTP/AVP 96\r\ny=12345\r\n";
@@ -3297,6 +3571,10 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         authenticator: None,
         snapshot_executor: None,
         control_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
     };
     let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
     let peer_addr = peer.local_addr().expect("peer addr");
@@ -3448,6 +3726,10 @@ async fn test_info_playback_control_live_session_noop() {
         authenticator: None,
         snapshot_executor: None,
         control_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
     };
 
     let body = "<Control><CmdType>PlaybackControl</CmdType><SN>1</SN><DeviceID>34020000001320000001</DeviceID><Info><ControlValue>PAUSE</ControlValue></Info></Control>";
@@ -3542,6 +3824,10 @@ mod tcp_media_tests {
             authenticator: None,
             snapshot_executor: None,
             control_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
         };
 
         // Platform stand-in: TCP listener on an ephemeral port.
@@ -3672,6 +3958,10 @@ mod tcp_media_tests {
             authenticator: None,
             snapshot_executor: None,
             control_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
         };
 
         let body = "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=video 9 TCP/RTP/AVP 96\r\na=setup:active\r\ny=2000000001\r\n";
@@ -3754,6 +4044,10 @@ mod tcp_media_tests {
             authenticator: None,
             snapshot_executor: None,
             control_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
             metrics: Arc::new(crate::metrics::NoopMetrics),
         };
 
@@ -3884,6 +4178,10 @@ mod tcp_media_tests {
             authenticator: None,
             snapshot_executor: None,
             control_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
         };
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         let peer_addr = peer.local_addr().expect("peer addr");
@@ -3947,6 +4245,10 @@ mod tcp_media_tests {
             authenticator: None,
             snapshot_executor: None,
             control_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
         };
         let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
         let peer_addr = peer.local_addr().expect("peer addr");
@@ -4075,6 +4377,10 @@ mod tcp_media_tests {
             authenticator: None,
             snapshot_executor: None,
             control_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
         }
     }
 
