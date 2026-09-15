@@ -467,9 +467,167 @@ pub fn build_upload_snapshot_finished(
 // issue #58). The family shares one `<Control><CmdType>DeviceControl…`
 // body with exactly one sub-command child element. DragZoom (2022 拉框
 // 放大/缩小) is deferred until its wire form is verified against the
-// standard text; PTZCmd passes through as raw A.3/A505 hex — bit-level
-// decode is tracked in issue #57.
+// standard text; PTZCmd is bit-level decoded (§A.3-A.4, issue #57) —
+// [`parse_ptz_command`] is the byte-exact inverse of the gb28181-go
+// platform builders, and the golden hex table is shared across the
+// twins.
 // ---------------------------------------------------------------------------
+
+/// PTZ direction bits (§A.4, byte 4 of the A5 0F command). Diagonals
+/// combine two axis bits; zoom rides the high bits of the same byte.
+pub const PTZ_RIGHT: u8 = 0x01;
+pub const PTZ_LEFT: u8 = 0x02;
+pub const PTZ_DOWN: u8 = 0x04;
+pub const PTZ_UP: u8 = 0x08;
+pub const PTZ_ZOOM_IN: u8 = 0x10;
+pub const PTZ_ZOOM_OUT: u8 = 0x20;
+
+/// FI lens action bits (§A.3.3 表 A.6 — low nibble of byte 4, which the
+/// gb28181-go builders OR with 0x40).
+pub const PTZ_FOCUS_FAR: u8 = 0x01;
+pub const PTZ_FOCUS_NEAR: u8 = 0x02;
+pub const PTZ_IRIS_OPEN: u8 = 0x04;
+pub const PTZ_IRIS_CLOSE: u8 = 0x08;
+
+/// §A.3.4 preset instruction (byte 4 = 0x81/0x82/0x83).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtzPresetAction {
+    /// 设置预置位 (0x81).
+    Set,
+    /// 调用预置位 (0x82).
+    Call,
+    /// 删除预置位 (0x83).
+    Delete,
+}
+
+/// §A.3.5 cruise instruction (byte 4 = 0x84-0x88).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PtzCruiseAction {
+    /// 加入巡航点 (0x84).
+    AddPoint,
+    /// 删除巡航点 (0x85).
+    DelPoint,
+    /// 设置巡航速度 (0x86).
+    Speed,
+    /// 设置巡航停留时间 (0x87).
+    StayTime,
+    /// 开始巡航 (0x88).
+    Start,
+}
+
+/// A bit-level decoded PTZCmd (GB/T 28181 §A.3-A.4, issue #57): the
+/// 8-byte `A5 0F` command. Structurally invalid input (hex length,
+/// missing A5 start byte, checksum mismatch) surfaces as
+/// [`PtzCommand::Invalid`] with the raw string preserved — the decode is
+/// total and hosts keep seeing everything the platform sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PtzCommand {
+    /// §A.4 pan/tilt/zoom: direction bits (0 = stop) and the per-axis
+    /// speeds of the acting axes (0x00-0xFF slow→fast).
+    Move {
+        /// Direction bits — combine [`PTZ_UP`], [`PTZ_LEFT`], … .
+        bits: u8,
+        pan_speed: u8,
+        tilt_speed: u8,
+        zoom_speed: u8,
+    },
+    /// §A.3.4 preset set/call/delete; the number (1-255) rides in byte 7.
+    Preset { action: PtzPresetAction, preset: u8 },
+    /// §A.3.5 cruise: group in byte 5, value (preset/speed/stay) in
+    /// byte 7.
+    Cruise {
+        action: PtzCruiseAction,
+        group: u8,
+        value: u8,
+    },
+    /// §A.3.3 FI focus/iris: action bits (low nibble of byte 4 | 0x40)
+    /// and the focus/iris speeds in bytes 5/6.
+    Lens {
+        bits: u8,
+        focus_speed: u8,
+        iris_speed: u8,
+    },
+    /// §A.3.7 auxiliary switch (wiper/light): number in byte 5.
+    AuxSwitch { number: u8, on: bool },
+    /// Structurally valid but unrecognized instruction code; data bytes
+    /// 5-7 preserved for vendor extensions.
+    Unknown { code: u8, data: [u8; 3] },
+    /// Undecodable as an 8-byte A5 command; `raw` is the input as
+    /// received (trimmed).
+    Invalid { raw: String },
+}
+
+impl PtzCommand {
+    /// Whether the command is a §A.4 stop (a Move with no direction
+    /// bits set).
+    #[must_use]
+    pub fn is_stop(&self) -> bool {
+        matches!(self, Self::Move { bits: 0, .. })
+    }
+}
+
+/// Decodes the `<PTZCmd>` hex payload into a structured [`PtzCommand`].
+/// Total — never fails: undecodable input yields [`PtzCommand::Invalid`].
+/// Bytes 2-3 (the `0F` combination byte and the address) vary across
+/// vendors and only feed the checksum.
+#[must_use]
+pub fn parse_ptz_command(a505_hex: &str) -> PtzCommand {
+    let trimmed = a505_hex.trim();
+    let invalid = || PtzCommand::Invalid {
+        raw: trimmed.to_string(),
+    };
+    let Ok(raw) = hex::decode(trimmed) else {
+        return invalid();
+    };
+    if raw.len() != 8 || raw[0] != 0xA5 {
+        return invalid();
+    }
+    let sum = raw[..7].iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+    if sum != raw[7] {
+        return invalid();
+    }
+    let code = raw[3];
+    match code {
+        0x00..=0x3F => PtzCommand::Move {
+            bits: code,
+            pan_speed: raw[4],
+            tilt_speed: raw[5],
+            zoom_speed: raw[6],
+        },
+        0x40..=0x4F => PtzCommand::Lens {
+            bits: code & 0x0F,
+            focus_speed: raw[4],
+            iris_speed: raw[5],
+        },
+        0x81..=0x83 => PtzCommand::Preset {
+            action: match code {
+                0x81 => PtzPresetAction::Set,
+                0x82 => PtzPresetAction::Call,
+                _ => PtzPresetAction::Delete,
+            },
+            preset: raw[6],
+        },
+        0x84..=0x88 => PtzCommand::Cruise {
+            action: match code {
+                0x84 => PtzCruiseAction::AddPoint,
+                0x85 => PtzCruiseAction::DelPoint,
+                0x86 => PtzCruiseAction::Speed,
+                0x87 => PtzCruiseAction::StayTime,
+                _ => PtzCruiseAction::Start,
+            },
+            group: raw[4],
+            value: raw[6],
+        },
+        0x8C | 0x8D => PtzCommand::AuxSwitch {
+            number: raw[4],
+            on: code == 0x8C,
+        },
+        _ => PtzCommand::Unknown {
+            code,
+            data: [raw[4], raw[5], raw[6]],
+        },
+    }
+}
 
 /// A decoded DeviceControl sub-command (issue #58).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -486,8 +644,9 @@ pub enum DeviceControlKind {
     ResetAlarm,
     /// `<TeleBoot>Boot</TeleBoot>` — remote restart.
     TeleBoot,
-    /// `<PTZCmd>` — A.3 A505 command, raw hex passthrough (#57 decodes).
-    Ptz(String),
+    /// `<PTZCmd>` — A.3/A.4 command, bit-level decoded ([`PtzCommand`],
+    /// issue #57).
+    Ptz(PtzCommand),
 }
 
 /// An inbound DeviceControl body with a recognized sub-command.
@@ -580,7 +739,8 @@ pub fn parse_device_control(body: &str) -> Option<DeviceControl> {
             _ => None,
         }
     } else {
-        c.ptz_cmd.map(DeviceControlKind::Ptz)
+        c.ptz_cmd
+            .map(|hex| DeviceControlKind::Ptz(parse_ptz_command(&hex)))
     }?;
     Some(DeviceControl {
         sn: c.sn,
@@ -716,11 +876,304 @@ mod tests {
     }
 
     #[test]
-    fn device_control_ptz_cmd_passthrough() {
-        // A.3 A505 command carried verbatim; bit-level decode is #57.
+    fn device_control_ptz_cmd_decodes() {
+        // A.3/A.4 command, bit-level decoded (#57).
+        let c = parse_device_control(&control_body("<PTZCmd>A50F0102200000D7</PTZCmd>"))
+            .expect("PTZCmd must parse");
+        assert_eq!(
+            c.kind,
+            DeviceControlKind::Ptz(PtzCommand::Move {
+                bits: PTZ_LEFT,
+                pan_speed: 0x20,
+                tilt_speed: 0,
+                zoom_speed: 0
+            })
+        );
+        // Undecodable hex still parses into a control — delivered as
+        // Invalid with the raw string preserved (no reject path).
         let c = parse_device_control(&control_body("<PTZCmd>A50F01021F00</PTZCmd>"))
-            .expect("PTZCmd must pass through");
-        assert_eq!(c.kind, DeviceControlKind::Ptz("A50F01021F00".to_string()));
+            .expect("PTZCmd must parse");
+        assert_eq!(
+            c.kind,
+            DeviceControlKind::Ptz(PtzCommand::Invalid {
+                raw: "A50F01021F00".to_string()
+            })
+        );
+    }
+
+    /// Golden hex table — the byte-exact outputs of the gb28181-go
+    /// platform builders (BuildPTZCommand / preset / cruise / FI / aux,
+    /// GB/T 28181 §A.3-A.4). The same table pins the Go twin
+    /// (device.DecodePTZCommand); keep both in sync.
+    #[test]
+    fn parse_ptz_command_goldens() {
+        let cases: &[(&str, PtzCommand)] = &[
+            // BuildPTZCommand(direction, 0x20).
+            (
+                "A50F0100000000B5",
+                PtzCommand::Move {
+                    bits: 0,
+                    pan_speed: 0,
+                    tilt_speed: 0,
+                    zoom_speed: 0,
+                },
+            ),
+            (
+                "A50F0108002000DD",
+                PtzCommand::Move {
+                    bits: PTZ_UP,
+                    pan_speed: 0,
+                    tilt_speed: 0x20,
+                    zoom_speed: 0,
+                },
+            ),
+            (
+                "A50F0104002000D9",
+                PtzCommand::Move {
+                    bits: PTZ_DOWN,
+                    pan_speed: 0,
+                    tilt_speed: 0x20,
+                    zoom_speed: 0,
+                },
+            ),
+            (
+                "A50F0102200000D7",
+                PtzCommand::Move {
+                    bits: PTZ_LEFT,
+                    pan_speed: 0x20,
+                    tilt_speed: 0,
+                    zoom_speed: 0,
+                },
+            ),
+            (
+                "A50F0101200000D6",
+                PtzCommand::Move {
+                    bits: PTZ_RIGHT,
+                    pan_speed: 0x20,
+                    tilt_speed: 0,
+                    zoom_speed: 0,
+                },
+            ),
+            (
+                "A50F010A202000FF",
+                PtzCommand::Move {
+                    bits: PTZ_UP | PTZ_LEFT,
+                    pan_speed: 0x20,
+                    tilt_speed: 0x20,
+                    zoom_speed: 0,
+                },
+            ),
+            (
+                "A50F0109202000FE",
+                PtzCommand::Move {
+                    bits: PTZ_UP | PTZ_RIGHT,
+                    pan_speed: 0x20,
+                    tilt_speed: 0x20,
+                    zoom_speed: 0,
+                },
+            ),
+            (
+                "A50F0106202000FB",
+                PtzCommand::Move {
+                    bits: PTZ_DOWN | PTZ_LEFT,
+                    pan_speed: 0x20,
+                    tilt_speed: 0x20,
+                    zoom_speed: 0,
+                },
+            ),
+            (
+                "A50F0105202000FA",
+                PtzCommand::Move {
+                    bits: PTZ_DOWN | PTZ_RIGHT,
+                    pan_speed: 0x20,
+                    tilt_speed: 0x20,
+                    zoom_speed: 0,
+                },
+            ),
+            (
+                "A50F0110000020E5",
+                PtzCommand::Move {
+                    bits: PTZ_ZOOM_IN,
+                    pan_speed: 0,
+                    tilt_speed: 0,
+                    zoom_speed: 0x20,
+                },
+            ),
+            (
+                "A50F0120000020F5",
+                PtzCommand::Move {
+                    bits: PTZ_ZOOM_OUT,
+                    pan_speed: 0,
+                    tilt_speed: 0,
+                    zoom_speed: 0x20,
+                },
+            ),
+            // BuildPTZPresetCommand(action, 5).
+            (
+                "A50F01810000053B",
+                PtzCommand::Preset {
+                    action: PtzPresetAction::Set,
+                    preset: 5,
+                },
+            ),
+            (
+                "A50F01820000053C",
+                PtzCommand::Preset {
+                    action: PtzPresetAction::Call,
+                    preset: 5,
+                },
+            ),
+            (
+                "A50F01830000053D",
+                PtzCommand::Preset {
+                    action: PtzPresetAction::Delete,
+                    preset: 5,
+                },
+            ),
+            // BuildPTZCruiseCommand(action, 2, 7).
+            (
+                "A50F018402000742",
+                PtzCommand::Cruise {
+                    action: PtzCruiseAction::AddPoint,
+                    group: 2,
+                    value: 7,
+                },
+            ),
+            (
+                "A50F018502000743",
+                PtzCommand::Cruise {
+                    action: PtzCruiseAction::DelPoint,
+                    group: 2,
+                    value: 7,
+                },
+            ),
+            (
+                "A50F018602000744",
+                PtzCommand::Cruise {
+                    action: PtzCruiseAction::Speed,
+                    group: 2,
+                    value: 7,
+                },
+            ),
+            (
+                "A50F018702000745",
+                PtzCommand::Cruise {
+                    action: PtzCruiseAction::StayTime,
+                    group: 2,
+                    value: 7,
+                },
+            ),
+            (
+                "A50F018802000746",
+                PtzCommand::Cruise {
+                    action: PtzCruiseAction::Start,
+                    group: 2,
+                    value: 7,
+                },
+            ),
+            // BuildFICommand(action, 0x40), §A.3.3.
+            (
+                "A50F01480040003D",
+                PtzCommand::Lens {
+                    bits: PTZ_IRIS_CLOSE,
+                    focus_speed: 0,
+                    iris_speed: 0x40,
+                },
+            ),
+            (
+                "A50F014400400039",
+                PtzCommand::Lens {
+                    bits: PTZ_IRIS_OPEN,
+                    focus_speed: 0,
+                    iris_speed: 0x40,
+                },
+            ),
+            (
+                "A50F014240000037",
+                PtzCommand::Lens {
+                    bits: PTZ_FOCUS_NEAR,
+                    focus_speed: 0x40,
+                    iris_speed: 0,
+                },
+            ),
+            (
+                "A50F014140000036",
+                PtzCommand::Lens {
+                    bits: PTZ_FOCUS_FAR,
+                    focus_speed: 0x40,
+                    iris_speed: 0,
+                },
+            ),
+            (
+                "A50F0140000000F5",
+                PtzCommand::Lens {
+                    bits: 0,
+                    focus_speed: 0,
+                    iris_speed: 0,
+                },
+            ),
+            // BuildAuxSwitchCommand(1, on), §A.3.7.
+            (
+                "A50F018C01000042",
+                PtzCommand::AuxSwitch {
+                    number: 1,
+                    on: true,
+                },
+            ),
+            (
+                "A50F018D01000043",
+                PtzCommand::AuxSwitch {
+                    number: 1,
+                    on: false,
+                },
+            ),
+        ];
+        for (hex, want) in cases {
+            let got = parse_ptz_command(hex);
+            assert_eq!(&got, want, "golden {hex}");
+            if let PtzCommand::Move { bits, .. } = want {
+                assert_eq!(got.is_stop(), *bits == 0, "is_stop for {hex}");
+            }
+        }
+    }
+
+    #[test]
+    fn parse_ptz_command_invalid_and_unknown() {
+        for bad in [
+            "A50F01",
+            "A50F0100000000B500",
+            "A50F0100000000B",
+            "ZZ0F0100000000B5",
+            "950F0100000000B5",
+            "A50F0100000000FF",
+        ] {
+            assert_eq!(
+                parse_ptz_command(bad),
+                PtzCommand::Invalid {
+                    raw: bad.to_string()
+                },
+                "input {bad}"
+            );
+        }
+        // Lowercase hex accepted; surrounding whitespace trimmed.
+        assert_eq!(
+            parse_ptz_command(" a50f0108002000dd "),
+            PtzCommand::Move {
+                bits: PTZ_UP,
+                pan_speed: 0,
+                tilt_speed: 0x20,
+                zoom_speed: 0
+            }
+        );
+        // Structurally valid, unrecognized instruction code → Unknown
+        // with the data bytes (checksum: A5+0F+01+99+11+22+33 = 0xB4).
+        assert_eq!(
+            parse_ptz_command("A50F0199112233B4"),
+            PtzCommand::Unknown {
+                code: 0x99,
+                data: [0x11, 0x22, 0x33]
+            }
+        );
     }
 
     #[test]
