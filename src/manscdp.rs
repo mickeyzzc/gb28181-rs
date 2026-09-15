@@ -44,6 +44,10 @@ pub struct Query {
         deserialize_with = "empty_string_as_none"
     )]
     pub stream_type: Option<String>,
+    /// Cruise-track index for the 2022 CruiseTrackQuery (A.2.4.12),
+    /// echoed in the response's `<Number>`.
+    #[serde(rename = "Number", default, deserialize_with = "empty_string_as_none")]
+    pub number: Option<String>,
 }
 
 /// Query in attribute format — older platforms put CmdType/SN/DeviceID on the
@@ -211,6 +215,7 @@ pub(crate) fn parse_query_dual(body: &str) -> Option<Query> {
                 end_time: qa.end_time,
                 r#type: qa.r#type,
                 stream_type: qa.stream_type,
+                number: None,
             });
         }
     }

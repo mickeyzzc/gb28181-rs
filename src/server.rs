@@ -1130,6 +1130,30 @@ impl Gb28181Server {
                 )?;
                 Ok(Some(response))
             }
+            "HomePositionQuery"
+            | "CruiseTrackListQuery"
+            | "CruiseTrackQuery"
+            | "PTZPosition"
+            | "SDCardStatus" => {
+                // GB/T 28181-2022 information queries (A.2.4.10-14):
+                // answer with the minimal valid Response (A.2.6.12-16).
+                // This device has no PTZ hardware, cruise tracks or
+                // storage card, so every optional block is omitted and
+                // required SumNum fields are zero — previously these fell
+                // through to the unknown-CmdType warn + silence.
+                // Semantics and goldens mirror gb28181-go #78 (issue #59).
+                let response = super::client::build_gb2022_query_response(
+                    &query.cmd_type,
+                    &query.sn,
+                    &query.device_id,
+                    query.number.as_deref(),
+                    &self.config.sip_domain,
+                    &self.local_ip,
+                    self.config.local_sip_port,
+                    cseq,
+                )?;
+                Ok(Some(response))
+            }
             "DeviceControl" | "Broadcast" | "DeviceConfig" | "HomePosition" => {
                 log::warn!("gb28181: control command not supported: {}", query.cmd_type);
                 let response = super::client::build_control_reject_response(
@@ -2916,6 +2940,74 @@ async fn test_recordinfo_dispatch_with_source() {
         .body
         .contains("<Address>34020000001320000001</Address>"));
     assert!(response.body.contains("<Type>time</Type>"));
+}
+
+/// GB/T 28181-2022 information queries (A.2.4.10-14) must answer with
+/// the minimal valid Response (issue #59) — previously they fell through
+/// to the unknown-CmdType warn + silence.
+#[tokio::test]
+async fn test_gb2022_information_queries_dispatch() {
+    let config = Gb28181Config {
+        enabled: true,
+        platform_sip_address: "127.0.0.1".to_string(),
+        platform_sip_port: 5060,
+        device_id: "34020000001320000001".to_string(),
+        channel_id: "34020000001320000001".to_string(),
+        sip_domain: "3402000000".to_string(),
+        password: "12345678".to_string(),
+        local_sip_port: 5060,
+        register_interval_secs: 60,
+        heartbeat_interval_secs: 60,
+        heartbeat_timeout_count: 3,
+        transport: Transport::Udp,
+        ..Gb28181Config::default()
+    };
+    let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+    let server = Gb28181Server {
+        config,
+        au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
+        sip_socket: Some(sip_socket),
+        tcp_conn: None,
+        media_socket: None,
+        media_tcp_conn: None,
+        media_task: None,
+        subscriber_id: None,
+        invite_info: None,
+        local_ip: "192.168.62.104".to_string(),
+        recording_index: None,
+        playback_ctl: None,
+        audio_sink: None,
+        authenticator: None,
+        snapshot_executor: None,
+        control_handler: None,
+    };
+
+    for (cmd_type, body, want) in [
+        ("HomePositionQuery", "<Query><CmdType>HomePositionQuery</CmdType><SN>61</SN><DeviceID>34020000001320000001</DeviceID></Query>", "<Response CmdType=\"HomePositionQuery\" SN=\"61\">"),
+        ("CruiseTrackListQuery", "<Query><CmdType>CruiseTrackListQuery</CmdType><SN>62</SN><DeviceID>34020000001320000001</DeviceID></Query>", "<SumNum>0</SumNum>"),
+        ("CruiseTrackQuery", "<Query><CmdType>CruiseTrackQuery</CmdType><SN>63</SN><DeviceID>34020000001320000001</DeviceID><Number>1</Number></Query>", "<SumNum>0</SumNum><Number>1</Number>"),
+        ("PTZPosition", "<Query><CmdType>PTZPosition</CmdType><SN>64</SN><DeviceID>34020000001320000001</DeviceID></Query>", "<Response CmdType=\"PTZPosition\" SN=\"64\">"),
+        ("SDCardStatus", "<Query><CmdType>SDCardStatus</CmdType><SN>65</SN><DeviceID>34020000001320000001</DeviceID></Query>", "<SumNum>0</SumNum>"),
+    ] {
+        let msg = SipMessage {
+            start_line: "MESSAGE sip:3402000000@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Message),
+            status_code: None,
+            uri: Some("sip:3402000000@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![(
+                "Content-Type".to_string(),
+                "Application/MANSCDP+xml".to_string(),
+            )],
+            body: body.to_string(),
+        };
+        let response = server
+            .build_query_response(&msg)
+            .expect("dispatch should succeed")
+            .unwrap_or_else(|| panic!("{cmd_type} must produce a response"));
+        assert!(response.body.contains(want), "{cmd_type} body: {}", response.body);
+    }
 }
 
 /// Without a recording source, a RecordInfo query yields the empty golden

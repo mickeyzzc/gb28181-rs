@@ -16,6 +16,7 @@
 - **SIP 信令** —— 手写 GB/T 28181 子集的解析/序列化（REGISTER + 摘要认证、INVITE、MESSAGE、BYE、ACK、OPTIONS），支持 UDP 与 TCP
 - **注册生命周期** —— 401 摘要挑战（MD5 + SHA-256，qop=auth）、周期性重注册、保活心跳与超时判定
 - **MANSCDP XML** —— Catalog / DeviceInfo / DeviceStatus / RecordInfo / Keepalive，元素与属性双形式；入站报文接受 UTF-8 **或** GB2312/GBK/GB18030，出站声明 GB2312 的报文按声明正确编码
+- **GB/T 28181-2022 信息查询** —— HomePositionQuery / CruiseTrackListQuery / CruiseTrackQuery / PTZPosition / SDCardStatus 以最小合规 Response 应答（A.2.4.10-14 / A.2.6.12-16）：必需的 `SumNum` 置零、可选能力块全部省略、CruiseTrackQuery 轨道号回显——语义与 golden 对齐 gb28181-go #78
 - **媒体推送** —— H.264/H.265 NALU → MPEG-2 PS → RTP（UDP + RTP over TCP 封帧），SSRC 处理，大帧有界 PES 分片；RTP 时间戳取自真实采集时间（任意帧率）
 - **DeviceControl 子命令**（2016 §9.3.2 / 2022 §9.3）—— `IFrameCmd` 强制 I 帧（平台起流/丢包恢复时常发）、`RecordCmd`（Record/StopRecord）、`GuardCmd`（SetGuard/ResetGuard）、`AlarmCmd`（ResetAlarm）、`TeleBoot`（Boot）与 `PTZCmd`（A.3/A505 原样透传）从同一 Control 体解码，经 `DeviceControlHandler` 宿主接缝回调（默认全 no-op，按硬件能力按需实现）；未识别子命令保持合规的 control reject。UDP 传输；DragZoom 待核验 2022 线格式后再解码
 - **语音对讲（接收侧）** —— audio-only INVITE（GB/T 28181-2022 §9.2）：临时端口接收 G.711 A/μ 律 RTP 并交付 `AudioTalkbackSink`（闭包即用；重写 `on_audio_codec` 可同时拿到协商出的 A 律/μ 律制式）。兼容真实平台的 offer 形态——仅 payload type 不带 `a=rtpmap` 的 PCMA、`y=` 前导零十进制 SSRC（由生产抓包逐字节 golden 用例锁定）；非 G.711 或未注册 sink 的 offer 以 488 拒绝
