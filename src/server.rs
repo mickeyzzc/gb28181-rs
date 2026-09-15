@@ -148,9 +148,12 @@ pub trait DeviceControlHandler: Send + Sync {
     /// reboot behind an explicit host opt-in; the default no-op makes the
     /// command a safe ack-only.
     fn on_teleboot(&self) {}
-    /// `<PTZCmd>` — raw A.3/A505 hex string; bit-level decode stays with
-    /// the host until #57 lands a shared decoder.
-    fn on_ptz(&self, _a505_hex: &str) {}
+    /// `<PTZCmd>` — A.3/A.4 command, bit-level decoded
+    /// ([`crate::manscdp::PtzCommand`], #57): movement direction/speed
+    /// bits, presets, cruise, FI lens, auxiliary switches. Undecodable
+    /// hex arrives as `PtzCommand::Invalid` with the raw string
+    /// preserved.
+    fn on_ptz(&self, _cmd: &crate::manscdp::PtzCommand) {}
 }
 
 /// Executes a decoded DeviceControl against the installed handler.
@@ -165,7 +168,7 @@ fn dispatch_device_control(
         DeviceControlKind::Guard(arm) => handler.on_guard(*arm),
         DeviceControlKind::ResetAlarm => handler.on_reset_alarm(),
         DeviceControlKind::TeleBoot => handler.on_teleboot(),
-        DeviceControlKind::Ptz(hex) => handler.on_ptz(hex),
+        DeviceControlKind::Ptz(cmd) => handler.on_ptz(cmd),
     }
 }
 
@@ -2564,8 +2567,8 @@ mod tests {
         fn on_teleboot(&self) {
             self.0.lock().unwrap().push("boot".into());
         }
-        fn on_ptz(&self, a505_hex: &str) {
-            self.0.lock().unwrap().push(format!("ptz:{a505_hex}"));
+        fn on_ptz(&self, cmd: &crate::manscdp::PtzCommand) {
+            self.0.lock().unwrap().push(format!("ptz:{cmd:?}"));
         }
     }
 
@@ -2620,9 +2623,17 @@ mod tests {
         assert_eq!(
             dispatch_of(
                 "<Control><CmdType>DeviceControl</CmdType><SN>1</SN>\
-                 <DeviceID>d</DeviceID><PTZCmd>A50F01</PTZCmd></Control>"
+                 <DeviceID>d</DeviceID><PTZCmd>A50F0102200000D7</PTZCmd></Control>"
             ),
-            vec!["ptz:A50F01".to_string()]
+            vec![format!(
+                "ptz:{:?}",
+                crate::manscdp::PtzCommand::Move {
+                    bits: crate::manscdp::PTZ_LEFT,
+                    pan_speed: 0x20,
+                    tilt_speed: 0,
+                    zoom_speed: 0
+                }
+            )]
         );
     }
 
