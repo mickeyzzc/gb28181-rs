@@ -68,6 +68,15 @@ pub struct Gb28181Config {
     /// `gb28181-rs/<version>` (never a product name).
     #[serde(default)]
     pub user_agent: Option<String>,
+    /// GB/T 28181-2022 Annex I X-GB-Ver: when set (conventionally
+    /// "3.0" = 2022, "2.0" = 2016), stamped as the `X-GB-Ver` header on
+    /// every REGISTER. The platform's version, when it answers with one,
+    /// is exposed via
+    /// [`ServerHandle::platform_protocol_version`](crate::ServerHandle::platform_protocol_version).
+    /// `None` (default) omits the header — byte-identical to the
+    /// pre-2022 wire form.
+    #[serde(default)]
+    pub protocol_version: Option<String>,
     /// Catalog/DeviceInfo `Name`. `None` → `Camera <device_id>`.
     #[serde(default)]
     pub device_name: Option<String>,
@@ -235,6 +244,7 @@ impl Default for Gb28181Config {
             transport: Transport::default(),
             incoming_note_policy: crate::authenticator::IncomingNotePolicy::default(),
             user_agent: None,
+            protocol_version: None,
             device_name: None,
             manufacturer: None,
             model: None,
