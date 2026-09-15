@@ -88,7 +88,10 @@ impl ServerHandle {
     /// (GB/T 28181-2022 Annex I). `None` when the platform never
     /// announced one.
     pub fn platform_protocol_version(&self) -> Option<String> {
-        self.platform_proto_ver.lock().unwrap().clone()
+        self.platform_proto_ver
+            .lock()
+            .expect("platform protocol version lock")
+            .clone()
     }
 }
 
@@ -899,7 +902,10 @@ impl Gb28181Server {
         let Some(ver) = resp.get_header("X-GB-Ver") else {
             return;
         };
-        let mut guard = self.platform_proto_ver.lock().unwrap();
+        let mut guard = self
+            .platform_proto_ver
+            .lock()
+            .expect("platform protocol version lock");
         if guard.as_deref() != Some(ver) {
             log::info!("gb28181: platform protocol version (X-GB-Ver): {ver}");
             *guard = Some(ver.to_string());
