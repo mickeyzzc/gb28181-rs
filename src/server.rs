@@ -60,6 +60,9 @@ pub struct ServerHandle {
     /// Platform X-GB-Ver as last seen on a REGISTER response (Annex I),
     /// shared with the server task.
     platform_proto_ver: Arc<std::sync::Mutex<Option<String>>>,
+    /// Platform clock from the REGISTER response's SIP Date header
+    /// (§9.10.2), shared with the server task.
+    platform_date: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
 impl ServerHandle {
@@ -92,6 +95,15 @@ impl ServerHandle {
             .lock()
             .expect("platform protocol version lock")
             .clone()
+    }
+
+    /// The platform clock as last carried by a REGISTER response's SIP
+    /// `Date` header (§9.10.2), Unix seconds — the device-side
+    /// time-sync source. `None` when no response carried a parseable
+    /// Date. Hosts compare against their own clock and decide (log the
+    /// drift, or discipline the clock on NTP-less deployments).
+    pub fn platform_date_unix(&self) -> Option<i64> {
+        *self.platform_date.lock().expect("platform date lock")
     }
 }
 
@@ -292,6 +304,9 @@ pub struct Gb28181Server {
     /// Platform X-GB-Ver as last seen on a REGISTER response (Annex I).
     /// Shared with the [`ServerHandle`] accessor.
     platform_proto_ver: Arc<std::sync::Mutex<Option<String>>>,
+    /// Platform clock as last carried by a REGISTER response's SIP Date
+    /// header (§9.10.2), Unix seconds. Shared with the handle accessor.
+    platform_date: Arc<std::sync::Mutex<Option<i64>>>,
     /// Device-side snapshot executor (A.2.1.24). `None` = control reject.
     snapshot_executor: Option<Arc<dyn crate::snapshot::SnapshotExecutor>>,
     /// DeviceControl sub-command handler (issue #58). `None` = recognized
@@ -429,6 +444,7 @@ impl Gb28181Server {
             audio_sink: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             config_handler: None,
@@ -603,6 +619,7 @@ impl Gb28181Server {
         self.config.check_example_defaults().ok();
 
         let platform_proto_ver = Arc::clone(&self.platform_proto_ver);
+        let platform_date = Arc::clone(&self.platform_date);
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let handle = tokio::spawn(async move {
             if let Err(e) = self.run_udp(&mut shutdown_rx).await {
@@ -614,6 +631,7 @@ impl Gb28181Server {
             task: handle,
             shutdown: shutdown_tx,
             platform_proto_ver,
+            platform_date,
         })
     }
 
@@ -629,6 +647,7 @@ impl Gb28181Server {
         let recording_index = self.recording_index;
         let audio_sink = self.audio_sink;
         let platform_proto_ver = Arc::clone(&self.platform_proto_ver);
+        let platform_date = Arc::clone(&self.platform_date);
 
         let handle = tokio::spawn(async move {
             // Accept loop for TCP connections
@@ -679,6 +698,7 @@ impl Gb28181Server {
             task: handle,
             shutdown: shutdown_tx,
             platform_proto_ver,
+            platform_date,
         })
     }
 
@@ -981,6 +1001,31 @@ impl Gb28181Server {
         Ok(())
     }
 
+    /// Record the platform clock from a REGISTER response's SIP Date
+    /// header (§9.10.2 — the device-side time-sync source). Logs the
+    /// measured drift; applying the clock stays with the host (NTP-less
+    /// deployments set it, NTP-fed ones just observe).
+    fn note_platform_date(&self, resp: &SipMessage) {
+        let Some(raw) = resp.get_header("Date") else {
+            return;
+        };
+        let Some(unix) = super::sip::parse_sip_date(raw) else {
+            log::warn!("gb28181: unparseable SIP Date header: {raw:?}");
+            return;
+        };
+        let local = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let drift = local - unix;
+        if drift.unsigned_abs() > 5 {
+            log::warn!(
+                "gb28181: platform clock differs by {drift}s (SIP Date {unix}, local {local})"
+            );
+        }
+        *self.platform_date.lock().expect("platform date lock") = Some(unix);
+    }
+
     /// Record the platform's X-GB-Ver off a REGISTER response (Annex I).
     /// An absent header (2016-era platforms) keeps the previous value.
     fn note_platform_protocol_version(&self, resp: &SipMessage) {
@@ -1025,6 +1070,7 @@ impl Gb28181Server {
             .receive_register_response(initial_cseq, Duration::from_secs(5))
             .await?;
         self.note_platform_protocol_version(&msg);
+        self.note_platform_date(&msg);
         if msg.status_code != Some(SipStatusCode::Unauthorized) {
             bail!("Expected 401 Unauthorized, got {:?}", msg.status_code);
         }
@@ -1054,6 +1100,7 @@ impl Gb28181Server {
             .receive_register_response(authed_cseq, Duration::from_secs(5))
             .await?;
         self.note_platform_protocol_version(&msg);
+        self.note_platform_date(&msg);
         if msg.status_code != Some(SipStatusCode::Ok) {
             bail!("Expected 200 OK, got {:?}", msg.status_code);
         }
@@ -2606,6 +2653,7 @@ async fn handle_tcp_connection(
         audio_sink,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         // DeviceControl dispatch over TCP is a follow-up (issue #58);
         // controls keep the reject path here.
@@ -3255,6 +3303,7 @@ async fn test_recordinfo_dispatch_with_source() {
         audio_sink: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         config_handler: None,
@@ -3347,6 +3396,7 @@ async fn test_subscribe_books_and_echoes_expires() {
         audio_sink: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         config_handler: None,
@@ -3446,6 +3496,7 @@ async fn test_gb2022_information_queries_dispatch() {
         audio_sink: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         config_handler: None,
@@ -3548,6 +3599,7 @@ async fn test_deviceconfig_and_configdownload_dispatch() {
         audio_sink: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         config_handler: Some(Arc::new(RecordingConfig(seen))),
@@ -3763,6 +3815,7 @@ async fn test_recordinfo_dispatch_without_source() {
         audio_sink: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         config_handler: None,
@@ -3833,6 +3886,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         audio_sink: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         config_handler: None,
@@ -3933,6 +3987,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         audio_sink: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         config_handler: None,
@@ -4030,6 +4085,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         audio_sink: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         config_handler: None,
@@ -4187,6 +4243,7 @@ async fn test_info_playback_control_live_session_noop() {
         audio_sink: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         control_handler: None,
         config_handler: None,
@@ -4287,6 +4344,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             config_handler: None,
@@ -4423,6 +4481,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             config_handler: None,
@@ -4511,6 +4570,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             config_handler: None,
@@ -4617,6 +4677,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             config_handler: None,
@@ -4640,7 +4701,7 @@ mod tcp_media_tests {
         // announcing the platform's version.
         let fresh_401 = "SIP/2.0 401 Unauthorized\r\nCSeq: 1 REGISTER\r\nWWW-Authenticate: Digest realm=\"3402000000\", nonce=\"abc\", algorithm=MD5\r\nContent-Length: 0\r\n\r\n";
         let fresh_200 =
-            "SIP/2.0 200 OK\r\nCSeq: 2 REGISTER\r\nX-GB-Ver: 2.0\r\nContent-Length: 0\r\n\r\n";
+            "SIP/2.0 200 OK\r\nCSeq: 2 REGISTER\r\nX-GB-Ver: 2.0\r\nDate: Tue, 15 Sep 2026 07:29:00 GMT\r\nContent-Length: 0\r\n\r\n";
 
         let sender = tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
@@ -4679,6 +4740,8 @@ mod tcp_media_tests {
             *server.platform_proto_ver.lock().unwrap(),
             Some("2.0".to_string())
         );
+        // §9.10.2: the same response's SIP Date is the platform clock.
+        assert_eq!(*server.platform_date.lock().unwrap(), Some(1_789_457_340));
     }
 
     /// Without configuration the header is omitted (byte-identical to the
@@ -4716,6 +4779,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             config_handler: None,
@@ -4787,6 +4851,7 @@ mod tcp_media_tests {
             task,
             shutdown: _shutdown_tx,
             platform_proto_ver: Arc::clone(&slot),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
         };
         assert_eq!(handle.platform_protocol_version(), Some("3.0".to_string()));
         *slot.lock().unwrap() = Some("2.0".to_string());
@@ -4879,6 +4944,7 @@ mod tcp_media_tests {
             audio_sink: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             config_handler: None,
@@ -4948,6 +5014,7 @@ mod tcp_media_tests {
             })),
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             config_handler: None,
@@ -5082,6 +5149,7 @@ mod tcp_media_tests {
             audio_sink,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
             control_handler: None,
             config_handler: None,
