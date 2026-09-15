@@ -208,6 +208,27 @@ fn apply_control(
     }
 }
 
+/// §9.4.2 media-end notification context: a naturally finished
+/// playback/download session sends the in-dialog `MediaStatus` INFO so
+/// the platform can tear the fetch down promptly. Captured at INVITE
+/// time; UDP SIP only (over TCP-SIP the dialog write half stays with
+/// the connection handler — follow-up on #60).
+pub struct MediaEndInfo {
+    /// The shared SIP UDP socket the INFO leaves through.
+    pub sip_socket: Arc<UdpSocket>,
+    /// Platform SIP address (the INVITE's source — same path back).
+    pub platform_sip_addr: SocketAddr,
+    /// Prebuilt in-dialog INFO request (§9.4.2 body).
+    pub info: crate::sip::SipMessage,
+}
+
+async fn send_media_end(end: &MediaEndInfo) {
+    let data = crate::server::serialize_wire(&end.info);
+    if let Err(e) = end.sip_socket.send_to(&data, end.platform_sip_addr).await {
+        log::warn!("gb28181: MediaStatus INFO send failed: {e}");
+    }
+}
+
 /// Stream recorded segments as PS-over-RTP to the platform.
 ///
 /// `segments` must already be the result of `lookup(start_ms, end_ms)`.
@@ -229,6 +250,7 @@ pub async fn run_playback_task(
     remote_addr: SocketAddr,
     paced: bool,
     mut ctl: mpsc::Receiver<PlaybackControl>,
+    end_info: Option<MediaEndInfo>,
 ) -> Result<()> {
     let mut rtp_pusher = RtpPusher::new(remote_addr, ssrc, PS_PAYLOAD_TYPE);
     let mut state = PlaybackState {
@@ -255,6 +277,11 @@ pub async fn run_playback_task(
         }
 
         if state.idx >= state.frames.len() {
+            // §9.4.2: natural end (not BYE — the channel-closed breaks
+            // below leave this out) reports MediaStatus to the platform.
+            if let Some(end) = &end_info {
+                send_media_end(end).await;
+            }
             break;
         }
 
@@ -462,6 +489,7 @@ mod tests {
             remote,
             true,
             no_control(),
+            None,
         ));
         let packets = receive_rtp(&receiver, start, 3).await;
         task.await.expect("task join").expect("task ok");
@@ -509,6 +537,7 @@ mod tests {
             remote,
             false,
             no_control(),
+            None,
         ));
         let packets = receive_rtp(&receiver, start, 3).await;
         task.await.expect("task join").expect("task ok");
@@ -519,6 +548,155 @@ mod tests {
             "download must not pace, third packet at {}ms",
             packets[2].0
         );
+    }
+
+    /// §9.4.2 (#60): natural completion of a playback session sends the
+    /// in-dialog MediaStatus INFO to the platform SIP socket.
+    #[tokio::test]
+    async fn test_playback_natural_end_sends_media_status_play_finished() {
+        let dir = temp_dir();
+        let seg = write_segment(
+            &dir,
+            "0000.h264",
+            &[
+                (true, vec![vec![0x65, 0x88]], 0),
+                (false, vec![vec![0x61, 0x88]], 40),
+            ],
+        );
+        let source = Arc::new(TestSource {
+            segments: vec![seg.clone()],
+            root: dir,
+        });
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind receiver");
+        let remote = receiver.local_addr().expect("receiver addr");
+        let media_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind media"));
+        // Platform-side SIP socket the INFO must arrive on.
+        let sip_rx = UdpSocket::bind("127.0.0.1:0").await.expect("bind sip rx");
+        let sip_platform_addr = sip_rx.local_addr().expect("sip rx addr");
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind sip tx"));
+        let info = crate::sip::build_media_status_info_request(
+            "dev",
+            "127.0.0.1",
+            5060,
+            "plat",
+            "domain",
+            "call-1",
+            2,
+            7,
+            false,
+        );
+
+        let task = tokio::spawn(run_playback_task(
+            source,
+            vec![seg.clone()],
+            seg.start_ms,
+            seg.end_ms,
+            media_socket,
+            None,
+            12345,
+            "dev",
+            remote,
+            false, // download pacing: finish immediately
+            no_control(),
+            Some(MediaEndInfo {
+                sip_socket,
+                platform_sip_addr: sip_platform_addr,
+                info,
+            }),
+        ));
+        task.await.expect("task join").expect("task ok");
+
+        // The RTP media went to `remote`; the MediaStatus INFO must land
+        // on the platform SIP socket with the §9.4.2 golden body.
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            sip_rx.recv_from(&mut buf),
+        )
+        .await
+        .expect("MediaStatus INFO within timeout")
+        .expect("recv");
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(text.starts_with("INFO "), "got: {text}");
+        assert!(
+            text.ends_with("MediaStatus: Play Finished\r\n"),
+            "got: {text}"
+        );
+    }
+
+    /// §9.4.2 (#60): BYE-side termination (control channel closed) must NOT
+    /// send MediaStatus — the platform already tore the dialog down.
+    #[tokio::test]
+    async fn test_playback_bye_close_sends_no_media_status() {
+        let dir = temp_dir();
+        let seg = write_segment(
+            &dir,
+            "0000.h264",
+            &[
+                (true, vec![vec![0x65, 0x88]], 0),
+                (false, vec![vec![0x61, 0x88]], 40),
+            ],
+        );
+        let source = Arc::new(TestSource {
+            segments: vec![seg.clone()],
+            root: dir,
+        });
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.expect("bind receiver");
+        let remote = receiver.local_addr().expect("receiver addr");
+        let media_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind media"));
+        let sip_rx = UdpSocket::bind("127.0.0.1:0").await.expect("bind sip rx");
+        let sip_platform_addr = sip_rx.local_addr().expect("sip rx addr");
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind sip tx"));
+        let info = crate::sip::build_media_status_info_request(
+            "dev",
+            "127.0.0.1",
+            5060,
+            "plat",
+            "domain",
+            "call-2",
+            2,
+            7,
+            false,
+        );
+
+        // BYE in production aborts the media task outright (the server
+        // takes and aborts the handle) — no natural-exhaustion break, so
+        // no MediaStatus INFO. Reproduce exactly that.
+        let (_tx, rx) = mpsc::channel::<PlaybackControl>(1);
+        let task = tokio::spawn(run_playback_task(
+            source,
+            vec![seg.clone()],
+            seg.start_ms,
+            seg.end_ms,
+            media_socket,
+            None,
+            12345,
+            "dev",
+            remote,
+            true,
+            rx,
+            Some(MediaEndInfo {
+                sip_socket,
+                platform_sip_addr: sip_platform_addr,
+                info,
+            }),
+        ));
+        // Let it emit the first frame and settle into the pace sleep.
+        let mut buf = [0u8; 2048];
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            receiver.recv_from(&mut buf),
+        )
+        .await;
+        task.abort();
+        let _ = task.await;
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            sip_rx.recv_from(&mut buf),
+        )
+        .await;
+        assert!(res.is_err(), "no MediaStatus INFO may follow a BYE abort");
     }
 
     /// Go-parity: a mid-GOP start must fast-forward to the NEXT keyframe —
@@ -560,6 +738,7 @@ mod tests {
             remote,
             false,
             no_control(),
+            None,
         ));
         let packets = receive_rtp(&receiver, tokio::time::Instant::now(), 2).await;
         task.await.expect("task join").expect("task ok");
@@ -618,6 +797,7 @@ mod tests {
             remote,
             false,
             no_control(),
+            None,
         ));
         let packets = receive_rtp(&receiver, tokio::time::Instant::now(), 1).await;
         task.await.expect("task join").expect("task ok");
@@ -734,6 +914,7 @@ mod tests {
             remote,
             true,
             ctl_rx,
+            None,
         ));
 
         // First frame arrives immediately.
@@ -814,6 +995,7 @@ mod tests {
             remote,
             true,
             ctl_rx,
+            None,
         ));
 
         // First frame is seg1's keyframe.
@@ -882,6 +1064,7 @@ mod tests {
             remote,
             true,
             ctl_rx,
+            None,
         ));
 
         // First frame immediate, then set 4x speed.
