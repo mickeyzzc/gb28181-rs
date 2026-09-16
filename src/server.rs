@@ -1131,6 +1131,16 @@ impl Gb28181Server {
             .await?;
         self.note_platform_protocol_version(&msg);
         self.note_platform_date(&msg);
+        if msg.status_code == Some(SipStatusCode::Ok) {
+            // No-auth platforms answer the initial REGISTER directly
+            // (RFC 3261 §10.2 allows unauthenticated registration; the Go
+            // twin has always accepted this path). Also covers a stale
+            // 200 from a previous instance's superseded REGISTER after a
+            // restart — accepting it is registered.
+            log::info!("gb28181: registered without challenge (no-auth platform)");
+            client.inc_cseq();
+            return Ok(());
+        }
         if msg.status_code != Some(SipStatusCode::Unauthorized) {
             bail!("Expected 401 Unauthorized, got {:?}", msg.status_code);
         }
@@ -5249,6 +5259,78 @@ mod tcp_media_tests {
             .find_map(|l| l.strip_prefix("Call-ID: "))
             .expect("Call-ID header");
         assert!(reg2.contains(&format!("Call-ID: {call_id}")));
+    }
+
+    /// A no-auth platform answers the initial REGISTER with 200
+    /// directly — the registration succeeds without the challenge round
+    /// (twin parity with gb28181-go's "no auth required" path; also
+    /// covers a stale 200 for a superseded REGISTER after a restart).
+    #[tokio::test]
+    async fn register_lifecycle_accepts_direct_200() {
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config: Gb28181Config::default(),
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            talkback_source: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+        };
+        let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
+        let platform_addr = platform.local_addr().expect("addr");
+        let server_addr = server
+            .sip_socket
+            .as_ref()
+            .expect("socket bound")
+            .local_addr()
+            .expect("server addr");
+        let ok = "SIP/2.0 200 OK\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n".to_string();
+        let sender = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (n, _) = platform.recv_from(&mut buf).await.expect("recv REGISTER");
+            platform.send_to(ok.as_bytes(), server_addr).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+        let mut client = SipDeviceClient::new(
+            "34020000001320000001",
+            platform_addr,
+            "127.0.0.1",
+            5060,
+            "3402000000",
+            "12345678",
+            3600,
+        );
+        server
+            .perform_register(&mut client, platform_addr)
+            .await
+            .expect("direct 200 must register");
+        let reg = sender.await.unwrap();
+        assert!(reg.contains("REGISTER"), "wire: {reg}");
+        assert!(
+            !reg.contains("Authorization"),
+            "leg 1 is unauthenticated: {reg}"
+        );
+        // Exactly one leg — cseq advanced past the initial value.
+        assert_eq!(client.cseq, 2);
     }
 
     /// A platform accepting the unauthenticated de-register outright
