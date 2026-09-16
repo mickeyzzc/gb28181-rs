@@ -1302,6 +1302,26 @@ pub fn dispatch_inbound_message(msg: &SipMessage) -> Result<(SipMessage, Option<
                 // Caller must build the actual device info response
                 Ok((ok_response, None))
             }
+            // Query types the server layer's rich dispatcher answers
+            // directly (build_device_status_response et al., server.rs
+            // handle_query): acknowledge here and let that layer produce
+            // the response MESSAGE. Not unknown — warning about them
+            // spammed every keepalive interval on platforms that poll
+            // DeviceStatus.
+            "DeviceStatus"
+            | "RecordInfo"
+            | "HomePositionQuery"
+            | "CruiseTrackListQuery"
+            | "CruiseTrackQuery"
+            | "PTZPosition"
+            | "SDCardStatus"
+            | "ConfigDownload" => {
+                log::debug!(
+                    "gb28181: received {} Query (answered by server dispatcher)",
+                    query.cmd_type
+                );
+                build_200_ok_response(msg)
+            }
             _ => {
                 log::warn!("gb28181: unknown Query CmdType: {}", query.cmd_type);
                 build_200_ok_response(msg)
