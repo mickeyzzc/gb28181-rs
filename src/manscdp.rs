@@ -672,6 +672,32 @@ pub enum DeviceControlKind {
         /// Preset index to return to, 0-255 (absent = keep current).
         preset_index: Option<u32>,
     },
+    /// `<DragZoomIn>`/`<DragZoomOut>` — 拉框放大/缩小 control
+    /// (A.2.3.1.8/9): box coordinates in playback-window pixels
+    /// ([`DragZoom`], issue #58).
+    DragZoom(DragZoom),
+}
+
+/// 拉框放大/缩小 control payload (A.2.3.1.8 DragZoomIn / A.2.3.1.9
+/// DragZoomOut): the box the platform user drew on the playback window,
+/// in window pixels with the origin at the top-left corner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DragZoom {
+    /// `true` = DragZoomIn — enlarge the drawn box to fill the playback
+    /// window; `false` = DragZoomOut — shrink the window into the box.
+    pub zoom_in: bool,
+    /// 播放窗口长度像素值 (playback-window length, px).
+    pub length: u32,
+    /// 播放窗口宽度像素值 (playback-window width, px).
+    pub width: u32,
+    /// 拉框中心横轴坐标像素值 (box centre X, px).
+    pub mid_point_x: u32,
+    /// 拉框中心纵轴坐标像素值 (box centre Y, px).
+    pub mid_point_y: u32,
+    /// 拉框长度像素值 (box length, px).
+    pub length_x: u32,
+    /// 拉框宽度像素值 (box width, px).
+    pub length_y: u32,
 }
 
 /// An inbound DeviceControl body with a recognized sub-command.
@@ -728,6 +754,10 @@ struct DeviceControlBody {
     ptz_cmd: Option<String>,
     #[serde(rename = "HomePosition", default)]
     home_position: Option<HomePositionBody>,
+    #[serde(rename = "DragZoomIn", default)]
+    drag_zoom_in: Option<DragZoomBody>,
+    #[serde(rename = "DragZoomOut", default)]
+    drag_zoom_out: Option<DragZoomBody>,
 }
 
 /// `<HomePosition>` body (A.2.3.1.10).
@@ -747,6 +777,25 @@ struct HomePositionBody {
         deserialize_with = "empty_string_as_none"
     )]
     preset_index: Option<String>,
+}
+
+/// `<DragZoomIn>`/`<DragZoomOut>` payload (A.2.3.1.8/9). All six integer
+/// children are 必选; a missing or non-numeric child fails the parse so
+/// the caller keeps its control-reject answer.
+#[derive(Debug, Deserialize)]
+struct DragZoomBody {
+    #[serde(rename = "Length", default)]
+    length: String,
+    #[serde(rename = "Width", default)]
+    width: String,
+    #[serde(rename = "MidPointX", default)]
+    mid_point_x: String,
+    #[serde(rename = "MidPointY", default)]
+    mid_point_y: String,
+    #[serde(rename = "LengthX", default)]
+    length_x: String,
+    #[serde(rename = "LengthY", default)]
+    length_y: String,
 }
 
 /// Parses an inbound DeviceControl body; `None` when the body is not a
@@ -791,6 +840,10 @@ pub fn parse_device_control(body: &str) -> Option<DeviceControl> {
             reset_time: hp.reset_time.and_then(|v| v.trim().parse::<u32>().ok()),
             preset_index: hp.preset_index.and_then(|v| v.trim().parse::<u32>().ok()),
         })
+    } else if let Some(dz) = c.drag_zoom_in {
+        parse_drag_zoom(dz, true).map(DeviceControlKind::DragZoom)
+    } else if let Some(dz) = c.drag_zoom_out {
+        parse_drag_zoom(dz, false).map(DeviceControlKind::DragZoom)
     } else {
         c.ptz_cmd
             .map(|hex| DeviceControlKind::Ptz(parse_ptz_command(&hex)))
@@ -799,6 +852,22 @@ pub fn parse_device_control(body: &str) -> Option<DeviceControl> {
         sn: c.sn,
         device_id: c.device_id,
         kind,
+    })
+}
+
+/// Parses a `<DragZoomIn>`/`<DragZoomOut>` payload (A.2.3.1.8/9) into a
+/// [`DragZoom`]. All six integer children are 必选 — a missing or
+/// non-numeric child yields `None` so the caller keeps its
+/// control-reject behavior.
+fn parse_drag_zoom(b: DragZoomBody, zoom_in: bool) -> Option<DragZoom> {
+    Some(DragZoom {
+        zoom_in,
+        length: b.length.trim().parse().ok()?,
+        width: b.width.trim().parse().ok()?,
+        mid_point_x: b.mid_point_x.trim().parse().ok()?,
+        mid_point_y: b.mid_point_y.trim().parse().ok()?,
+        length_x: b.length_x.trim().parse().ok()?,
+        length_y: b.length_y.trim().parse().ok()?,
     })
 }
 
@@ -1393,6 +1462,66 @@ mod tests {
         assert!(parse_device_control(
             "<Control><CmdType>DeviceControl</CmdType><SN>11</SN><DeviceID>d</DeviceID>\
              <HomePosition><Enabled>on</Enabled></HomePosition></Control>"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn device_control_drag_zoom_decodes() {
+        // A.2.3.1.8/9 拉框放大/缩小: six required integer children — the
+        // drawn box in playback-window pixels, origin at the top-left.
+        let c = parse_device_control(
+            "<Control><CmdType>DeviceControl</CmdType><SN>12</SN><DeviceID>d</DeviceID>\
+             <DragZoomIn><Length>1920</Length><Width>1080</Width><MidPointX>960</MidPointX>\
+             <MidPointY>540</MidPointY><LengthX>480</LengthX><LengthY>270</LengthY>\
+             </DragZoomIn></Control>",
+        )
+        .expect("DragZoomIn must parse");
+        assert_eq!(
+            c.kind,
+            DeviceControlKind::DragZoom(DragZoom {
+                zoom_in: true,
+                length: 1920,
+                width: 1080,
+                mid_point_x: 960,
+                mid_point_y: 540,
+                length_x: 480,
+                length_y: 270,
+            })
+        );
+        let c = parse_device_control(
+            "<Control><CmdType>DeviceControl</CmdType><SN>13</SN><DeviceID>d</DeviceID>\
+             <DragZoomOut><Length>1920</Length><Width>1080</Width><MidPointX>960</MidPointX>\
+             <MidPointY>540</MidPointY><LengthX>480</LengthX><LengthY>270</LengthY>\
+             </DragZoomOut></Control>",
+        )
+        .expect("DragZoomOut must parse");
+        assert_eq!(
+            c.kind,
+            DeviceControlKind::DragZoom(DragZoom {
+                zoom_in: false,
+                length: 1920,
+                width: 1080,
+                mid_point_x: 960,
+                mid_point_y: 540,
+                length_x: 480,
+                length_y: 270,
+            })
+        );
+        // All six children are 必选 — a missing child is not a command we
+        // recognize.
+        assert!(parse_device_control(
+            "<Control><CmdType>DeviceControl</CmdType><SN>14</SN><DeviceID>d</DeviceID>\
+             <DragZoomIn><Length>1920</Length><Width>1080</Width><MidPointX>960</MidPointX>\
+             <MidPointY>540</MidPointY><LengthX>480</LengthX></DragZoomIn></Control>"
+        )
+        .is_none());
+        // Non-numeric text likewise.
+        assert!(parse_device_control(
+            "<Control><CmdType>DeviceControl</CmdType><SN>15</SN><DeviceID>d</DeviceID>\
+             <DragZoomOut><Length>wide</Length><Width>1080</Width><MidPointX>960</MidPointX>\
+             <MidPointY>540</MidPointY><LengthX>480</LengthX><LengthY>270</LengthY>\
+             </DragZoomOut></Control>"
         )
         .is_none());
     }
