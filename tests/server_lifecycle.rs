@@ -102,6 +102,150 @@ async fn tcp_server_shutdown_stops_accept_loop() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Graceful deregistration end-to-end (issue #62): register against a
+/// fake platform, then `shutdown_with_deregister` — the platform must see
+/// the REGISTER `Expires: 0` legs (401 challenge dance, same Call-ID)
+/// before the server task exits.
+#[tokio::test]
+async fn shutdown_with_deregister_sends_expires_zero() -> anyhow::Result<()> {
+    use tokio::net::UdpSocket;
+
+    let platform = UdpSocket::bind("127.0.0.1:0").await?;
+    let platform_port = platform.local_addr()?.port();
+    let (registered_tx, registered_rx) = tokio::sync::oneshot::channel::<()>();
+
+    // Fake platform: answers the registration (401 → 200) and the
+    // de-registration (401 → 200) by CSeq; keepalive MESSAGEs are
+    // ignored. Collects every REGISTER wire form for assertions. The
+    // oneshot fires on the server's FIRST datagram after the authed
+    // REGISTER was answered (keepalive or de-registration leg) — both
+    // prove the registration completed; signalling on the 200's send
+    // alone races the server's register-phase shutdown arm (a Deregister
+    // arriving mid-registration is a documented fast-stop no-op, not a
+    // de-registration).
+    let platform_task = tokio::spawn(async move {
+        let mut registered_tx = Some(registered_tx);
+        let mut registers: Vec<String> = Vec::new();
+        let mut buf = vec![0u8; 4096];
+        let mut signal_on_next = false;
+        loop {
+            let (n, peer) = match platform.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(_) => break,
+            };
+            let msg = String::from_utf8_lossy(&buf[..n]).to_string();
+            if signal_on_next {
+                signal_on_next = false;
+                if let Some(tx) = registered_tx.take() {
+                    let _ = tx.send(());
+                }
+            }
+            if !msg.contains("REGISTER sip:") {
+                continue; // keepalive MESSAGE or media noise
+            }
+            let cseq: u32 = msg
+                .lines()
+                .find_map(|l| l.strip_prefix("CSeq: "))
+                .and_then(|v| v.split(' ').next().map(str::parse))
+                .and_then(Result::ok)
+                .unwrap_or(0);
+            registers.push(msg);
+            // Replies from the platform's own socket; the server learns
+            // nothing from Contact here (it answers to the source addr).
+            let reply = match cseq {
+                1 | 3 => "SIP/2.0 401 Unauthorized\r\nCSeq: {cseq} REGISTER\r\nWWW-Authenticate: Digest realm=\"3402000000\", nonce=\"n{cseq}\", algorithm=MD5\r\nContent-Length: 0\r\n\r\n".replace("{cseq}", &cseq.to_string()),
+                2 | 4 => format!("SIP/2.0 200 OK\r\nCSeq: {cseq} REGISTER\r\nContent-Length: 0\r\n\r\n"),
+                _ => continue,
+            };
+            let _ = platform.send_to(reply.as_bytes(), peer).await;
+            if registers.len() == 2 {
+                signal_on_next = true;
+            }
+            if registers.len() == 4 {
+                break;
+            }
+        }
+        registers
+    });
+
+    let mut handle = Gb28181Server::start(
+        Gb28181Config {
+            local_sip_port: 0,
+            platform_sip_port: platform_port,
+            ..test_config(0, gb28181_rs::config::Transport::Udp)
+        },
+        Arc::new(MockFrameHub::new()),
+        None,
+    )
+    .await?;
+
+    // The de-register request must only go out once the registration
+    // exists (requesting it earlier is a documented no-op fast-stop).
+    tokio::time::timeout(Duration::from_secs(10), registered_rx)
+        .await
+        .expect("registration must complete against the fake platform")?;
+    tokio::time::timeout(Duration::from_secs(10), handle.shutdown_with_deregister())
+        .await
+        .expect("shutdown_with_deregister must complete (registration + deregistration)")?;
+
+    let registers = platform_task
+        .await
+        .expect("platform task must finish after 4 REGISTERs");
+    assert_eq!(registers.len(), 4, "exactly the 4 REGISTER legs");
+    assert!(
+        !registers[0].contains("Expires: 0"),
+        "registration leg 1 carries the configured expiry: {}",
+        registers[0]
+    );
+    assert!(
+        registers[2].contains("Expires: 0"),
+        "deregistration leg 1 must carry Expires: 0: {}",
+        registers[2]
+    );
+    assert!(
+        registers[3].contains("Expires: 0") && registers[3].contains("Authorization"),
+        "deregistration leg 2 answers the 401 with Expires: 0: {}",
+        registers[3]
+    );
+    // RFC 3261 §10.2.2: the deregistration rides the registration dialog.
+    let call_ids: Vec<&str> = registers
+        .iter()
+        .map(|m| {
+            m.lines()
+                .find_map(|l| l.strip_prefix("Call-ID: "))
+                .expect("Call-ID header")
+        })
+        .collect();
+    assert!(call_ids.iter().all(|c| *c == call_ids[0]));
+    Ok(())
+}
+
+/// `shutdown_with_deregister` before a successful registration is a
+/// no-op for the wire (nothing to remove) and must not delay shutdown.
+#[tokio::test]
+async fn shutdown_with_deregister_without_registration_is_noop() -> anyhow::Result<()> {
+    // Platform port with no listener: registration attempts fail.
+    let probe = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    let port = probe.local_addr()?.port();
+    drop(probe);
+
+    let mut handle = Gb28181Server::start(
+        Gb28181Config {
+            local_sip_port: 0,
+            platform_sip_port: port,
+            ..test_config(0, gb28181_rs::config::Transport::Udp)
+        },
+        Arc::new(MockFrameHub::new()),
+        None,
+    )
+    .await?;
+
+    tokio::time::timeout(Duration::from_secs(3), handle.shutdown_with_deregister())
+        .await
+        .expect("shutdown must complete without waiting for registration retries")?;
+    Ok(())
+}
+
 /// Strict mode (issue #32): spec-example values that would otherwise only
 /// warn must refuse to start, naming every offending field — before any
 /// socket is bound.

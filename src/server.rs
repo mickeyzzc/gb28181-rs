@@ -52,11 +52,23 @@ pub(super) const PS_PAYLOAD_TYPE: u8 = 96;
 /// running), but hosts that spawned it inside a `tokio::spawn` and let the
 /// handle drop have repeatedly ended up with dead servers — await it or keep
 /// it for shutdown.
+/// Shutdown mode carried on the shutdown watch channel (issue #62).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShutdownMode {
+    /// Initial value — no shutdown requested yet.
+    Init,
+    /// Stop the server without touching the registration.
+    Fast,
+    /// De-register first (best-effort REGISTER with `Expires: 0`), then
+    /// stop.
+    Deregister,
+}
+
 #[derive(Debug)]
 #[must_use = "dropping the handle leaves the server unsupervised; await it or call shutdown()"]
 pub struct ServerHandle {
     task: tokio::task::JoinHandle<()>,
-    shutdown: watch::Sender<bool>,
+    shutdown: watch::Sender<ShutdownMode>,
     /// Platform X-GB-Ver as last seen on a REGISTER response (Annex I),
     /// shared with the server task.
     platform_proto_ver: Arc<std::sync::Mutex<Option<String>>>,
@@ -70,11 +82,28 @@ impl ServerHandle {
     ///
     /// Stops the SIP recv/accept loop and the keepalive task, aborts any
     /// active media/playback task, and unsubscribes from the frame source.
-    /// Sending a REGISTER with `Expires: 0` (SIP de-registration) is the
-    /// host's responsibility and NOT performed here.
+    /// The registration is left to expire on the platform — use
+    /// [`ServerHandle::shutdown_with_deregister`] to de-register first.
     pub async fn shutdown(&mut self) -> Result<()> {
         // Ignore a send error: every receiver may already be dropped.
-        let _ = self.shutdown.send(true);
+        let _ = self.shutdown.send(ShutdownMode::Fast);
+        (&mut self.task)
+            .await
+            .context("gb28181: server task join failed")?;
+        Ok(())
+    }
+
+    /// Graceful shutdown that first de-registers from the platform
+    /// (issue #62): the server sends REGISTER with `Expires: 0` — the
+    /// same 401 Digest dance as registration, 2s response timeouts —
+    /// before tearing down. Every deregistration failure (an
+    /// unresponsive platform included) is logged and ignored: shutdown
+    /// itself must always succeed. No-op on the UDP path when
+    /// registration never succeeded; the TCP transport keeps the
+    /// fast-stop behavior (its connection handlers do not de-register).
+    pub async fn shutdown_with_deregister(&mut self) -> Result<()> {
+        // Ignore a send error: every receiver may already be dropped.
+        let _ = self.shutdown.send(ShutdownMode::Deregister);
         (&mut self.task)
             .await
             .context("gb28181: server task join failed")?;
@@ -380,7 +409,7 @@ async fn probe_local_ip_with_retry<F, Fut>(
     mut attempt: F,
     max_attempts: u32,
     backoff: Duration,
-    shutdown: &mut watch::Receiver<bool>,
+    shutdown: &mut watch::Receiver<ShutdownMode>,
 ) -> Result<Option<String>>
 where
     F: FnMut() -> Fut,
@@ -627,7 +656,7 @@ impl Gb28181Server {
 
         let platform_proto_ver = Arc::clone(&self.platform_proto_ver);
         let platform_date = Arc::clone(&self.platform_date);
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(ShutdownMode::Init);
         let handle = tokio::spawn(async move {
             if let Err(e) = self.run_udp(&mut shutdown_rx).await {
                 log::error!("gb28181: server error: {e}");
@@ -648,7 +677,7 @@ impl Gb28181Server {
         log::info!("gb28181: listening on SIP port {local_sip_port} (TCP)");
         self.config.check_example_defaults().ok();
 
-        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(ShutdownMode::Init);
         let au_hub = self.au_hub;
         let config = self.config;
         let recording_index = self.recording_index;
@@ -710,7 +739,7 @@ impl Gb28181Server {
     }
 
     /// Main UDP server loop.
-    async fn run_udp(&mut self, shutdown: &mut watch::Receiver<bool>) -> Result<()> {
+    async fn run_udp(&mut self, shutdown: &mut watch::Receiver<ShutdownMode>) -> Result<()> {
         // Parse platform SIP address
         let platform_sip_addr: SocketAddr = format!(
             "{}:{}",
@@ -920,6 +949,9 @@ impl Gb28181Server {
                     tokio::select! {
                         _ = sd.changed() => {
                             log::info!("gb28181: shutdown requested during re-registration — stopping");
+                            if matches!(*sd.borrow_and_update(), ShutdownMode::Deregister) && registered {
+                                self.perform_deregister(&mut sip_client, platform_sip_addr).await;
+                            }
                             return self.shutdown_cleanup();
                         }
                         result = self.perform_register(&mut sip_client, platform_sip_addr) => {
@@ -985,6 +1017,9 @@ impl Gb28181Server {
                 }
                 _ = shutdown.changed() => {
                     log::info!("gb28181: shutdown requested — stopping SIP recv loop");
+                    if matches!(*shutdown.borrow(), ShutdownMode::Deregister) && registered {
+                        self.perform_deregister(&mut sip_client, platform_sip_addr).await;
+                    }
                     return self.shutdown_cleanup();
                 }
             }
@@ -1117,6 +1152,108 @@ impl Gb28181Server {
 
         client.inc_cseq();
         Ok(())
+    }
+
+    /// Best-effort SIP de-registration (REGISTER with `Expires: 0`,
+    /// issue #62). Runs the same 401 Digest dance as registration with
+    /// short timeouts; every failure path — a silent platform, an
+    /// unexpected status, a malformed challenge — logs a warning and
+    /// returns, so shutdown is never blocked by an unresponsive
+    /// platform.
+    async fn perform_deregister(
+        &mut self,
+        client: &mut SipDeviceClient,
+        platform_addr: SocketAddr,
+    ) {
+        const DEREG_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
+
+        // Leg 1: unauthenticated de-register. A platform may accept it
+        // outright — then we are done.
+        let mut dereg = client.build_deregister();
+        stamp_xgbver(&mut dereg, &self.config.protocol_version);
+        let initial_cseq = client.cseq;
+        if let Err(e) = self.send_sip_message(&dereg, platform_addr).await {
+            log::warn!("gb28181: deregistration send failed: {e}");
+            return;
+        }
+        let resp = match self
+            .receive_register_response(initial_cseq, DEREG_RESPONSE_TIMEOUT)
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => {
+                log::warn!("gb28181: deregistration unanswered: {e}");
+                return;
+            }
+        };
+        match resp.status_code {
+            Some(SipStatusCode::Ok) => {
+                log::info!("gb28181: deregistered from platform (Expires: 0 accepted)");
+                client.inc_cseq();
+                return;
+            }
+            Some(SipStatusCode::Unauthorized) => {}
+            other => {
+                log::warn!("gb28181: deregistration rejected with {other:?}");
+                client.inc_cseq();
+                return;
+            }
+        }
+
+        // Leg 2: answer the 401 like the registration path.
+        client.inc_cseq();
+        let authed_cseq = client.cseq;
+        let mut authed = if let Some(auth) = &self.authenticator {
+            match resp.get_header("WWW-Authenticate") {
+                Some(www_auth) => match auth.authorize_with_challenge(www_auth) {
+                    Ok(authz) => {
+                        let mut reg = client.build_deregister();
+                        reg.headers.push(("Authorization".to_string(), authz));
+                        reg
+                    }
+                    Err(e) => {
+                        log::warn!("gb28181: deregistration challenge failed: {e}");
+                        return;
+                    }
+                },
+                None => {
+                    log::warn!("gb28181: deregistration 401 missing WWW-Authenticate header");
+                    return;
+                }
+            }
+        } else {
+            match parse_401_challenge(&resp) {
+                Ok(auth) => client.build_deregister_with_auth(&auth),
+                Err(e) => {
+                    log::warn!("gb28181: deregistration challenge unparseable: {e}");
+                    return;
+                }
+            }
+        };
+        stamp_xgbver(&mut authed, &self.config.protocol_version);
+        if let Err(e) = self.send_sip_message(&authed, platform_addr).await {
+            log::warn!("gb28181: deregistration send failed: {e}");
+            return;
+        }
+        match self
+            .receive_register_response(authed_cseq, DEREG_RESPONSE_TIMEOUT)
+            .await
+        {
+            Ok(resp) if resp.status_code == Some(SipStatusCode::Ok) => {
+                log::info!(
+                    "gb28181: deregistered from platform {platform_addr} (Expires: 0, authed)"
+                );
+                client.inc_cseq();
+            }
+            Ok(resp) => {
+                log::warn!(
+                    "gb28181: deregistration rejected with {:?}",
+                    resp.status_code
+                );
+                client.inc_cseq();
+            }
+            Err(e) => log::warn!("gb28181: deregistration unanswered: {e}"),
+        }
     }
 
     /// Handle incoming SIP message.
@@ -2421,7 +2558,7 @@ async fn run_keepalive(
     interval_secs: u64,
     authenticator: Option<Arc<dyn RegisterAuthenticator>>,
     metrics: Arc<dyn crate::metrics::MetricsHooks>,
-    shutdown: &mut watch::Receiver<bool>,
+    shutdown: &mut watch::Receiver<ShutdownMode>,
 ) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
     let mut sn = 1u32;
@@ -2612,7 +2749,7 @@ async fn handle_tcp_connection(
     config: Gb28181Config,
     recording_index: Option<Arc<dyn RecordingSource>>,
     audio_sink: Option<Arc<dyn AudioTalkbackSink>>,
-    shutdown: &mut watch::Receiver<bool>,
+    shutdown: &mut watch::Receiver<ShutdownMode>,
 ) -> Result<()> {
     use tokio::io::BufReader;
 
@@ -2915,7 +3052,7 @@ mod tests {
     /// after exactly three attempts.
     #[tokio::test]
     async fn test_local_ip_probe_retries_transient_failures() {
-        let (_tx, mut rx) = watch::channel(false);
+        let (_tx, mut rx) = watch::channel(ShutdownMode::Init);
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let scripted = Arc::clone(&calls);
         let ip = probe_local_ip_with_retry(
@@ -2950,7 +3087,7 @@ mod tests {
     /// `max_attempts` attempts (not loop forever).
     #[tokio::test]
     async fn test_local_ip_probe_errors_after_max_attempts() {
-        let (_tx, mut rx) = watch::channel(false);
+        let (_tx, mut rx) = watch::channel(ShutdownMode::Init);
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let scripted = Arc::clone(&calls);
         let result = probe_local_ip_with_retry(
@@ -2980,12 +3117,12 @@ mod tests {
     /// immediately with `Ok(None)` instead of waiting out the backoff.
     #[tokio::test]
     async fn test_local_ip_probe_shutdown_during_backoff_aborts() {
-        let (tx, mut rx) = watch::channel(false);
+        let (tx, mut rx) = watch::channel(ShutdownMode::Init);
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let scripted = Arc::clone(&calls);
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            let _ = tx.send(true);
+            let _ = tx.send(ShutdownMode::Fast);
         });
         let started = std::time::Instant::now();
         let ip = probe_local_ip_with_retry(
@@ -3015,7 +3152,7 @@ mod tests {
     /// A probe that succeeds on the first attempt must not sleep at all.
     #[tokio::test]
     async fn test_local_ip_probe_first_try_success_no_retry() {
-        let (_tx, mut rx) = watch::channel(false);
+        let (_tx, mut rx) = watch::channel(ShutdownMode::Init);
         let calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let scripted = Arc::clone(&calls);
         let ip = probe_local_ip_with_retry(
@@ -4868,12 +5005,254 @@ mod tcp_media_tests {
         assert_eq!(*server.platform_proto_ver.lock().unwrap(), None);
     }
 
+    /// Deregistration helper (issue #62): REGISTER with Expires: 0 runs
+    /// the same 401 Digest dance as registration. Both legs reuse the
+    /// registration's Call-ID (RFC 3261 §10.2.2 — removing the binding
+    /// established under the same dialog).
+    #[tokio::test]
+    async fn deregister_lifecycle_answers_401_then_200() {
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config: Gb28181Config {
+                enabled: true,
+                platform_sip_address: "127.0.0.1".to_string(),
+                platform_sip_port: 5060,
+                device_id: "34020000001320000001".to_string(),
+                channel_id: "34020000001320000001".to_string(),
+                sip_domain: "3402000000".to_string(),
+                password: "12345678".to_string(),
+                local_sip_port: 5060,
+                register_interval_secs: 3600,
+                heartbeat_interval_secs: 3600,
+                heartbeat_timeout_count: 3,
+                transport: Transport::Udp,
+                ..Gb28181Config::default()
+            },
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+        };
+
+        let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
+        let platform_addr = platform.local_addr().expect("addr");
+        let server_addr = server
+            .sip_socket
+            .as_ref()
+            .expect("socket bound")
+            .local_addr()
+            .expect("server addr");
+
+        let fresh_401 = "SIP/2.0 401 Unauthorized\r\nCSeq: 3 REGISTER\r\nWWW-Authenticate: Digest realm=\"3402000000\", nonce=\"dereg\", algorithm=MD5\r\nContent-Length: 0\r\n\r\n";
+        let fresh_200 = "SIP/2.0 200 OK\r\nCSeq: 4 REGISTER\r\nContent-Length: 0\r\n\r\n";
+
+        let sender = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (n, _) = platform.recv_from(&mut buf).await.expect("recv dereg 1");
+            let reg1 = String::from_utf8_lossy(&buf[..n]).to_string();
+            platform
+                .send_to(fresh_401.as_bytes(), server_addr)
+                .await
+                .unwrap();
+            let (n, _) = platform.recv_from(&mut buf).await.expect("recv dereg 2");
+            let reg2 = String::from_utf8_lossy(&buf[..n]).to_string();
+            platform
+                .send_to(fresh_200.as_bytes(), server_addr)
+                .await
+                .unwrap();
+            (reg1, reg2)
+        });
+
+        // A client that already registered (cseq consumed through 2).
+        let mut client = SipDeviceClient::new(
+            "34020000001320000001",
+            platform_addr,
+            "127.0.0.1",
+            5060,
+            "3402000000",
+            "12345678",
+            3600,
+        );
+        client.inc_cseq();
+        client.inc_cseq();
+        server.perform_deregister(&mut client, platform_addr).await;
+        let (reg1, reg2) = sender.await.unwrap();
+        assert!(reg1.contains("REGISTER"), "leg 1: {reg1}");
+        assert!(
+            reg1.contains("Expires: 0"),
+            "leg 1 must carry Expires: 0: {reg1}"
+        );
+        assert!(
+            !reg1.contains("Authorization"),
+            "leg 1 is unauthenticated: {reg1}"
+        );
+        assert!(
+            reg2.contains("Expires: 0"),
+            "leg 2 must carry Expires: 0: {reg2}"
+        );
+        assert!(
+            reg2.contains("Authorization"),
+            "leg 2 answers the 401: {reg2}"
+        );
+        // Same dialog as the registration (the binding being removed).
+        let call_id = reg1
+            .lines()
+            .find_map(|l| l.strip_prefix("Call-ID: "))
+            .expect("Call-ID header");
+        assert!(reg2.contains(&format!("Call-ID: {call_id}")));
+    }
+
+    /// A platform accepting the unauthenticated de-register outright
+    /// (200 on leg 1) ends the dance in one round-trip.
+    #[tokio::test]
+    async fn deregister_accepts_unauth_200() {
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config: Gb28181Config::default(),
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+        };
+        let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
+        let platform_addr = platform.local_addr().expect("addr");
+        let server_addr = server
+            .sip_socket
+            .as_ref()
+            .expect("socket bound")
+            .local_addr()
+            .expect("server addr");
+
+        let ok = "SIP/2.0 200 OK\r\nCSeq: 1 REGISTER\r\nContent-Length: 0\r\n\r\n".to_string();
+        let sender = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let (n, _) = platform.recv_from(&mut buf).await.expect("recv dereg");
+            platform.send_to(ok.as_bytes(), server_addr).await.unwrap();
+            String::from_utf8_lossy(&buf[..n]).to_string()
+        });
+
+        let mut client = SipDeviceClient::new(
+            "34020000001320000001",
+            platform_addr,
+            "127.0.0.1",
+            5060,
+            "3402000000",
+            "12345678",
+            3600,
+        );
+        let started = std::time::Instant::now();
+        server.perform_deregister(&mut client, platform_addr).await;
+        let reg = sender.await.unwrap();
+        assert!(reg.contains("Expires: 0"), "leg 1: {reg}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // No second leg — the 200 path increments cseq exactly once
+        // past the leg-1 value.
+        assert_eq!(client.cseq, 2);
+    }
+
+    /// "Tolerate no-answer" (issue #62): a silent platform never blocks
+    /// the shutdown path — the 2s response timeout expires and the
+    /// helper simply returns.
+    #[tokio::test]
+    async fn deregister_tolerates_silent_platform() {
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config: Gb28181Config::default(),
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+        };
+        // Bind but never answer.
+        let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
+        let platform_addr = platform.local_addr().expect("addr");
+        let recv_drain = tokio::spawn(async move {
+            let mut buf = vec![0u8; 2048];
+            let _ = platform.recv_from(&mut buf).await;
+        });
+
+        let mut client = SipDeviceClient::new(
+            "34020000001320000001",
+            platform_addr,
+            "127.0.0.1",
+            5060,
+            "3402000000",
+            "12345678",
+            3600,
+        );
+        let started = std::time::Instant::now();
+        server.perform_deregister(&mut client, platform_addr).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= Duration::from_secs(2) && elapsed < Duration::from_secs(4),
+            "one 2s timeout then return, took {elapsed:?}"
+        );
+        recv_drain.abort();
+    }
+
     /// The ServerHandle accessor reads the same shared slot the server
     /// task writes (Annex I plumbing).
     #[tokio::test]
     async fn server_handle_exposes_platform_protocol_version() {
         let slot = Arc::new(std::sync::Mutex::new(Some("3.0".to_string())));
-        let (_shutdown_tx, shutdown_rx) = watch::channel(false);
+        let (_shutdown_tx, shutdown_rx) = watch::channel(ShutdownMode::Init);
         let task = tokio::spawn(async move {
             let _ = shutdown_rx;
         });
