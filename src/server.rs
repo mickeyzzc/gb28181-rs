@@ -334,6 +334,11 @@ pub struct Gb28181Server {
     /// Audio talkback sink (audio-only INVITE receive). `None` = talkback
     /// INVITEs are refused with 488.
     audio_sink: Option<Arc<dyn AudioTalkbackSink>>,
+    /// Upstream talkback frames (§9.2 send half, issue #61): host-fed
+    /// pre-framed G.711 bytes the media task packetizes toward the
+    /// platform. Shared behind a mutex so the session task can drain it
+    /// while the server keeps it for future sessions.
+    talkback_source: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>>,
     /// Optional replacement for Digest REGISTER authentication (GB 35114
     /// A-level via the `gb35114` feature). `None` keeps the Digest flow.
     authenticator: Option<Arc<dyn RegisterAuthenticator>>,
@@ -478,6 +483,7 @@ impl Gb28181Server {
             recording_index,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -541,6 +547,18 @@ impl Gb28181Server {
 
     pub fn with_audio_sink(mut self, sink: Arc<dyn AudioTalkbackSink>) -> Self {
         self.audio_sink = Some(sink);
+        self
+    }
+
+    /// Install the talkback upstream source (§9.2 send half, issue #61):
+    /// pre-framed G.711 bytes packetized as RTP toward the platform's
+    /// media address at one frame per 20 ms tick. Push ~160-byte frames
+    /// (20 ms of 8 kHz G.711) at a real-time cadence; the channel
+    /// buffers bursts. An offer requiring upstream audio (`a=recvonly`)
+    /// without a source is refused with 488, mirroring the no-sink
+    /// refusal. Call before `spawn`.
+    pub fn with_talkback_source(mut self, frames: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+        self.talkback_source = Some(Arc::new(std::sync::Mutex::new(frames)));
         self
     }
 
@@ -1979,6 +1997,17 @@ impl Gb28181Server {
             self.send_sip_message(&resp, peer_addr).await?;
             return Ok(());
         }
+        // Upstream-required offers (a=recvonly — the platform only
+        // listens) must not be answered by a device that cannot send:
+        // mirror the no-sink refusal (issue #61).
+        if invite_info.recv_only && self.talkback_source.is_none() {
+            log::warn!(
+                "gb28181: talkback INVITE requires upstream audio but no talkback source installed — 488"
+            );
+            let resp = build_error_response(msg, 488, "Not Acceptable Here");
+            self.send_sip_message(&resp, peer_addr).await?;
+            return Ok(());
+        }
 
         log::info!(
             "gb28181: talkback INVITE from {} ({}), ssrc {}",
@@ -2003,7 +2032,16 @@ impl Gb28181Server {
         let device_ip = self.local_ip.clone();
         let local_sip_port = self.config.local_sip_port;
 
-        let sdp = build_audio_sdp_answer(media_port, invite_info.ssrc, &device_ip, codec);
+        // Only the upstream-required form announces a direction — every
+        // other answer stays byte-identical to the pre-upstream wire
+        // form.
+        let direction = if invite_info.recv_only {
+            "a=sendonly\r\n"
+        } else {
+            ""
+        };
+        let sdp =
+            build_audio_sdp_answer(media_port, invite_info.ssrc, &device_ip, codec, direction);
         let response = build_invite_response(
             msg,
             &self.config.device_id,
@@ -2033,38 +2071,102 @@ impl Gb28181Server {
             invite_response: Some(response),
             _remote_addr: peer_addr,
             _ssrc: invite_info.ssrc,
-            _media_addr: invite_info.media_address,
+            _media_addr: invite_info.media_address.clone(),
             _media_port: invite_info.media_port,
         });
 
-        // RTP receive loop: strip the fixed 12-byte header (+ CSRC list)
-        // and hand the G.711 payload to the sink. Lives on the shared
-        // media_task slot, so BYE / dialog recycle aborts it.
+        // Upstream half (issue #61): with a source channel installed and
+        // the offer not explicitly receive-only-for-the-device
+        // (a=sendonly), the media task also packetizes pushed G.711
+        // frames toward the offer's c=/m= address.
+        let upstream = {
+            let source = self
+                .talkback_source
+                .clone()
+                .filter(|_| !invite_info.send_only);
+            let dst = source.as_ref().and_then(|_| {
+                format!("{}:{}", invite_info.media_address, invite_info.media_port)
+                    .parse::<SocketAddr>()
+                    .ok()
+            });
+            if self.talkback_source.is_some() && !invite_info.send_only && dst.is_none() {
+                log::warn!(
+                    "gb28181: talkback offer lacks a usable c=/m= media address — upstream disabled"
+                );
+            }
+            dst.zip(source).map(|(dst, rx)| TalkbackUpstream {
+                rx,
+                dst,
+                pt: codec.payload_type(),
+                seq: rand::random::<u16>(),
+                ts: rand::random::<u32>(),
+                ssrc: rand::random::<u32>(),
+            })
+        };
+
+        // Media loop: the receive half strips the fixed 12-byte header
+        // (+ CSRC list) and hands the G.711 payload to the sink; the
+        // upstream half drains one source frame per 20 ms tick. Both
+        // live on the shared media_task slot, so BYE / dialog recycle
+        // aborts them together.
         let session_ssrc = invite_info.ssrc;
         let recv_socket = Arc::clone(&media_socket);
         let media_task = tokio::spawn(async move {
             let mut buf = vec![0u8; 2048];
+            let mut up = upstream;
+            let mut ticker = tokio::time::interval(Duration::from_millis(20));
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            ticker.tick().await; // the first tick fires immediately — skip it
             loop {
-                match recv_socket.recv_from(&mut buf).await {
-                    Ok((len, _)) => {
-                        if len < 12 {
-                            continue;
+                tokio::select! {
+                    r = recv_socket.recv_from(&mut buf) => {
+                        match r {
+                            Ok((len, _)) => {
+                                if len < 12 {
+                                    continue;
+                                }
+                                let csrc_count = (buf[0] & 0x0F) as usize;
+                                let header_len = 12 + csrc_count * 4;
+                                if len <= header_len {
+                                    continue;
+                                }
+                                let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                                sink.on_audio_codec(
+                                    &buf[header_len..len],
+                                    if ssrc != 0 { ssrc } else { session_ssrc },
+                                    codec,
+                                );
+                            }
+                            Err(e) => {
+                                log::warn!("gb28181: talkback recv error: {e}");
+                                break;
+                            }
                         }
-                        let csrc_count = (buf[0] & 0x0F) as usize;
-                        let header_len = 12 + csrc_count * 4;
-                        if len <= header_len {
-                            continue;
-                        }
-                        let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
-                        sink.on_audio_codec(
-                            &buf[header_len..len],
-                            if ssrc != 0 { ssrc } else { session_ssrc },
-                            codec,
-                        );
                     }
-                    Err(e) => {
-                        log::warn!("gb28181: talkback recv error: {e}");
-                        break;
+                    _ = ticker.tick(), if up.is_some() => {
+                        if let Some(u) = up.as_mut() {
+                            let frame =
+                                match u.rx.lock().expect("talkback source lock").try_recv() {
+                                    Ok(f) => f,
+                                    Err(_) => continue,
+                                };
+                            if frame.is_empty() || frame.len() > 2048 {
+                                continue;
+                            }
+                            let mut pkt = Vec::with_capacity(12 + frame.len());
+                            pkt.push(0x80); // V=2, no padding/extension/CSRC
+                            pkt.push(u.pt); // M=0 — continuous G.711 stream
+                            pkt.extend_from_slice(&u.seq.to_be_bytes());
+                            pkt.extend_from_slice(&u.ts.to_be_bytes());
+                            pkt.extend_from_slice(&u.ssrc.to_be_bytes());
+                            pkt.extend_from_slice(&frame);
+                            if let Err(e) = recv_socket.send_to(&pkt, u.dst).await {
+                                log::debug!("gb28181: talkback send loop ended: {e}");
+                                break;
+                            }
+                            u.seq = u.seq.wrapping_add(1);
+                            u.ts = u.ts.wrapping_add(frame.len() as u32);
+                        }
                     }
                 }
             }
@@ -2492,11 +2594,23 @@ fn build_device_sdp_answer(
 /// Build the SDP answer for an audio-only talkback INVITE
 /// (GB/T 28181-2022 §9.2): the device advertises the UDP port its RTP
 /// receive loop is bound to and mirrors the offered G.711 payload type.
+/// Upstream talkback state (issue #61): the host-fed G.711 frame
+/// channel plus the RTP bookkeeping for the send half.
+struct TalkbackUpstream {
+    rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
+    dst: SocketAddr,
+    pt: u8,
+    seq: u16,
+    ts: u32,
+    ssrc: u32,
+}
+
 fn build_audio_sdp_answer(
     media_port: u16,
     ssrc: u32,
     device_ip: &str,
     codec: AudioCodec,
+    direction: &str,
 ) -> String {
     let pt = codec.payload_type();
     format!(
@@ -2507,7 +2621,7 @@ fn build_audio_sdp_answer(
          t=0 0\r\n\
          m=audio {media_port} RTP/AVP {pt}\r\n\
          a=rtpmap:{pt} {}/8000\r\n\
-         y={ssrc}\r\n",
+         {direction}y={ssrc}\r\n",
         codec.name()
     )
 }
@@ -2795,6 +2909,7 @@ async fn handle_tcp_connection(
         recording_index,
         playback_ctl: None,
         audio_sink,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -3190,7 +3305,7 @@ mod tests {
     /// device's receive port is the one the RTP recv loop binds.
     #[test]
     fn test_build_audio_sdp_answer_pcma() {
-        let sdp = build_audio_sdp_answer(40000, 777, "192.168.62.104", AudioCodec::Pcma);
+        let sdp = build_audio_sdp_answer(40000, 777, "192.168.62.104", AudioCodec::Pcma, "");
         assert_eq!(
             sdp,
             "v=0\r\no=- 0 0 IN IP4 192.168.62.104\r\ns=Play\r\nc=IN IP4 192.168.62.104\r\nt=0 0\r\nm=audio 40000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\ny=777\r\n"
@@ -3199,7 +3314,7 @@ mod tests {
 
     #[test]
     fn test_build_audio_sdp_answer_pcmu() {
-        let sdp = build_audio_sdp_answer(40001, 778, "192.168.62.104", AudioCodec::Pcmu);
+        let sdp = build_audio_sdp_answer(40001, 778, "192.168.62.104", AudioCodec::Pcmu, "");
         assert_eq!(
             sdp,
             "v=0\r\no=- 0 0 IN IP4 192.168.62.104\r\ns=Play\r\nc=IN IP4 192.168.62.104\r\nt=0 0\r\nm=audio 40001 RTP/AVP 0\r\na=rtpmap:0 PCMU/8000\r\ny=778\r\n"
@@ -3468,6 +3583,7 @@ async fn test_recordinfo_dispatch_with_source() {
         recording_index: Some(Arc::new(source)),
         playback_ctl: None,
         audio_sink: None,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -3561,6 +3677,7 @@ async fn test_subscribe_books_and_echoes_expires() {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -3661,6 +3778,7 @@ async fn test_gb2022_information_queries_dispatch() {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -3764,6 +3882,7 @@ async fn test_deviceconfig_and_configdownload_dispatch() {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -3980,6 +4099,7 @@ async fn test_recordinfo_dispatch_without_source() {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -4051,6 +4171,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -4152,6 +4273,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         recording_index: Some(Arc::new(source)),
         playback_ctl: None,
         audio_sink: None,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -4250,6 +4372,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -4408,6 +4531,7 @@ async fn test_info_playback_control_live_session_noop() {
         recording_index: None,
         playback_ctl: None,
         audio_sink: None,
+        talkback_source: None,
         authenticator: None,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -4509,6 +4633,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -4646,6 +4771,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -4735,6 +4861,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -4842,6 +4969,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -4944,6 +5072,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -5040,6 +5169,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -5140,6 +5270,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -5208,6 +5339,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -5316,6 +5448,323 @@ mod tcp_media_tests {
         }
     }
 
+    /// audio_invite_msg parametrized on the direction attribute and media
+    /// target (upstream tests point c=/m= at a local socket).
+    fn audio_invite_msg_to(
+        call_id: &str,
+        pt: u8,
+        direction: &str,
+        ip: &str,
+        port: u16,
+    ) -> SipMessage {
+        SipMessage {
+            start_line: "INVITE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Invite),
+            status_code: None,
+            uri: Some("sip:34020000001320000001@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), call_id.to_string()),
+                (
+                    "From".to_string(),
+                    "<sip:34020000002000000001@3402000000>;tag=plat".to_string(),
+                ),
+                (
+                    "To".to_string(),
+                    "<sip:34020000001320000001@3402000000>".to_string(),
+                ),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                (
+                    "Via".to_string(),
+                    format!("SIP/2.0/UDP {ip}:5060;branch=z9hG4bKaudio{call_id}"),
+                ),
+            ],
+            body: format!(
+                "v=0\r\no=- 0 0 IN IP4 {ip}\r\ns=Play\r\nc=IN IP4 {ip}\r\nt=0 0\r\nm=audio {port} RTP/AVP {pt}\r\na={direction}\r\ny=999\r\n"
+            ),
+        }
+    }
+
+    /// Upstream half (issue #61): with a source channel installed, an
+    /// a=recvonly offer is answered a=sendonly and pushed G.711 frames
+    /// leave as RTP toward the offer's c=/m= address — payload type 8,
+    /// growing sequence numbers, timestamps advancing by payload length
+    /// (8 kHz G.711 clock), stable SSRC, payload copied verbatim.
+    #[tokio::test]
+    async fn test_talkback_upstream_sends_rtp() {
+        use std::sync::Mutex;
+        type Collected = Arc<Mutex<Vec<(Vec<u8>, u32)>>>;
+        let received: Collected = Arc::new(Mutex::new(Vec::new()));
+        let sink_capture = Arc::clone(&received);
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: Some(Arc::new(move |payload: &[u8], ssrc: u32| {
+                sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
+            })),
+            talkback_source: Some(Arc::new(Mutex::new(rx))),
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+        };
+        let media = UdpSocket::bind("127.0.0.1:0").await.expect("media bind");
+        let media_port = media.local_addr().expect("media addr").port();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let msg = audio_invite_msg_to("talk-up-1", 8, "recvonly", "127.0.0.1", media_port);
+        server
+            .handle_invite(&msg, peer_addr)
+            .await
+            .expect("handle_invite should not error");
+
+        // 200 OK with the sendonly answer golden: the direction line sits
+        // between the rtpmap and y=.
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 200 OK")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert_eq!(resp.status_code.map(|c| c.code()), Some(200));
+        assert!(
+            resp.body
+                .contains("a=rtpmap:8 PCMA/8000\r\na=sendonly\r\ny=999\r\n"),
+            "sendonly answer body: {}",
+            resp.body
+        );
+
+        // Push two frames; the sender drains one per 20 ms tick.
+        tx.send(vec![0xD5, 0x5A, 0xA5, 0x37, 0x11, 0x22, 0x33, 0x44])
+            .expect("push frame 1");
+        tx.send(vec![0x0F]).expect("push frame 2");
+
+        let mut mbuf = vec![0u8; 2048];
+        let (n1, _) = tokio::time::timeout(Duration::from_secs(2), media.recv_from(&mut mbuf))
+            .await
+            .expect("timed out waiting for upstream RTP 1")
+            .expect("media recv failed");
+        let f1 = mbuf[..n1].to_vec();
+        assert_eq!(n1, 12 + 8, "packet length");
+        assert_eq!(f1[0], 0x80, "V/P/X/CC");
+        assert_eq!(f1[1], 8, "payload type 8 (PCMA)");
+        assert_eq!(&f1[12..], &[0xD5, 0x5A, 0xA5, 0x37, 0x11, 0x22, 0x33, 0x44]);
+        let seq1 = u16::from_be_bytes([f1[2], f1[3]]);
+        let ts1 = u32::from_be_bytes([f1[4], f1[5], f1[6], f1[7]]);
+        let ssrc = u32::from_be_bytes([f1[8], f1[9], f1[10], f1[11]]);
+
+        let (n2, _) = tokio::time::timeout(Duration::from_secs(2), media.recv_from(&mut mbuf))
+            .await
+            .expect("timed out waiting for upstream RTP 2")
+            .expect("media recv failed");
+        let f2 = mbuf[..n2].to_vec();
+        let seq2 = u16::from_be_bytes([f2[2], f2[3]]);
+        let ts2 = u32::from_be_bytes([f2[4], f2[5], f2[6], f2[7]]);
+        assert_eq!(seq2, seq1.wrapping_add(1), "sequence increments");
+        assert_eq!(
+            ts2.wrapping_sub(ts1),
+            8,
+            "timestamp advances by payload length (one sample per byte @8 kHz)"
+        );
+        assert_eq!(
+            u32::from_be_bytes([f2[8], f2[9], f2[10], f2[11]]),
+            ssrc,
+            "SSRC stable across packets"
+        );
+        assert_eq!(&f2[12..], &[0x0F]);
+    }
+
+    /// An offer that requires upstream audio (a=recvonly) without a
+    /// source wired is refused with 488 — the mirror of the no-sink
+    /// refusal (issue #61).
+    #[tokio::test]
+    async fn test_talkback_recvonly_without_source_returns_488() {
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: Some(Arc::new(|_payload: &[u8], _ssrc: u32| {})),
+            talkback_source: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+        };
+        let media = UdpSocket::bind("127.0.0.1:0").await.expect("media bind");
+        let media_port = media.local_addr().expect("media addr").port();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let msg = audio_invite_msg_to("talk-up-nosrc", 8, "recvonly", "127.0.0.1", media_port);
+        server
+            .handle_invite(&msg, peer_addr)
+            .await
+            .expect("handle_invite should not error");
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 488")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert_eq!(resp.status_code.map(|c| c.code()), Some(488));
+    }
+
+    /// A source installed against an a=sendonly offer (platform speaks,
+    /// device listens) must NOT start the upstream sender: no RTP leaves.
+    #[tokio::test]
+    async fn test_talkback_sendonly_offer_keeps_upstream_off() {
+        use std::sync::Mutex;
+        type Collected = Arc<Mutex<Vec<(Vec<u8>, u32)>>>;
+        let received: Collected = Arc::new(Mutex::new(Vec::new()));
+        let sink_capture = Arc::clone(&received);
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: Some(Arc::new(move |payload: &[u8], ssrc: u32| {
+                sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
+            })),
+            talkback_source: Some(Arc::new(Mutex::new(rx))),
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+        };
+        let media = UdpSocket::bind("127.0.0.1:0").await.expect("media bind");
+        let media_port = media.local_addr().expect("media addr").port();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let msg = audio_invite_msg_to("talk-up-mute", 8, "sendonly", "127.0.0.1", media_port);
+        server
+            .handle_invite(&msg, peer_addr)
+            .await
+            .expect("handle_invite should not error");
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 200 OK")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert_eq!(resp.status_code.map(|c| c.code()), Some(200));
+        assert!(
+            !resp.body.contains("a=sendonly"),
+            "sendonly offer keeps the directionless answer: {}",
+            resp.body
+        );
+
+        tx.send(vec![0xD5, 0x5A]).expect("push frame");
+        let mut mbuf = vec![0u8; 2048];
+        match tokio::time::timeout(Duration::from_millis(300), media.recv_from(&mut mbuf)).await {
+            Ok(Ok((n, _))) => {
+                panic!("upstream RTP must not flow for a=sendonly offers, got {n} bytes")
+            }
+            Ok(Err(e)) => panic!("media recv error: {e}"),
+            Err(_) => {}
+        }
+        drop(tx);
+    }
+
     /// A talkback INVITE with no sink registered is refused with 488 —
     /// receiving audio nobody consumes would be a silent black hole.
     #[tokio::test]
@@ -5351,6 +5800,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink: None,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -5421,6 +5871,7 @@ mod tcp_media_tests {
             audio_sink: Some(Arc::new(move |payload: &[u8], ssrc: u32| {
                 sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
             })),
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -5556,6 +6007,7 @@ mod tcp_media_tests {
             recording_index: None,
             playback_ctl: None,
             audio_sink,
+            talkback_source: None,
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
