@@ -153,6 +153,53 @@ impl SipDeviceClient {
         )
     }
 
+    /// Build a de-registration REGISTER (`Expires: 0`, unauthenticated).
+    /// Reuses the registration's Call-ID and tags — RFC 3261 §10.2.2
+    /// removes the binding established under the same dialog (issue #62).
+    pub fn build_deregister(&self) -> SipMessage {
+        build_register_request(
+            &self.device_id,
+            &self.local_ip,
+            self.local_port,
+            &self.domain,
+            &self.domain,
+            0,
+            None,
+            &self.call_id,
+            self.cseq,
+            &self.from_tag,
+            &self.user_agent,
+        )
+    }
+
+    /// Build a de-registration REGISTER with Digest authentication.
+    pub fn build_deregister_with_auth(&self, auth: &DigestAuthParams) -> SipMessage {
+        let uri = format!("sip:{}@{}", self.domain, self.domain);
+        let auth_header = build_digest_auth(
+            &self.username,
+            &auth.realm,
+            &self.password,
+            &auth.nonce,
+            &uri,
+            "REGISTER",
+            auth.algorithm.as_deref().unwrap_or("MD5"),
+            auth.qop.as_deref(),
+        );
+        build_register_request(
+            &self.device_id,
+            &self.local_ip,
+            self.local_port,
+            &self.domain,
+            &self.domain,
+            0,
+            Some(&auth_header),
+            &self.call_id,
+            self.cseq,
+            &self.from_tag,
+            &self.user_agent,
+        )
+    }
+
     /// Build a SIP BYE request to end a session.
     pub fn build_bye(
         &self,
@@ -1318,6 +1365,50 @@ mod tests {
     /// DeviceConfig answer body golden (A.2.6.8): attribute-form
     /// Response, SN echoed, Result OK/ERROR. Byte-identical shape to the
     /// Go twin's builder.
+    /// Deregistration builders (issue #62): Expires: 0, the
+    /// registration's Call-ID/tags reused, Authorization only on the
+    /// authed variant.
+    #[test]
+    fn deregister_builders_carry_expires_zero() {
+        let client = SipDeviceClient::new(
+            "34020000001320000001",
+            "127.0.0.1:5060".parse().expect("addr"),
+            "127.0.0.1",
+            5060,
+            "3402000000",
+            "12345678",
+            3600,
+        );
+        let reg = client.build_register();
+        let dereg = client.build_deregister();
+        assert!(dereg.start_line.contains("REGISTER"));
+        assert_eq!(
+            dereg.get_header("Expires").map(str::trim),
+            Some("0"),
+            "deregister REGISTER: {dereg:?}"
+        );
+        let call_id = reg.get_header("Call-ID").expect("Call-ID");
+        assert_eq!(dereg.get_header("Call-ID"), Some(call_id));
+        assert!(dereg.get_header("Authorization").is_none());
+        assert_ne!(
+            reg.get_header("Expires").map(str::trim),
+            Some("0"),
+            "registration REGISTER must carry the configured expiry"
+        );
+
+        let auth = crate::sip::parse_digest_auth(
+            "Digest realm=\"3402000000\", nonce=\"abc\", algorithm=MD5",
+        )
+        .expect("challenge");
+        let authed = client.build_deregister_with_auth(&auth);
+        assert_eq!(
+            authed.get_header("Expires").map(str::trim),
+            Some("0"),
+            "authed deregister: {authed:?}"
+        );
+        assert!(authed.get_header("Authorization").is_some());
+    }
+
     #[test]
     fn device_config_response_body_golden() {
         for (ok, result) in [(true, "OK"), (false, "ERROR")] {
