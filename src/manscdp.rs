@@ -1843,3 +1843,122 @@ mod snapshot_tests {
         assert!(back.snap_shot_list.snap_shot_file_id.is_empty());
     }
 }
+
+// ── A.2.5.5 / A.2.6.11 voice broadcast (§9.12.1) ─────────────────────────────
+
+/// A.2.5.5 语音广播通知: the platform announces a voice broadcast; the
+/// device (voice output equipment) acknowledges via A.2.6.11 and then
+/// INVITEs the announced source to receive the audio stream.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BroadcastNotify {
+    pub sn: u32,
+    /// 语音输入设备编码 — the broadcast's audio source.
+    pub source_id: String,
+    /// 语音输出设备编码 — the addressed receiver (this device/channel).
+    pub target_id: String,
+}
+
+/// Recognize a `<CmdType>Broadcast</CmdType>` notify body. Both the
+/// child-element and the attribute form of CmdType/SN are accepted
+/// (platform dialects vary, same as the Query family).
+pub fn parse_broadcast_notify(body: &str) -> Option<BroadcastNotify> {
+    #[derive(serde::Deserialize)]
+    struct Child {
+        #[serde(rename = "CmdType")]
+        cmd_type: String,
+        #[serde(rename = "SN")]
+        sn: String,
+        #[serde(rename = "SourceID")]
+        source_id: String,
+        #[serde(rename = "TargetID")]
+        target_id: String,
+    }
+    if let Ok(v) = serde_xml_rs::from_str::<Child>(body) {
+        if v.cmd_type == "Broadcast" {
+            let sn = v.sn.parse().ok()?;
+            return Some(BroadcastNotify {
+                sn,
+                source_id: v.source_id,
+                target_id: v.target_id,
+            });
+        }
+        return None;
+    }
+    // Attribute form: <Notify CmdType="Broadcast" SN="…" …/>
+    #[derive(serde::Deserialize)]
+    struct Attr {
+        #[serde(rename = "@CmdType")]
+        cmd_type: String,
+        #[serde(rename = "@SN")]
+        sn: String,
+        #[serde(rename = "@SourceID")]
+        source_id: Option<String>,
+        #[serde(rename = "@TargetID")]
+        target_id: Option<String>,
+        #[serde(rename = "SourceID")]
+        child_source: Option<String>,
+        #[serde(rename = "TargetID")]
+        child_target: Option<String>,
+    }
+    let v = serde_xml_rs::from_str::<Attr>(body).ok()?;
+    if v.cmd_type != "Broadcast" {
+        return None;
+    }
+    let sn = v.sn.parse().ok()?;
+    Some(BroadcastNotify {
+        sn,
+        source_id: v.source_id.or(v.child_source)?,
+        target_id: v.target_id.or(v.child_target)?,
+    })
+}
+
+/// A.2.6.11 语音广播应答 body (信令3): OK when the device can receive
+/// the broadcast, ERROR otherwise.
+#[must_use]
+pub fn build_broadcast_response(sn: u32, device_id: &str, ok: bool) -> String {
+    let result = if ok { "OK" } else { "ERROR" };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<Response>\r\n<CmdType>Broadcast</CmdType>\r\n<SN>{sn}</SN>\r\n<DeviceID>{device_id}</DeviceID>\r\n<Result>{result}</Result>\r\n</Response>\r\n"
+    )
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::*;
+
+    #[test]
+    fn parses_child_element_form_notify() {
+        let body = "<?xml version=\"1.0\"?>\r\n<Notify>\r\n<CmdType>Broadcast</CmdType>\r\n<SN>42</SN>\r\n<SourceID>34020000002000000001</SourceID>\r\n<TargetID>34020000001320000002</TargetID>\r\n</Notify>\r\n";
+        let n = parse_broadcast_notify(body).expect("recognized");
+        assert_eq!(n.sn, 42);
+        assert_eq!(n.source_id, "34020000002000000001");
+        assert_eq!(n.target_id, "34020000001320000002");
+    }
+
+    #[test]
+    fn parses_attribute_form_notify() {
+        let body = "<Notify CmdType=\"Broadcast\" SN=\"7\" SourceID=\"11000000002000000001\" TargetID=\"34020000001310000001\"/>";
+        let n = parse_broadcast_notify(body).expect("recognized");
+        assert_eq!(n.sn, 7);
+        assert_eq!(n.source_id, "11000000002000000001");
+        assert_eq!(n.target_id, "34020000001310000001");
+    }
+
+    #[test]
+    fn non_broadcast_bodies_are_not_recognized() {
+        assert!(
+            parse_broadcast_notify("<Notify><CmdType>Keepalive</CmdType><SN>1</SN></Notify>")
+                .is_none()
+        );
+        assert!(parse_broadcast_notify("not xml").is_none());
+    }
+
+    #[test]
+    fn response_body_matches_a_2_6_11() {
+        assert_eq!(
+            build_broadcast_response(42, "34020000001320000002", true),
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<Response>\r\n<CmdType>Broadcast</CmdType>\r\n<SN>42</SN>\r\n<DeviceID>34020000001320000002</DeviceID>\r\n<Result>OK</Result>\r\n</Response>\r\n"
+        );
+        assert!(build_broadcast_response(1, "d", false).contains("<Result>ERROR</Result>"));
+    }
+}
