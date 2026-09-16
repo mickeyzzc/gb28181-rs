@@ -324,6 +324,12 @@ pub struct InviteInfo {
     pub media_kind: MediaKind,
     /// G.711 variant for audio-only offers, `None` for video sessions.
     pub audio_codec: Option<AudioCodec>,
+    /// `a=recvonly` on the offer's media line: the platform only listens —
+    /// the device must send (talkback upstream, issue #61).
+    pub recv_only: bool,
+    /// `a=sendonly` on the offer's media line: the platform only speaks —
+    /// a receive-only session, the upstream sender must stay off.
+    pub send_only: bool,
 }
 
 /// Parse a SIP INVITE message to extract stream target information.
@@ -418,6 +424,14 @@ pub fn parse_invite(msg: &SipMessage) -> Result<InviteInfo> {
     } else {
         (MediaKind::Video, None)
     };
+    let (recv_only, send_only) = if media_kind == MediaKind::Audio {
+        (
+            media.get_attr("recvonly").is_some(),
+            media.get_attr("sendonly").is_some(),
+        )
+    } else {
+        (false, false)
+    };
     Ok(InviteInfo {
         call_id,
         media_transport,
@@ -425,6 +439,8 @@ pub fn parse_invite(msg: &SipMessage) -> Result<InviteInfo> {
         media_port: media.port,
         media_kind,
         audio_codec,
+        recv_only,
+        send_only,
         ssrc,
         payload_type,
         session_type,
