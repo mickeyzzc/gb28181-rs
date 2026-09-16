@@ -325,6 +325,11 @@ pub struct Gb28181Server {
     subscriber_id: Option<u64>,
     /// Current INVITE dialog info
     invite_info: Option<InviteDialog>,
+    /// Pending outbound voice-broadcast INVITE (§9.12.1 信令5): awaiting
+    /// the platform's SIP response, which the recv loop routes in by
+    /// Call-ID (see the fallback arm of `handle_message`). Dropped
+    /// (media socket closed) on answer, rejection or 5s expiry.
+    broadcast_pending: Option<PendingBroadcast>,
     /// Detected local IP advertised in Contact headers.
     local_ip: String,
     /// Optional source of recorded-segment metadata for RecordInfo queries.
@@ -394,6 +399,23 @@ struct InviteDialog {
     _media_addr: String,
     /// Platform's media (RTP) port
     _media_port: u16,
+}
+
+/// A §9.12.1 voice-broadcast session in the INVITE-sent state (信令5
+/// outstanding): the recv loop completes it when the platform's SIP
+/// response arrives with the matching Call-ID.
+struct PendingBroadcast {
+    call_id: String,
+    /// The outbound INVITE as sent — the ACK reuses its routing headers.
+    invite: SipMessage,
+    /// The ephemeral UDP socket announced in the INVITE SDP; the RTP
+    /// receiver owns it after the 200 OK, dropping it closes the socket.
+    media_socket: Arc<UdpSocket>,
+    /// SSRC we announced (y= and Subject) — RTP fallback key.
+    ssrc: u32,
+    sink: Arc<dyn AudioTalkbackSink>,
+    platform_addr: SocketAddr,
+    sent_at: std::time::Instant,
 }
 
 /// Local-IP route probe retry budget: 30 attempts × 3 s ≈ 90 s, matching
@@ -479,6 +501,7 @@ impl Gb28181Server {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: String::new(),
             recording_index,
             playback_ctl: None,
@@ -1051,6 +1074,7 @@ impl Gb28181Server {
         if let Some(subscriber_id) = self.subscriber_id.take() {
             self.au_hub.unsubscribe(subscriber_id);
         }
+        self.broadcast_pending = None;
         if let Some(task) = self.media_task.take() {
             task.abort();
         }
@@ -1381,6 +1405,20 @@ impl Gb28181Server {
                     );
                 }
 
+                // Voice broadcast (§9.12.1, A.2.5.5): acknowledge the
+                // notification, then — with an audio sink installed —
+                // run the 信令3/信令5 device half. UDP transport only
+                // (the response and INVITE leave through the shared SIP
+                // UDP socket).
+                if let Some(notify) = crate::manscdp::parse_broadcast_notify(&msg.body) {
+                    if self.tcp_conn.is_none() && self.sip_socket.is_some() {
+                        let ok = build_error_response(msg, 200, "OK");
+                        self.send_sip_message(&ok, peer_addr).await?;
+                        self.start_broadcast(notify, platform_addr).await?;
+                        return Ok(());
+                    }
+                }
+
                 // Build and send Catalog/DeviceInfo response if this was a query
                 if let Some(response_msg) = self.build_query_response(msg)? {
                     // Small delay to let 200 OK be processed first
@@ -1404,6 +1442,30 @@ impl Gb28181Server {
                 self.send_sip_message(&ok_response, peer_addr).await?;
             }
             _ => {
+                // Route a SIP response to the pending broadcast INVITE by
+                // Call-ID (§9.12.1 信令5→13). Anything else falls through
+                // to the keepalive heuristic.
+                if msg.status_code.is_some() {
+                    let call_id = msg.get_header("Call-ID").unwrap_or("");
+                    let matches = self
+                        .broadcast_pending
+                        .as_ref()
+                        .map(|p| p.call_id == call_id)
+                        .unwrap_or(false);
+                    if matches {
+                        let pending = self.broadcast_pending.take().expect("checked above");
+                        self.complete_broadcast(pending, msg.clone()).await?;
+                        return Ok(());
+                    }
+                    // Expire a stale pending (5s answer window) — dropping
+                    // it closes the media socket.
+                    if let Some(p) = self.broadcast_pending.as_ref() {
+                        if p.sent_at.elapsed() > Duration::from_secs(5) {
+                            log::warn!("gb28181: broadcast INVITE unanswered — session abandoned");
+                            self.broadcast_pending = None;
+                        }
+                    }
+                }
                 // Check if this is a response to our keepalive
                 if msg.status_code == Some(SipStatusCode::Ok) {
                     *keepalive_failures = 0; // Reset failure counter on OK
@@ -1423,6 +1485,116 @@ impl Gb28181Server {
                 }
             }
         }
+        Ok(())
+    }
+
+    /// §9.12.1 voice-broadcast device half, phase 1: send the A.2.6.11
+    /// acknowledgement (信令3 — OK iff an audio sink is installed), then
+    /// with a sink bind the receive socket and send the audio INVITE
+    /// (信令5: s=Play / m=audio / Subject header). The platform's SIP
+    /// response completes the session in the recv loop
+    /// ([`Self::complete_broadcast`]).
+    async fn start_broadcast(
+        &mut self,
+        notify: crate::manscdp::BroadcastNotify,
+        platform_addr: SocketAddr,
+    ) -> Result<()> {
+        let sink = self.audio_sink.clone();
+        let resp = build_broadcast_response_message(
+            notify.sn,
+            &self.config.device_id,
+            &self.config.sip_domain,
+            &self.local_ip,
+            self.config.local_sip_port,
+            sink.is_some(),
+        );
+        self.send_sip_message(&resp, platform_addr).await?;
+
+        let Some(sink) = sink else {
+            log::info!("gb28181: broadcast declined — no audio sink installed");
+            return Ok(());
+        };
+
+        // Occupies the shared media slot (single session at a time).
+        if let Some(task) = self.media_task.take() {
+            task.abort();
+        }
+        let media_socket = Arc::new(
+            UdpSocket::bind("0.0.0.0:0")
+                .await
+                .context("gb28181: failed to bind broadcast media socket")?,
+        );
+        let media_port = media_socket.local_addr()?.port();
+        let ssrc = rand::random::<u32>();
+        let invite = build_broadcast_invite(
+            &self.config.device_id,
+            &self.config.sip_domain,
+            &self.local_ip,
+            self.config.local_sip_port,
+            &notify.source_id,
+            media_port,
+            ssrc,
+            platform_addr,
+        );
+        log::info!(
+            "gb28181: broadcast INVITE sent, source {}, ssrc {}",
+            notify.source_id,
+            ssrc
+        );
+        self.send_sip_message(&invite, platform_addr).await?;
+        self.broadcast_pending = Some(PendingBroadcast {
+            call_id: invite.get_header("Call-ID").unwrap_or("").to_string(),
+            invite,
+            media_socket,
+            ssrc,
+            sink,
+            platform_addr,
+            sent_at: std::time::Instant::now(),
+        });
+        Ok(())
+    }
+
+    /// §9.12.1 voice-broadcast device half, phase 2: the platform
+    /// answered the outbound INVITE. On 200, send the in-dialog ACK
+    /// (信令15), register the dialog for BYE cleanup (信令17→18) and
+    /// receive G.711 RTP into the sink on the shared media slot.
+    async fn complete_broadcast(
+        &mut self,
+        pending: PendingBroadcast,
+        resp: SipMessage,
+    ) -> Result<()> {
+        if resp.status_code != Some(SipStatusCode::Ok) {
+            log::warn!(
+                "gb28181: broadcast INVITE rejected (status {:?}) — session dropped",
+                resp.status_code
+            );
+            return Ok(());
+        }
+        let ack = build_broadcast_ack(&pending.invite, &resp);
+        self.send_sip_message(&ack, pending.platform_addr).await?;
+
+        let (call_id, media_socket, ssrc, sink) = (
+            pending.call_id,
+            pending.media_socket,
+            pending.ssrc,
+            pending.sink,
+        );
+        // Dialog bookkeeping so the platform's BYE (信令17) tears the
+        // receiver down through the existing handle_bye path.
+        self.invite_info = Some(InviteDialog {
+            call_id: call_id.clone(),
+            _remote_tag: String::new(),
+            _local_tag: 0,
+            cseq: 1,
+            invite_response: None,
+            _remote_addr: SocketAddr::from(([0, 0, 0, 0], 0)),
+            _ssrc: ssrc,
+            _media_addr: String::new(),
+            _media_port: 0,
+        });
+        let receiver = tokio::spawn(run_broadcast_receiver(media_socket, sink, ssrc));
+        self.media_task = Some(receiver);
+        log::info!("gb28181: broadcast session receiving, call-id {}", call_id);
         Ok(())
     }
 
@@ -2637,6 +2809,207 @@ fn build_audio_sdp_answer(
 }
 
 /// Build a SIP error response.
+/// §9.12.1 信令3: the A.2.6.11 broadcast acknowledgement MESSAGE toward
+/// the platform (To = SIP server, same shape as the keepalive notify).
+#[must_use]
+fn build_broadcast_response_message(
+    sn: u32,
+    device_id: &str,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    ok: bool,
+) -> SipMessage {
+    let body = crate::manscdp::build_broadcast_response(sn, device_id, ok);
+    let uri = format!("sip:{domain}@{domain}");
+    let headers = vec![
+        (
+            "Via".to_string(),
+            format!(
+                "SIP/2.0/UDP {}:{};rport;branch={}",
+                local_ip,
+                local_port,
+                super::sip::random_branch()
+            ),
+        ),
+        ("From".to_string(), format!("<sip:{device_id}@{domain}>")),
+        ("To".to_string(), format!("<sip:{domain}@{domain}>")),
+        (
+            "Call-ID".to_string(),
+            format!("bresp{}@{device_id}", rand::random::<u64>()),
+        ),
+        ("CSeq".to_string(), "1 MESSAGE".to_string()),
+        (
+            "Contact".to_string(),
+            format!("<sip:{device_id}@{local_ip}:{local_port}>"),
+        ),
+        ("Max-Forwards".to_string(), "70".to_string()),
+        (
+            "Content-Type".to_string(),
+            "Application/MANSCDP+xml".to_string(),
+        ),
+        ("Content-Length".to_string(), body.len().to_string()),
+    ];
+    SipMessage {
+        start_line: format!("MESSAGE {uri} SIP/2.0"),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some(uri),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body,
+    }
+}
+
+/// §9.12.1 信令5: the audio-only INVITE toward the announced source —
+/// s=Play (live), m=audio with the device's receive port, y= SSRC, and
+/// the GB Subject convention `<sourceID>:<ssrc>,<deviceID>:0`. The
+/// Request-URI targets the platform's actual SIP address (the domain is
+/// not DNS-routable) with the announced source as the user part.
+#[must_use]
+#[allow(clippy::too_many_arguments)]
+fn build_broadcast_invite(
+    device_id: &str,
+    domain: &str,
+    local_ip: &str,
+    local_sip_port: u16,
+    source_id: &str,
+    media_port: u16,
+    ssrc: u32,
+    platform_addr: SocketAddr,
+) -> SipMessage {
+    let uri = format!("sip:{source_id}@{platform_addr}");
+    let sdp = format!(
+        "v=0\r\no=- 0 0 IN IP4 {local_ip}\r\ns=Play\r\nc=IN IP4 {local_ip}\r\nt=0 0\r\nm=audio {media_port} RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\ny={ssrc}\r\n"
+    );
+    let headers = vec![
+        (
+            "Via".to_string(),
+            format!(
+                "SIP/2.0/UDP {}:{};rport;branch={}",
+                local_ip,
+                local_sip_port,
+                super::sip::random_branch()
+            ),
+        ),
+        (
+            "From".to_string(),
+            format!(
+                "<sip:{device_id}@{domain}>;tag={:08x}",
+                rand::random::<u32>()
+            ),
+        ),
+        ("To".to_string(), format!("<sip:{source_id}@{domain}>")),
+        (
+            "Call-ID".to_string(),
+            format!("bcast{}@{local_ip}", rand::random::<u64>()),
+        ),
+        ("CSeq".to_string(), "1 INVITE".to_string()),
+        (
+            "Contact".to_string(),
+            format!("<sip:{device_id}@{local_ip}:{local_sip_port}>"),
+        ),
+        ("Max-Forwards".to_string(), "70".to_string()),
+        ("Content-Type".to_string(), "application/sdp".to_string()),
+        (
+            "Subject".to_string(),
+            format!("{source_id}:{ssrc},{device_id}:0"),
+        ),
+        ("Content-Length".to_string(), sdp.len().to_string()),
+    ];
+    SipMessage {
+        start_line: format!("INVITE {uri} SIP/2.0"),
+        method: Some(SipMethod::Invite),
+        status_code: None,
+        uri: Some(uri),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body: sdp,
+    }
+}
+
+/// §9.12.1 信令15: the in-dialog ACK for the platform's 200 OK (the To
+/// header — including its tag — comes verbatim from the response).
+#[must_use]
+fn build_broadcast_ack(invite: &SipMessage, resp: &SipMessage) -> SipMessage {
+    let via_host = invite
+        .get_header("Via")
+        .map(|v| {
+            let rest = v.strip_prefix("SIP/2.0/UDP").unwrap_or(v);
+            rest.split(';').next().unwrap_or(rest).trim().to_string()
+        })
+        .unwrap_or_default();
+    let mut headers = vec![
+        (
+            "Via".to_string(),
+            format!(
+                "SIP/2.0/UDP {via_host};branch={}",
+                super::sip::random_branch()
+            ),
+        ),
+        (
+            "From".to_string(),
+            invite.get_header("From").unwrap_or("").to_string(),
+        ),
+        (
+            "To".to_string(),
+            resp.get_header("To").unwrap_or("").to_string(),
+        ),
+        (
+            "Call-ID".to_string(),
+            invite.get_header("Call-ID").unwrap_or("").to_string(),
+        ),
+        ("CSeq".to_string(), "1 ACK".to_string()),
+        ("Max-Forwards".to_string(), "70".to_string()),
+        ("Content-Length".to_string(), "0".to_string()),
+    ];
+    headers.dedup_by(|a, b| a.0 == b.0);
+    SipMessage {
+        start_line: format!("ACK {} SIP/2.0", invite.uri.clone().unwrap_or_default()),
+        method: Some(SipMethod::Ack),
+        status_code: None,
+        uri: invite.uri.clone(),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body: String::new(),
+    }
+}
+
+/// Broadcast RTP receive loop (§9.12.1 信令16 onward): strip the fixed
+/// 12-byte header (+ CSRC list) and hand the G.711 payload to the sink.
+/// The announced SSRC is the fallback when the packet carries 0.
+async fn run_broadcast_receiver(
+    socket: Arc<UdpSocket>,
+    sink: Arc<dyn AudioTalkbackSink>,
+    session_ssrc: u32,
+) {
+    let mut buf = vec![0u8; 2048];
+    loop {
+        match socket.recv_from(&mut buf).await {
+            Ok((len, _)) => {
+                if len < 12 {
+                    continue;
+                }
+                let csrc_count = (buf[0] & 0x0F) as usize;
+                let header_len = 12 + csrc_count * 4;
+                if len <= header_len {
+                    continue;
+                }
+                let ssrc = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
+                sink.on_audio_codec(
+                    &buf[header_len..len],
+                    if ssrc != 0 { ssrc } else { session_ssrc },
+                    AudioCodec::Pcma,
+                );
+            }
+            Err(e) => {
+                log::debug!("gb28181: broadcast recv loop ended: {e}");
+                break;
+            }
+        }
+    }
+}
+
 fn build_error_response(request: &SipMessage, code: u16, reason: &str) -> SipMessage {
     let mut headers = Vec::new();
 
@@ -2915,6 +3288,7 @@ async fn handle_tcp_connection(
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: local_ip.clone(),
         recording_index,
         playback_ctl: None,
@@ -3589,6 +3963,7 @@ async fn test_recordinfo_dispatch_with_source() {
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: "192.168.62.104".to_string(),
         recording_index: Some(Arc::new(source)),
         playback_ctl: None,
@@ -3683,6 +4058,7 @@ async fn test_subscribe_books_and_echoes_expires() {
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
@@ -3784,6 +4160,7 @@ async fn test_gb2022_information_queries_dispatch() {
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
@@ -3888,6 +4265,7 @@ async fn test_deviceconfig_and_configdownload_dispatch() {
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: "127.0.0.1".to_string(),
         recording_index: None,
         playback_ctl: None,
@@ -4105,6 +4483,7 @@ async fn test_recordinfo_dispatch_without_source() {
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
@@ -4177,6 +4556,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
@@ -4279,6 +4659,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: "192.168.62.104".to_string(),
         recording_index: Some(Arc::new(source)),
         playback_ctl: None,
@@ -4378,6 +4759,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
@@ -4537,6 +4919,7 @@ async fn test_info_playback_control_live_session_noop() {
         media_task: None,
         subscriber_id: None,
         invite_info: None,
+        broadcast_pending: None,
         local_ip: "192.168.62.104".to_string(),
         recording_index: None,
         playback_ctl: None,
@@ -4639,6 +5022,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -4777,6 +5161,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -4867,6 +5252,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -4975,6 +5361,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5078,6 +5465,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5175,6 +5563,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5278,6 +5667,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5348,6 +5738,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5417,6 +5808,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5606,6 +5998,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5723,6 +6116,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5794,6 +6188,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5878,6 +6273,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "192.168.62.104".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -5947,6 +6343,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: "127.0.0.1".to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -6085,6 +6482,7 @@ mod tcp_media_tests {
             media_task: None,
             subscriber_id: None,
             invite_info: None,
+            broadcast_pending: None,
             local_ip: local_ip.to_string(),
             recording_index: None,
             playback_ctl: None,
@@ -6245,5 +6643,250 @@ mod tcp_media_tests {
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
         assert_eq!(sink.seen.lock().unwrap().as_slice(), [AudioCodec::Pcma]);
+    }
+
+    // ─── voice broadcast (§9.12.1) ─────────────────────────────────────────
+
+    fn broadcast_notify_msg() -> SipMessage {
+        SipMessage {
+            start_line: "MESSAGE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Message),
+            status_code: None,
+            uri: Some("sip:34020000001320000001@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), "bnotify-1".to_string()),
+                ("From".to_string(), "<sip:34020000002000000001@3402000000>;tag=plat".to_string()),
+                ("To".to_string(), "<sip:34020000001320000001@3402000000>".to_string()),
+                ("CSeq".to_string(), "1 MESSAGE".to_string()),
+                ("Via".to_string(), "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbcast1".to_string()),
+                ("Content-Type".to_string(), "Application/MANSCDP+xml".to_string()),
+            ],
+            body: "<?xml version=\"1.0\"?>\r\n<Notify>\r\n<CmdType>Broadcast</CmdType>\r\n<SN>42</SN>\r\n<SourceID>34020000002000000001</SourceID>\r\n<TargetID>34020000001320000001</TargetID>\r\n</Notify>\r\n".to_string(),
+        }
+    }
+
+    async fn broadcast_test_server(
+        sink: Option<Arc<dyn AudioTalkbackSink>>,
+    ) -> (Gb28181Server, Arc<UdpSocket>) {
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(Arc::clone(&sip_socket)),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            broadcast_pending: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: sink,
+            talkback_source: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+        };
+        (server, sip_socket)
+    }
+
+    async fn recv_sip(peer: &UdpSocket) -> SipMessage {
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for SIP")
+            .expect("recv failed");
+        SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8")).expect("parse")
+    }
+
+    /// §9.12.1 device half with a sink: 信令3 (A.2.6.11, Result OK) then
+    /// the audio INVITE (s=Play / m=audio / Subject / Request-URI at the
+    /// platform address); the platform's 200 completes the handshake
+    /// (in-dialog ACK) and RTP reaches the sink with PCMA semantics.
+    #[tokio::test]
+    async fn test_broadcast_full_device_half() {
+        use std::sync::Mutex;
+        type Collected = Arc<Mutex<Vec<(Vec<u8>, u32)>>>;
+        let received: Collected = Arc::new(Mutex::new(Vec::new()));
+        let sink_capture = Arc::clone(&received);
+        let sink: Arc<dyn AudioTalkbackSink> = Arc::new(move |payload: &[u8], ssrc: u32| {
+            sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
+        });
+        let (mut server, _sip) = broadcast_test_server(Some(sink)).await;
+        let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
+        let platform_addr = platform.local_addr().expect("platform addr");
+
+        let notify = crate::manscdp::parse_broadcast_notify(&broadcast_notify_msg().body)
+            .expect("notify parses");
+        server
+            .start_broadcast(notify, platform_addr)
+            .await
+            .expect("start_broadcast");
+
+        // 信令3: A.2.6.11 acknowledgement, Result OK.
+        let resp3 = recv_sip(&platform).await;
+        assert_eq!(resp3.method, Some(SipMethod::Message));
+        assert!(resp3.body.contains("<CmdType>Broadcast</CmdType>"));
+        assert!(resp3.body.contains("<SN>42</SN>"));
+        assert!(resp3.body.contains("<Result>OK</Result>"));
+
+        // 信令5: audio-only INVITE toward the announced source.
+        let invite = recv_sip(&platform).await;
+        assert_eq!(invite.method, Some(SipMethod::Invite));
+        assert!(
+            invite
+                .uri
+                .as_deref()
+                .unwrap_or("")
+                .starts_with("sip:34020000002000000001@127.0.0.1:"),
+            "Request-URI targets the platform's actual address, got {:?}",
+            invite.uri
+        );
+        let subject = invite.get_header("Subject").unwrap_or("");
+        assert!(
+            subject.starts_with("34020000002000000001:")
+                && subject.ends_with(",34020000001320000001:0"),
+            "Subject convention, got {subject}"
+        );
+        assert!(invite.body.contains("s=Play\r\n"));
+        assert!(invite.body.contains("m=audio "));
+        assert!(invite.body.contains("a=rtpmap:8 PCMA/8000\r\n"));
+        let media_port: u16 = invite
+            .body
+            .lines()
+            .find(|l| l.starts_with("m=audio "))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|p| p.parse().ok())
+            .expect("media port in SDP");
+        let invite_call_id = invite.get_header("Call-ID").unwrap_or("").to_string();
+
+        // Platform 200 OK (信令13/14): the response is routed by Call-ID;
+        // test the completion directly with the pending state.
+        let ok200 = SipMessage {
+            start_line: "SIP/2.0 200 OK".to_string(),
+            method: None,
+            status_code: Some(SipStatusCode::Ok),
+            uri: None,
+            version: "SIP/2.0".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), invite_call_id.clone()),
+                ("From".to_string(), invite.get_header("From").unwrap_or("").to_string()),
+                ("To".to_string(), "<sip:34020000002000000001@3402000000>;tag=mediasrv".to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+                ("Via".to_string(), "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbcast1".to_string()),
+            ],
+            body: "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=Play\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 30000 RTP/AVP 8\r\ny=12345\r\n"
+                .to_string(),
+        };
+        let pending = server.broadcast_pending.take().expect("pending exists");
+        assert_eq!(pending.call_id, invite_call_id);
+        server
+            .complete_broadcast(pending, ok200.clone())
+            .await
+            .expect("complete_broadcast");
+
+        // 信令15: in-dialog ACK — routing headers from the INVITE, To tag
+        // verbatim from the response.
+        let ack = recv_sip(&platform).await;
+        assert_eq!(ack.method, Some(SipMethod::Ack));
+        assert_eq!(ack.get_header("Call-ID").unwrap_or(""), invite_call_id);
+        assert!(ack.get_header("To").unwrap_or("").contains("tag=mediasrv"));
+        assert_eq!(ack.get_header("CSeq").unwrap_or(""), "1 ACK");
+
+        // RTP platform→device on the announced port reaches the sink
+        // (header stripped, SSRC preserved, PCMA implied by the invite).
+        let pkt = {
+            let mut p = vec![0x80u8, 8];
+            p.extend_from_slice(&1u16.to_be_bytes());
+            p.extend_from_slice(&160u32.to_be_bytes());
+            p.extend_from_slice(&0x0A0B0C0Du32.to_be_bytes());
+            p.extend_from_slice(&[0xD5, 0x5A, 0xA5]);
+            p
+        };
+        platform
+            .send_to(&pkt, format!("127.0.0.1:{media_port}"))
+            .await
+            .expect("send RTP");
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            received.lock().unwrap().as_slice(),
+            [(vec![0xD5, 0x5A, 0xA5], 0x0A0B0C0D)]
+        );
+
+        // BYE (信令17) tears the session down via the shared dialog path.
+        let bye = SipMessage {
+            start_line: "BYE sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Bye),
+            status_code: None,
+            uri: Some("sip:34020000001320000001@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), invite_call_id),
+                (
+                    "From".to_string(),
+                    "<sip:34020000002000000001@3402000000>;tag=mediasrv".to_string(),
+                ),
+                (
+                    "To".to_string(),
+                    "<sip:34020000001320000001@3402000000>".to_string(),
+                ),
+                ("CSeq".to_string(), "2 BYE".to_string()),
+                (
+                    "Via".to_string(),
+                    "SIP/2.0/UDP 127.0.0.1:5060;branch=z9hG4bKbye1".to_string(),
+                ),
+            ],
+            body: String::new(),
+        };
+        server
+            .handle_bye(&bye, platform_addr)
+            .await
+            .expect("handle_bye");
+        let bye_ok = recv_sip(&platform).await;
+        assert_eq!(bye_ok.status_code.map(|c| c.code()), Some(200));
+    }
+
+    /// Without an audio sink the device acknowledges with Result=ERROR
+    /// and never sends the audio INVITE (§9.12.1 decline path).
+    #[tokio::test]
+    async fn test_broadcast_declined_without_sink() {
+        let (mut server, _sip) = broadcast_test_server(None).await;
+        let platform = UdpSocket::bind("127.0.0.1:0").await.expect("platform bind");
+        let platform_addr = platform.local_addr().expect("platform addr");
+        let notify = crate::manscdp::parse_broadcast_notify(&broadcast_notify_msg().body)
+            .expect("notify parses");
+        server
+            .start_broadcast(notify, platform_addr)
+            .await
+            .expect("start_broadcast");
+        let resp3 = recv_sip(&platform).await;
+        assert!(resp3.body.contains("<Result>ERROR</Result>"));
+        assert!(server.broadcast_pending.is_none());
     }
 }
