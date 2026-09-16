@@ -189,6 +189,12 @@ pub trait DeviceControlHandler: Send + Sync {
         _preset_index: Option<u32>,
     ) {
     }
+    /// `<DragZoomIn>`/`<DragZoomOut>` — 拉框放大/缩小 control
+    /// (A.2.3.1.8/9, [`crate::manscdp::DragZoom`]): zoom the drawn box to
+    /// fill the playback window (In) or the window into the box (Out);
+    /// coordinates are window pixels with the origin at the top-left.
+    /// Hosts without a PTZ keep the default no-op (ack-only).
+    fn on_drag_zoom(&self, _cmd: &crate::manscdp::DragZoom) {}
 }
 
 /// Host seam for DeviceConfig sub-commands (GB/T 28181-2022 §9.3.3 /
@@ -239,6 +245,7 @@ fn dispatch_device_control(
             reset_time,
             preset_index,
         } => handler.on_home_position(*enabled, *reset_time, *preset_index),
+        DeviceControlKind::DragZoom(cmd) => handler.on_drag_zoom(cmd),
     }
 }
 
@@ -2811,6 +2818,9 @@ mod tests {
         fn on_ptz(&self, cmd: &crate::manscdp::PtzCommand) {
             self.0.lock().unwrap().push(format!("ptz:{cmd:?}"));
         }
+        fn on_drag_zoom(&self, cmd: &crate::manscdp::DragZoom) {
+            self.0.lock().unwrap().push(format!("dragzoom:{cmd:?}"));
+        }
     }
 
     fn dispatch_of(body: &str) -> Vec<String> {
@@ -2873,6 +2883,26 @@ mod tests {
                     pan_speed: 0x20,
                     tilt_speed: 0,
                     zoom_speed: 0
+                }
+            )]
+        );
+        assert_eq!(
+            dispatch_of(
+                "<Control><CmdType>DeviceControl</CmdType><SN>1</SN>\
+                 <DeviceID>d</DeviceID><DragZoomIn><Length>1920</Length><Width>1080</Width>\
+                 <MidPointX>960</MidPointX><MidPointY>540</MidPointY><LengthX>480</LengthX>\
+                 <LengthY>270</LengthY></DragZoomIn></Control>"
+            ),
+            vec![format!(
+                "dragzoom:{:?}",
+                crate::manscdp::DragZoom {
+                    zoom_in: true,
+                    length: 1920,
+                    width: 1080,
+                    mid_point_x: 960,
+                    mid_point_y: 540,
+                    length_x: 480,
+                    length_y: 270,
                 }
             )]
         );
