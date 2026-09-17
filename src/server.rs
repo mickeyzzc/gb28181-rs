@@ -304,6 +304,49 @@ fn dispatch_device_config(
     }
 }
 
+/// Host-fed upstream talkback source (§9.2 send half): the frame
+/// channel the media task drains one 20 ms packet per tick, plus the
+/// G.711 variant negotiated for the current session. The wire side is
+/// law-aware (payload type 8/0 follows the offer); the host encoder is
+/// the one that must match — it holds a live [`Arc<TalkbackSource>`]
+/// (from [`Gb28181Server::talkback_upstream_source`], taken before
+/// `spawn`) and polls [`TalkbackSource::law`] per encode step.
+///
+/// The law defaults to PCMA (the de-facto GB platform codec) and is
+/// re-negotiated on every accepted offer that enables upstream audio.
+pub struct TalkbackSource {
+    rx: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>,
+    law: std::sync::Mutex<AudioCodec>,
+}
+
+impl TalkbackSource {
+    #[must_use]
+    pub fn new(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            rx: std::sync::Mutex::new(rx),
+            law: std::sync::Mutex::new(AudioCodec::Pcma),
+        }
+    }
+
+    /// G.711 variant the current session negotiated for upstream audio.
+    #[must_use]
+    pub fn law(&self) -> AudioCodec {
+        *self.law.lock().expect("talkback law lock")
+    }
+
+    fn negotiate(&self, law: AudioCodec) {
+        *self.law.lock().expect("talkback law lock") = law;
+    }
+}
+
+impl std::fmt::Debug for TalkbackSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TalkbackSource")
+            .field("law", &self.law())
+            .finish_non_exhaustive()
+    }
+}
+
 pub struct Gb28181Server {
     /// Configuration for the GB28181 server
     config: Gb28181Config,
@@ -339,11 +382,12 @@ pub struct Gb28181Server {
     /// Audio talkback sink (audio-only INVITE receive). `None` = talkback
     /// INVITEs are refused with 488.
     audio_sink: Option<Arc<dyn AudioTalkbackSink>>,
-    /// Upstream talkback frames (§9.2 send half, issue #61): host-fed
+    /// Upstream talkback source (§9.2 send half, issue #61): host-fed
     /// pre-framed G.711 bytes the media task packetizes toward the
-    /// platform. Shared behind a mutex so the session task can drain it
-    /// while the server keeps it for future sessions.
-    talkback_source: Option<Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>>,
+    /// platform, plus the G.711 variant negotiated for the current
+    /// session (see [`TalkbackSource`]). Shared so the session task can
+    /// drain it while the server — and the host encoder — keep it.
+    talkback_source: Option<Arc<TalkbackSource>>,
     /// Optional replacement for Digest REGISTER authentication (GB 35114
     /// A-level via the `gb35114` feature). `None` keeps the Digest flow.
     authenticator: Option<Arc<dyn RegisterAuthenticator>>,
@@ -581,8 +625,18 @@ impl Gb28181Server {
     /// without a source is refused with 488, mirroring the no-sink
     /// refusal. Call before `spawn`.
     pub fn with_talkback_source(mut self, frames: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
-        self.talkback_source = Some(Arc::new(std::sync::Mutex::new(frames)));
+        self.talkback_source = Some(Arc::new(TalkbackSource::new(frames)));
         self
+    }
+
+    /// Live handle to the upstream talkback source state (§9.2 send
+    /// half). The host encoder polls [`TalkbackSource::law`] per encode
+    /// step to match the platform's offer — PCMA by default, a PCMU
+    /// offer flips it for that session. Valid before and after `spawn`;
+    /// `None` without [`Self::with_talkback_source`].
+    #[must_use]
+    pub fn talkback_upstream_source(&self) -> Option<Arc<TalkbackSource>> {
+        self.talkback_source.clone()
     }
 
     /// Installs the DeviceControl sub-command handler (issue #58):
@@ -2276,8 +2330,8 @@ impl Gb28181Server {
                     "gb28181: talkback offer lacks a usable c=/m= media address — upstream disabled"
                 );
             }
-            dst.zip(source).map(|(dst, rx)| TalkbackUpstream {
-                rx,
+            dst.zip(source).map(|(dst, source)| TalkbackUpstream {
+                source,
                 dst,
                 pt: codec.payload_type(),
                 seq: rand::random::<u16>(),
@@ -2285,6 +2339,14 @@ impl Gb28181Server {
                 ssrc: rand::random::<u32>(),
             })
         };
+        // Publish the negotiated law to the host encoder's live handle
+        // (talkback_upstream_source) — only meaningful while upstream is
+        // actually enabled for this session.
+        if upstream.is_some() {
+            if let Some(src) = &self.talkback_source {
+                src.negotiate(codec);
+            }
+        }
 
         // Media loop: the receive half strips the fixed 12-byte header
         // (+ CSRC list) and hands the G.711 payload to the sink; the
@@ -2327,8 +2389,7 @@ impl Gb28181Server {
                     }
                     _ = ticker.tick(), if up.is_some() => {
                         if let Some(u) = up.as_mut() {
-                            let frame =
-                                match u.rx.lock().expect("talkback source lock").try_recv() {
+                            let frame = match u.source.rx.lock().expect("talkback source lock").try_recv() {
                                     Ok(f) => f,
                                     Err(_) => continue,
                                 };
@@ -2779,7 +2840,7 @@ fn build_device_sdp_answer(
 /// Upstream talkback state (issue #61): the host-fed G.711 frame
 /// channel plus the RTP bookkeeping for the send half.
 struct TalkbackUpstream {
-    rx: Arc<std::sync::Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
+    source: Arc<TalkbackSource>,
     dst: SocketAddr,
     pt: u8,
     seq: u16,
@@ -6005,7 +6066,7 @@ mod tcp_media_tests {
             audio_sink: Some(Arc::new(move |payload: &[u8], ssrc: u32| {
                 sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
             })),
-            talkback_source: Some(Arc::new(Mutex::new(rx))),
+            talkback_source: Some(Arc::new(TalkbackSource::new(rx))),
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
@@ -6082,6 +6143,101 @@ mod tcp_media_tests {
             "SSRC stable across packets"
         );
         assert_eq!(&f2[12..], &[0x0F]);
+    }
+
+    /// The upstream law slot follows the offer: a PCMU offer (payload
+    /// type 0) flips the live handle the host encoder polls — and the
+    /// RTP packets carry PT 0. Default (no offer yet) is PCMA.
+    #[tokio::test]
+    async fn test_talkback_upstream_law_follows_pcmu_offer() {
+        use crate::client::AudioCodec;
+        let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 60,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            broadcast_pending: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: Some(Arc::new(|_payload: &[u8], _ssrc: u32| {})),
+            talkback_source: Some(Arc::new(TalkbackSource::new(rx))),
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+        };
+        let source = server.talkback_upstream_source().expect("source installed");
+        assert_eq!(source.law(), AudioCodec::Pcma, "default law is PCMA");
+
+        let mut server = server;
+        let media = UdpSocket::bind("127.0.0.1:0").await.expect("media bind");
+        let media_port = media.local_addr().expect("media addr").port();
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("bind peer");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let msg = audio_invite_msg_to("talk-up-mu", 0, "recvonly", "127.0.0.1", media_port);
+        server
+            .handle_invite(&msg, peer_addr)
+            .await
+            .expect("handle_invite should not error");
+
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out waiting for 200 OK")
+            .expect("recv failed");
+        let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
+            .expect("parse response");
+        assert_eq!(resp.status_code.map(|c| c.code()), Some(200));
+        assert!(
+            resp.body.contains("m=audio"),
+            "audio answer body: {}",
+            resp.body
+        );
+        assert_eq!(
+            source.law(),
+            AudioCodec::Pcmu,
+            "accepted PCMU offer flips the live law handle"
+        );
+
+        tx.send(vec![0xFF, 0x7F]).expect("push frame");
+        let mut mbuf = vec![0u8; 2048];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), media.recv_from(&mut mbuf))
+            .await
+            .expect("timed out waiting for upstream RTP")
+            .expect("media recv failed");
+        assert_eq!(mbuf[0], 0x80, "V/P/X/CC");
+        assert_eq!(mbuf[1], 0, "payload type 0 (PCMU)");
+        assert_eq!(&mbuf[12..n], &[0xFF, 0x7F]);
     }
 
     /// An offer that requires upstream audio (a=recvonly) without a
@@ -6195,7 +6351,7 @@ mod tcp_media_tests {
             audio_sink: Some(Arc::new(move |payload: &[u8], ssrc: u32| {
                 sink_capture.lock().unwrap().push((payload.to_vec(), ssrc));
             })),
-            talkback_source: Some(Arc::new(Mutex::new(rx))),
+            talkback_source: Some(Arc::new(TalkbackSource::new(rx))),
             authenticator: None,
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
