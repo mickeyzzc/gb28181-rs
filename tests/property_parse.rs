@@ -5,7 +5,11 @@
 use proptest::prelude::*;
 
 use gb28181_rs::charset::{decode_wire_body, encode_wire_body};
-use gb28181_rs::sip::{build_register_request, SipMessage};
+use gb28181_rs::manscdp::{
+    parse_control_snapshot, parse_device_config, parse_device_control, parse_ptz_command,
+    PtzCommand,
+};
+use gb28181_rs::sip::{build_register_request, parse_digest_auth, parse_sip_date, SipMessage};
 
 proptest! {
     /// Arbitrary bytes (including invalid UTF-8) never panic the SIP
@@ -48,5 +52,46 @@ proptest! {
         let s: String = text.into_iter().collect();
         let encoded = encode_wire_body(&s);
         prop_assert_eq!(decode_wire_body(&encoded), s);
+    }
+
+    /// The MANSCDP XML parsers (device control / config / snapshot, the
+    /// DeviceControl family surfaces platforms push at the device) never
+    /// panic on arbitrary bytes — garbage surfaces as None, nothing else.
+    #[test]
+    fn manscdp_parse_never_panics(data in proptest::collection::vec(any::<u8>(), 0..8192)) {
+        let lossy = String::from_utf8_lossy(&data).into_owned();
+        let _ = parse_device_control(&lossy);
+        let _ = parse_device_config(&lossy);
+        let _ = parse_control_snapshot(&lossy);
+    }
+
+    /// PTZ decode is byte-faithful in both directions: arbitrary input
+    /// yields `Invalid` with the trimmed input preserved, and every
+    /// 8-byte A5 command with a matching checksum must decode to a
+    /// non-`Invalid` variant.
+    #[test]
+    fn ptz_command_invalid_preserves_raw(data in proptest::collection::vec(any::<u8>(), 0..64)) {
+        let lossy = String::from_utf8_lossy(&data).into_owned();
+        if let PtzCommand::Invalid { raw } = parse_ptz_command(&lossy) {
+            prop_assert_eq!(raw, lossy.trim());
+        }
+    }
+    #[test]
+    fn ptz_command_valid_always_decodes(bytes in any::<[u8; 8]>()) {
+        let mut raw = bytes;
+        raw[0] = 0xA5;
+        raw[7] = raw[..7].iter().fold(0u8, |acc, b| acc.wrapping_add(*b));
+        let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        prop_assert!( !matches!(parse_ptz_command(&hex), PtzCommand::Invalid { .. }),
+            "valid A5 command with matching checksum must not decode as Invalid: {hex}" );
+    }
+
+    /// Digest-auth challenge parsing and SIP Date parsing never panic on
+    /// arbitrary strings — failure is an Err/None, nothing else.
+    #[test]
+    fn digest_auth_and_sip_date_never_panics(data in proptest::collection::vec(any::<u8>(), 0..512)) {
+        let lossy = String::from_utf8_lossy(&data).into_owned();
+        let _ = parse_digest_auth(&lossy);
+        let _ = parse_sip_date(&lossy);
     }
 }
