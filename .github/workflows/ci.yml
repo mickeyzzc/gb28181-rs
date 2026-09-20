@@ -73,7 +73,7 @@ jobs:
         run: cargo check --target armv7-unknown-linux-musleabihf
 
   coverage:
-    # Line coverage via cargo-llvm-cov (issue #33), gated at 80% lines
+    # Line coverage via cargo-llvm-cov (issue #33), gated at 85% lines
     # (measured baseline ~91%).
     runs-on: ubuntu-latest
     steps:
@@ -84,5 +84,5 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
-      - name: Coverage gate (lines ≥ 80%, default + gb35114)
-        run: cargo llvm-cov --features gb35114 --summary-only --fail-under-lines 80
+      - name: Coverage gate (lines ≥ 85%, default + gb35114)
+        run: cargo llvm-cov --features gb35114 --summary-only --fail-under-lines 85
