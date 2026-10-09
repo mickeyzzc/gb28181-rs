@@ -376,13 +376,15 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> Option<i64> {
 
 // ---------------------------------------------------------------------------
 // GB/T 28181-2022 image snapshot (A.2.1.24 / A.2.5.7) — twin-parity wire
-// types with gb28181-go (#49): the Control element is <SnapShot> with
-// SnapNum/Interval/UploadURL/SessionID; the completion notify carries the
-// same SessionID plus a SnapShotList of SnapShotFileID entries.
+// types with gb28181-go (#49 / #107): the snapshot rides the
+// device-config channel — a Control root with CmdType DeviceConfig
+// carrying <SnapShotConfig> with SnapNum/Interval/UploadURL/SessionID;
+// the completion notify carries the same SessionID plus a SnapShotList
+// of SnapShotFileID entries.
 // ---------------------------------------------------------------------------
 
-/// The snapshot payload inside an inbound DeviceControl (A.2.1.24
-/// snapShotCfgType).
+/// The snapshot payload inside an inbound DeviceConfig (A.2.1.24
+/// snapShotCfgType, element <SnapShotConfig>).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapShotCmd {
     /// Frames to capture, 1..=10; manual snapshot = 1.
@@ -400,17 +402,18 @@ pub struct SnapShotCmd {
     pub session_id: String,
 }
 
-/// An inbound DeviceControl body carrying a snapshot command.
+/// An inbound DeviceConfig body carrying a snapshot configuration
+/// (gb28181-go #107: CmdType is DeviceConfig, not DeviceControl).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
-pub struct ControlSnapShot {
+pub struct ConfigSnapShot {
     #[serde(rename = "CmdType")]
     pub cmd_type: String,
     #[serde(rename = "SN")]
     pub sn: String,
     #[serde(rename = "DeviceID")]
     pub device_id: String,
-    #[serde(rename = "SnapShot")]
-    pub snap_shot: SnapShotCmd,
+    #[serde(rename = "SnapShotConfig")]
+    pub snap_shot_config: SnapShotCmd,
 }
 
 /// The `<SnapShotList>` node: 0..=10 uploaded-image IDs. An empty list is
@@ -454,9 +457,9 @@ impl UploadSnapShotFinished {
 
 /// Parses an inbound DeviceControl snapshot body; `None` when the body is
 /// not a snapshot control.
-pub fn parse_control_snapshot(body: &str) -> Option<ControlSnapShot> {
-    let c = serde_xml_rs::from_str::<ControlSnapShot>(body).ok()?;
-    (c.cmd_type == "DeviceControl").then_some(c)
+pub fn parse_config_snapshot(body: &str) -> Option<ConfigSnapShot> {
+    let c = serde_xml_rs::from_str::<ConfigSnapShot>(body).ok()?;
+    (c.cmd_type == "DeviceConfig").then_some(c)
 }
 
 /// Builds the device-side completion report.
@@ -703,7 +706,7 @@ pub struct DragZoom {
 /// An inbound DeviceControl body with a recognized sub-command.
 ///
 /// Only the child-element form is parsed (the production-validated form
-/// for controls, matching [`parse_control_snapshot`]); unknown or absent
+/// for controls, matching [`parse_config_snapshot`]); unknown or absent
 /// sub-commands yield `None` so the server keeps its reject behavior.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeviceControl {
@@ -1590,7 +1593,7 @@ mod tests {
 
     #[test]
     fn device_control_ignores_non_control_bodies() {
-        // Snapshot controls route through parse_control_snapshot; a Keepalive
+        // Snapshot configs route through parse_config_snapshot; a Keepalive
         // Notify is not a Control at all.
         let snap = "<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID>\
                     <SnapShot><SnapNum>1</SnapNum><UploadURL>u</UploadURL>\
@@ -1788,33 +1791,51 @@ mod snapshot_tests {
     const SESSION_ID: &str = "0123456789abcdef0123456789abcdef";
 
     #[test]
-    fn parse_control_snapshot_golden() {
-        let body = "<Control><CmdType>DeviceControl</CmdType><SN>17</SN><DeviceID>34020000001320000001</DeviceID>\
-<SnapShot><SnapNum>3</SnapNum><Interval>2</Interval>\
+    fn parse_config_snapshot_golden() {
+        let body = "<Control><CmdType>DeviceConfig</CmdType><SN>17</SN><DeviceID>34020000001320000001</DeviceID>\
+<SnapShotConfig><SnapNum>3</SnapNum><Interval>2</Interval>\
 <UploadURL>http://192.168.63.30:9090/api/gb28181/snapshot/upload</UploadURL>\
-<SessionID>0123456789abcdef0123456789abcdef</SessionID></SnapShot></Control>";
-        let c = parse_control_snapshot(body).expect("snapshot control parses");
+<SessionID>0123456789abcdef0123456789abcdef</SessionID></SnapShotConfig></Control>";
+        let c = parse_config_snapshot(body).expect("snapshot config parses");
         assert_eq!(c.sn, "17");
         assert_eq!(c.device_id, "34020000001320000001");
-        assert_eq!(c.snap_shot.snap_num, 3);
-        assert_eq!(c.snap_shot.interval, Some(2));
+        assert_eq!(c.snap_shot_config.snap_num, 3);
+        assert_eq!(c.snap_shot_config.interval, Some(2));
         assert_eq!(
-            c.snap_shot.upload_url,
+            c.snap_shot_config.upload_url,
             "http://192.168.63.30:9090/api/gb28181/snapshot/upload"
         );
-        assert_eq!(c.snap_shot.session_id, SESSION_ID);
+        assert_eq!(c.snap_shot_config.session_id, SESSION_ID);
 
         // Manual snapshot omits Interval.
-        let manual = "<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID>\
-<SnapShot><SnapNum>1</SnapNum><UploadURL>http://x/u</UploadURL><SessionID>0123456789abcdef0123456789abcdef</SessionID></SnapShot></Control>";
+        let manual = "<Control><CmdType>DeviceConfig</CmdType><SN>1</SN><DeviceID>d</DeviceID>\
+<SnapShotConfig><SnapNum>1</SnapNum><UploadURL>http://x/u</UploadURL><SessionID>0123456789abcdef0123456789abcdef</SessionID></SnapShotConfig></Control>";
         assert_eq!(
-            parse_control_snapshot(manual).unwrap().snap_shot.interval,
+            parse_config_snapshot(manual)
+                .unwrap()
+                .snap_shot_config
+                .interval,
             None
         );
 
-        // Non-snapshot controls and garbage return None.
-        assert!(parse_control_snapshot("<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID><RecordCmd>Record</RecordCmd></Control>").is_none());
-        assert!(parse_control_snapshot("<not-xml").is_none());
+        // Real 2022 platform capture (gb28181-go #107): the legacy
+        // DeviceControl/SnapShot shape must no longer parse.
+        let real = "<Control><CmdType>DeviceConfig</CmdType><SN>10003</SN><DeviceID>34020000001310000001</DeviceID>\
+<SnapShotConfig><SnapNum>1</SnapNum><Interval>1</Interval>\
+<UploadURL>http://192.168.0.110:9999/snap</UploadURL>\
+<SessionID>3cffba1f5df14a47acb6594b2375c5c7</SessionID></SnapShotConfig></Control>";
+        let c = parse_config_snapshot(real).expect("real capture parses");
+        assert_eq!(c.sn, "10003");
+        assert_eq!(
+            c.snap_shot_config.upload_url,
+            "http://192.168.0.110:9999/snap"
+        );
+
+        // Non-snapshot bodies and garbage return None — including the
+        // legacy DeviceControl/SnapShot shape this used to accept.
+        assert!(parse_config_snapshot("<Control><CmdType>DeviceConfig</CmdType><SN>1</SN><DeviceID>d</DeviceID><RecordCmd>Record</RecordCmd></Control>").is_none());
+        assert!(parse_config_snapshot("<Control><CmdType>DeviceControl</CmdType><SN>1</SN><DeviceID>d</DeviceID><SnapShot><SnapNum>1</SnapNum><UploadURL>u</UploadURL><SessionID>0123456789abcdef0123456789abcdef</SessionID></SnapShot></Control>").is_none());
+        assert!(parse_config_snapshot("<not-xml").is_none());
     }
 
     #[test]

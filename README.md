@@ -147,7 +147,7 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 ### GB28181-2022 snapshot wire types (issue #49 twin)
 
-`manscdp` parses the inbound `DeviceControl` snapshot command (`parse_control_snapshot`: `SnapShot` with `SnapNum`/`Interval`/`UploadURL`/`SessionID`, A.2.1.24) and builds the device-side `UploadSnapShotFinished` completion report (`build_upload_snapshot_finished`, A.2.5.7) — goldens byte-identical to the Go twin.
+`manscdp` parses the inbound snapshot configuration (`parse_config_snapshot`: a `Control` root with `CmdType=DeviceConfig` carrying `SnapShotConfig` with `SnapNum`/`Interval`/`UploadURL`/`SessionID`, A.2.1.24 — the device-config channel, matching real 2022 captures per gb28181-go #107) and builds the device-side `UploadSnapShotFinished` completion report (`build_upload_snapshot_finished`, A.2.5.7) — goldens byte-identical to the Go twin.
 
 ## Documentation
 

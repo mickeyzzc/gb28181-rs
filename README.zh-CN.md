@@ -146,7 +146,7 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 ### GB28181-2022 抓拍线格式类型（issue #49 孪生对齐）
 
-`manscdp` 解析入站 `DeviceControl` 抓拍命令（`parse_control_snapshot`：`SnapShot` 携带 `SnapNum`/`Interval`/`UploadURL`/`SessionID`，A.2.1.24），并构造设备侧 `UploadSnapShotFinished` 完成上报（`build_upload_snapshot_finished`，A.2.5.7）——golden 与 Go 孪生库逐字节一致。
+`manscdp` 解析入站抓拍配置（`parse_config_snapshot`：`Control` 根、`CmdType=DeviceConfig` 携带 `SnapShotConfig`——`SnapNum`/`Interval`/`UploadURL`/`SessionID`，A.2.1.24，走设备配置通道、与 2022 实机报文一致，见 gb28181-go #107），并构造设备侧 `UploadSnapShotFinished` 完成上报（`build_upload_snapshot_finished`，A.2.5.7）——golden 与 Go 孪生库逐字节一致。
 
 ## 文档
 

@@ -6,8 +6,7 @@ use proptest::prelude::*;
 
 use gb28181_rs::charset::{decode_wire_body, encode_wire_body};
 use gb28181_rs::manscdp::{
-    parse_control_snapshot, parse_device_config, parse_device_control, parse_ptz_command,
-    PtzCommand,
+    parse_config_snapshot, parse_device_config, parse_device_control, parse_ptz_command, PtzCommand,
 };
 use gb28181_rs::sip::{build_register_request, parse_digest_auth, parse_sip_date, SipMessage};
 
@@ -62,7 +61,7 @@ proptest! {
         let lossy = String::from_utf8_lossy(&data).into_owned();
         let _ = parse_device_control(&lossy);
         let _ = parse_device_config(&lossy);
-        let _ = parse_control_snapshot(&lossy);
+        let _ = parse_config_snapshot(&lossy);
     }
 
     /// PTZ decode is byte-faithful in both directions: arbitrary input

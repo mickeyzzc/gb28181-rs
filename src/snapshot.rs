@@ -1,17 +1,19 @@
 //! Device-side snapshot command execution (GB/T 28181-2022 A.2.1.24 /
 //! A.2.5.7).
 //!
-//! The platform orders captures with a DeviceControl(SnapShot) MESSAGE.
-//! The server answers 200 synchronously, hands the parsed command to the
-//! installed [`SnapshotExecutor`], and reports completion with an
+//! The platform orders captures with a DeviceConfig(SnapShotConfig)
+//! MESSAGE (A.2.1.24 rides the device-config channel — twin of
+//! gb28181-go #107). The server answers 200 plus the A.2.6.8 OK
+//! response, hands the parsed command to the installed
+//! [`SnapshotExecutor`], and reports completion with an
 //! UploadSnapShotFinished notify carrying the same SessionID. The
 //! executor owns the product side: capture JPEG frames and POST each
 //! body to the command's `upload_url` **verbatim** (the URL already
 //! carries the session parameter — the receiving platform owns that
 //! contract); the returned IDs become the notify's SnapShotFileID list,
 //! and an empty list reports the exchange as wholly/partially failed
-//! (A.2.5.7). Without an executor the server keeps its historical
-//! behavior and rejects the control command.
+//! (A.2.5.7). Without an executor the server rejects the configuration
+//! with Result=ERROR on the same channel.
 
 use std::future::Future;
 use std::pin::Pin;

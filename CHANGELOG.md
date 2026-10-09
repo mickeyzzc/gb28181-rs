@@ -11,6 +11,17 @@ released out of band.
 
 ## [Unreleased]
 
+- `fix(manscdp)` snapshot rides the device-config channel (twin of
+  gb28181-go #107): the 2022 image-snapshot command is a `Control` body
+  with `CmdType=DeviceConfig` carrying `SnapShotConfig` (A.2.1.24) —
+  not `DeviceControl`/`SnapShot` as previously modeled — matching real
+  2022 platform captures. `ConfigSnapShot`/`parse_config_snapshot`
+  replace `ControlSnapShot`/`parse_control_snapshot`; with an executor
+  installed the A.2.6.8 `Result=OK` response is the synchronous answer
+  before the exchange runs, and the reject goes back on the same
+  DeviceConfig channel. `SnapshotExecutor`/`SnapshotCommand` are
+  unchanged.
+
 ## [v0.12.0] — 2026-09-20
 
 The GB/T 28181-2022 device-side closure package (#57/#58), twin of

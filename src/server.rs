@@ -577,7 +577,7 @@ impl Gb28181Server {
     }
 
     /// Installs the device-side snapshot executor (GB/T 28181-2022
-    /// A.2.1.24): DeviceControl(SnapShot) commands run against it and
+    /// A.2.1.24): DeviceConfig(SnapShotConfig) commands run against it and
     /// complete asynchronously with the A.2.5.7 UploadSnapShotFinished
     /// notify. `None` (default) keeps the historical control-reject
     /// behavior. Requires the UDP transport — over TCP the command is
@@ -1391,23 +1391,37 @@ impl Gb28181Server {
                     self.send_sip_message(&ok_response, peer_addr).await?;
                 }
 
-                // DeviceControl(SnapShot) (A.2.1.24): with an executor
-                // installed the 200 above is the whole synchronous answer;
-                // the exchange runs in a spawned task and completes
+                // DeviceConfig(SnapShotConfig) (A.2.1.24, twin of
+                // gb28181-go #107): the snapshot rides the device-config
+                // channel. With an executor installed the A.2.6.8
+                // Result=OK response is the synchronous answer; the
+                // exchange runs in a spawned task and completes
                 // asynchronously via the A.2.5.7 notify. Without an
-                // executor — or over the TCP transport — the control
-                // reject below keeps the historical behavior.
-                if let Some(control) = crate::manscdp::parse_control_snapshot(&msg.body) {
+                // executor — or over the TCP transport — the fall-through
+                // reject answers ERROR on the same DeviceConfig channel.
+                if let Some(config) = crate::manscdp::parse_config_snapshot(&msg.body) {
                     if let Some(executor) = self.snapshot_executor.clone() {
                         // UDP only: the notify leaves through the shared
                         // SIP UDP socket; per-connection TCP servers carry
                         // a placeholder UDP socket, so key off tcp_conn.
                         if self.tcp_conn.is_none() && self.sip_socket.is_some() {
-                            self.spawn_snapshot_exchange(&control, executor, platform_addr);
+                            let cseq = random_cseq();
+                            let ok_response = super::client::build_device_config_response(
+                                true,
+                                &config.sn,
+                                &config.device_id,
+                                &self.config.sip_domain,
+                                &self.local_ip,
+                                self.config.local_sip_port,
+                                cseq,
+                            )?;
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            self.send_sip_message(&ok_response, peer_addr).await?;
+                            self.spawn_snapshot_exchange(&config, executor, platform_addr);
                             return Ok(());
                         }
                         log::warn!(
-                            "gb28181: snapshot command over TCP transport — executor requires UDP, rejecting"
+                            "gb28181: snapshot config over TCP transport — executor requires UDP, rejecting"
                         );
                     }
                 }
@@ -2647,20 +2661,20 @@ impl Gb28181Server {
     /// exchange (empty SnapShotList); `file_ids` pass through verbatim.
     fn spawn_snapshot_exchange(
         &self,
-        control: &crate::manscdp::ControlSnapShot,
+        config: &crate::manscdp::ConfigSnapShot,
         executor: Arc<dyn crate::snapshot::SnapshotExecutor>,
         platform_addr: SocketAddr,
     ) {
         use crate::snapshot::SnapshotCommand;
 
         let cmd = SnapshotCommand {
-            snap_num: control.snap_shot.snap_num,
-            interval: control.snap_shot.interval,
-            upload_url: control.snap_shot.upload_url.clone(),
-            session_id: control.snap_shot.session_id.clone(),
+            snap_num: config.snap_shot_config.snap_num,
+            interval: config.snap_shot_config.interval,
+            upload_url: config.snap_shot_config.upload_url.clone(),
+            session_id: config.snap_shot_config.session_id.clone(),
         };
-        let sn = control.sn.parse::<u32>().unwrap_or(0);
-        let session_id = control.snap_shot.session_id.clone();
+        let sn = config.sn.parse::<u32>().unwrap_or(0);
+        let session_id = config.snap_shot_config.session_id.clone();
         let device_id = self.config.device_id.clone();
         let domain = self.config.sip_domain.clone();
         let local_ip = self.local_ip.clone();
