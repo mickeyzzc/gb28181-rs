@@ -903,6 +903,113 @@ pub enum DeviceConfigKind {
         motion_detection: u32,
         field_detection: u32,
     },
+    /// A.2.3.2.5 视频参数属性配置 (gb28181-go #109 twin) — per-stream
+    /// codec attributes; hosts decide what sticks.
+    VideoParamAttribute(VideoParamAttributeCfg),
+    /// A.2.3.2.6 录像计划配置 — the weekly schedule hosts gate their
+    /// recorder on.
+    VideoRecordPlan(VideoRecordPlanCfg),
+    /// A.2.3.2.7 报警录像配置 — alarm recording with pre/post roll.
+    VideoAlarmRecord(VideoAlarmRecordCfg),
+    /// A.2.3.2.8 视频画面遮挡配置 — privacy masking regions.
+    PictureMask(PictureMaskCfg),
+    /// A.2.3.2.11 前端 OSD 配置 — time/text overlay layout.
+    OsdConfig(OsdConfigCfg),
+}
+
+/// A.2.1.13 videoParamAttributeCfgType Item: one stream's codec
+/// attributes (values per Annex G / SDP f=).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoParamItem {
+    pub stream_number: u32,
+    pub video_format: String,
+    pub resolution: String,
+    pub frame_rate: String,
+    pub bit_rate_type: String,
+    /// Required with a fixed bitrate; `None` when absent.
+    pub video_bit_rate: Option<String>,
+}
+
+/// A.2.3.2.5 视频参数属性配置 payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoParamAttributeCfg {
+    pub num: Option<u32>,
+    pub items: Vec<VideoParamItem>,
+}
+
+/// One recording window inside a weekday (A.2.1.15).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordTimeSegment {
+    pub start_hour: u32,
+    pub start_min: u32,
+    pub start_sec: u32,
+    pub stop_hour: u32,
+    pub stop_min: u32,
+    pub stop_sec: u32,
+}
+
+/// One weekday's recording plan (A.2.1.15): `week_day_num` 1..7
+/// (Mon..Sun), up to 8 segments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordSchedule {
+    pub week_day_num: u32,
+    pub time_segments: Vec<RecordTimeSegment>,
+}
+
+/// A.2.3.2.6 录像计划配置 payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoRecordPlanCfg {
+    pub record_enable: u32,
+    pub schedules: Vec<RecordSchedule>,
+    pub stream_number: u32,
+}
+
+/// A.2.3.2.7 报警录像配置 payload (A.2.1.16).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VideoAlarmRecordCfg {
+    pub record_enable: u32,
+    pub record_time: Option<u32>,
+    pub pre_record_time: Option<u32>,
+    pub stream_number: u32,
+}
+
+/// One masked region (A.2.1.17): `seq` 1..4 and "lx,ly,rx,ry" corners.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PictureMaskRegion {
+    pub seq: u32,
+    pub point: String,
+}
+
+/// A.2.3.2.8 视频画面遮挡配置 payload (A.2.1.17). `regions` is empty
+/// when the RegionList element is absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PictureMaskCfg {
+    pub on: u32,
+    pub sum_num: u32,
+    pub region_list_num: Option<u32>,
+    pub regions: Vec<PictureMaskRegion>,
+}
+
+/// One OSD text entry (A.2.1.12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsdItem {
+    pub text: String,
+    pub x: i32,
+    pub y: i32,
+}
+
+/// A.2.3.2.11 前端 OSD 配置 payload (A.2.1.12 OSDCfgType).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OsdConfigCfg {
+    pub length: i32,
+    pub width: i32,
+    pub time_x: i32,
+    pub time_y: i32,
+    pub time_enable: Option<u32>,
+    pub time_type: Option<u32>,
+    pub text_enable: Option<u32>,
+    pub sum_num: u32,
+    pub items: Vec<OsdItem>,
 }
 
 /// An inbound DeviceConfig command with a recognized sub-command.
@@ -931,6 +1038,16 @@ struct DeviceConfigBody {
     frame_mirror: Option<String>,
     #[serde(rename = "AlarmReport", default)]
     alarm_report: Option<AlarmReportBody>,
+    #[serde(rename = "VideoParamAttribute", default)]
+    video_param_attribute: Option<VideoParamAttributeBody>,
+    #[serde(rename = "VideoRecordPlan", default)]
+    video_record_plan: Option<VideoRecordPlanBody>,
+    #[serde(rename = "VideoAlarmRecord", default)]
+    video_alarm_record: Option<VideoAlarmRecordBody>,
+    #[serde(rename = "PictureMask", default)]
+    picture_mask: Option<PictureMaskBody>,
+    #[serde(rename = "OSDConfig", default)]
+    osd_config: Option<OsdConfigBody>,
 }
 
 #[derive(Deserialize)]
@@ -965,6 +1082,162 @@ struct AlarmReportBody {
     field_detection: String,
 }
 
+#[derive(Deserialize)]
+struct VideoParamAttributeBody {
+    #[serde(rename = "Num", default)]
+    num: Option<String>,
+    #[serde(rename = "Item", default)]
+    items: Vec<VideoParamItemBody>,
+}
+
+#[derive(Deserialize)]
+struct VideoParamItemBody {
+    #[serde(rename = "StreamNumber", default)]
+    stream_number: String,
+    #[serde(rename = "VideoFormat", default)]
+    video_format: String,
+    #[serde(rename = "Resolution", default)]
+    resolution: String,
+    #[serde(rename = "FrameRate", default)]
+    frame_rate: String,
+    #[serde(rename = "BitRateType", default)]
+    bit_rate_type: String,
+    #[serde(
+        rename = "VideoBitRate",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    video_bit_rate: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct VideoRecordPlanBody {
+    #[serde(rename = "RecordEnable", default)]
+    record_enable: String,
+    #[serde(rename = "RecordSchedule", default)]
+    schedules: Vec<RecordScheduleBody>,
+    #[serde(rename = "StreamNumber", default)]
+    stream_number: String,
+}
+
+#[derive(Deserialize)]
+struct RecordScheduleBody {
+    #[serde(rename = "WeekDayNum", default)]
+    week_day_num: String,
+    #[serde(rename = "TimeSegment", default)]
+    time_segments: Vec<RecordTimeSegmentBody>,
+}
+
+#[derive(Deserialize)]
+struct RecordTimeSegmentBody {
+    #[serde(rename = "StartHour", default)]
+    start_hour: String,
+    #[serde(rename = "StartMin", default)]
+    start_min: String,
+    #[serde(rename = "StartSec", default)]
+    start_sec: String,
+    #[serde(rename = "StopHour", default)]
+    stop_hour: String,
+    #[serde(rename = "StopMin", default)]
+    stop_min: String,
+    #[serde(rename = "StopSec", default)]
+    stop_sec: String,
+}
+
+#[derive(Deserialize)]
+struct VideoAlarmRecordBody {
+    #[serde(rename = "RecordEnable", default)]
+    record_enable: String,
+    #[serde(
+        rename = "RecordTime",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    record_time: Option<String>,
+    #[serde(
+        rename = "PreRecordTime",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    pre_record_time: Option<String>,
+    #[serde(rename = "StreamNumber", default)]
+    stream_number: String,
+}
+
+#[derive(Deserialize)]
+struct PictureMaskBody {
+    #[serde(rename = "On", default)]
+    on: String,
+    #[serde(rename = "SumNum", default)]
+    sum_num: String,
+    #[serde(rename = "RegionList", default)]
+    region_list: Option<PictureMaskRegionListBody>,
+}
+
+#[derive(Deserialize)]
+struct PictureMaskRegionListBody {
+    #[serde(rename = "Num", default)]
+    num: Option<String>,
+    #[serde(rename = "Item", default)]
+    items: Vec<PictureMaskRegionBody>,
+}
+
+#[derive(Deserialize)]
+struct PictureMaskRegionBody {
+    #[serde(rename = "Seq", default)]
+    seq: String,
+    #[serde(rename = "Point", default)]
+    point: String,
+}
+
+#[derive(Deserialize)]
+struct OsdConfigBody {
+    #[serde(rename = "Length", default)]
+    length: String,
+    #[serde(rename = "Width", default)]
+    width: String,
+    #[serde(rename = "TimeX", default)]
+    time_x: String,
+    #[serde(rename = "TimeY", default)]
+    time_y: String,
+    #[serde(
+        rename = "TimeEnable",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    time_enable: Option<String>,
+    #[serde(
+        rename = "TimeType",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    time_type: Option<String>,
+    #[serde(
+        rename = "TextEnable",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    text_enable: Option<String>,
+    #[serde(rename = "SumNum", default)]
+    sum_num: String,
+    #[serde(rename = "Item", default)]
+    items: Vec<OsdItemBody>,
+}
+
+#[derive(Deserialize)]
+struct OsdItemBody {
+    #[serde(rename = "Text", default)]
+    text: String,
+    #[serde(rename = "X", default)]
+    x: String,
+    #[serde(rename = "Y", default)]
+    y: String,
+}
+
+fn parse_num<T: std::str::FromStr>(s: &str) -> Option<T> {
+    s.trim().parse().ok()
+}
+
 /// Parses an inbound DeviceConfig body; `None` when the body is not a
 /// DeviceConfig or carries no recognized sub-command (the caller keeps
 /// the reject behavior for those).
@@ -993,6 +1266,106 @@ pub fn parse_device_config(body: &str) -> Option<DeviceConfig> {
             motion_detection,
             field_detection,
         })
+    } else if let Some(vpa) = c.video_param_attribute {
+        Some(DeviceConfigKind::VideoParamAttribute(
+            VideoParamAttributeCfg {
+                num: vpa.num.as_deref().and_then(parse_num),
+                items: vpa
+                    .items
+                    .into_iter()
+                    .map(|i| {
+                        Some(VideoParamItem {
+                            stream_number: parse_num(&i.stream_number)?,
+                            video_format: i.video_format,
+                            resolution: i.resolution,
+                            frame_rate: i.frame_rate,
+                            bit_rate_type: i.bit_rate_type,
+                            video_bit_rate: i.video_bit_rate,
+                        })
+                    })
+                    .collect::<Option<Vec<_>>>()?,
+            },
+        ))
+    } else if let Some(vrp) = c.video_record_plan {
+        Some(DeviceConfigKind::VideoRecordPlan(VideoRecordPlanCfg {
+            record_enable: parse_num(&vrp.record_enable)?,
+            schedules: vrp
+                .schedules
+                .into_iter()
+                .map(|s| {
+                    Some(RecordSchedule {
+                        week_day_num: parse_num(&s.week_day_num)?,
+                        time_segments: s
+                            .time_segments
+                            .into_iter()
+                            .map(|t| {
+                                Some(RecordTimeSegment {
+                                    start_hour: parse_num(&t.start_hour)?,
+                                    start_min: parse_num(&t.start_min)?,
+                                    start_sec: parse_num(&t.start_sec)?,
+                                    stop_hour: parse_num(&t.stop_hour)?,
+                                    stop_min: parse_num(&t.stop_min)?,
+                                    stop_sec: parse_num(&t.stop_sec)?,
+                                })
+                            })
+                            .collect::<Option<Vec<_>>>()?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+            stream_number: parse_num(&vrp.stream_number)?,
+        }))
+    } else if let Some(var) = c.video_alarm_record {
+        Some(DeviceConfigKind::VideoAlarmRecord(VideoAlarmRecordCfg {
+            record_enable: parse_num(&var.record_enable)?,
+            record_time: var.record_time.as_deref().and_then(parse_num),
+            pre_record_time: var.pre_record_time.as_deref().and_then(parse_num),
+            stream_number: parse_num(&var.stream_number)?,
+        }))
+    } else if let Some(pm) = c.picture_mask {
+        Some(DeviceConfigKind::PictureMask(PictureMaskCfg {
+            on: parse_num(&pm.on)?,
+            sum_num: parse_num(&pm.sum_num)?,
+            region_list_num: pm
+                .region_list
+                .as_ref()
+                .and_then(|rl| rl.num.as_deref().and_then(parse_num)),
+            regions: pm
+                .region_list
+                .and_then(|rl| {
+                    rl.items
+                        .into_iter()
+                        .map(|i| {
+                            Some(PictureMaskRegion {
+                                seq: parse_num(&i.seq)?,
+                                point: i.point,
+                            })
+                        })
+                        .collect::<Option<Vec<_>>>()
+                })
+                .unwrap_or_default(),
+        }))
+    } else if let Some(osd) = c.osd_config {
+        Some(DeviceConfigKind::OsdConfig(OsdConfigCfg {
+            length: parse_num(&osd.length)?,
+            width: parse_num(&osd.width)?,
+            time_x: parse_num(&osd.time_x)?,
+            time_y: parse_num(&osd.time_y)?,
+            time_enable: osd.time_enable.as_deref().and_then(parse_num),
+            time_type: osd.time_type.as_deref().and_then(parse_num),
+            text_enable: osd.text_enable.as_deref().and_then(parse_num),
+            sum_num: parse_num(&osd.sum_num)?,
+            items: osd
+                .items
+                .into_iter()
+                .map(|i| {
+                    Some(OsdItem {
+                        text: i.text,
+                        x: parse_num(&i.x)?,
+                        y: parse_num(&i.y)?,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?,
+        }))
     } else {
         None
     }?;
@@ -1061,6 +1434,112 @@ mod proptests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_device_config_2022_closure_golden() {
+        use super::*;
+
+        // A.2.3.2.5 VideoParamAttribute (Num attr + two Items).
+        let body = "<Control><CmdType>DeviceConfig</CmdType><SN>71</SN><DeviceID>d1</DeviceID>\
+<VideoParamAttribute Num=\"2\">\
+<Item><StreamNumber>0</StreamNumber><VideoFormat>H.264</VideoFormat>\
+<Resolution>1920x1080</Resolution><FrameRate>25</FrameRate>\
+<BitRateType>0</BitRateType><VideoBitRate>4096</VideoBitRate></Item>\
+<Item><StreamNumber>1</StreamNumber><VideoFormat>H.265</VideoFormat>\
+<Resolution>640x480</Resolution><FrameRate>15</FrameRate>\
+<BitRateType>1</BitRateType></Item>\
+</VideoParamAttribute></Control>";
+        let cfg = parse_device_config(body).expect("vpa parses");
+        match cfg.kind {
+            DeviceConfigKind::VideoParamAttribute(vpa) => {
+                assert_eq!(vpa.num, Some(2));
+                assert_eq!(vpa.items.len(), 2);
+                assert_eq!(vpa.items[0].stream_number, 0);
+                assert_eq!(vpa.items[0].resolution, "1920x1080");
+                assert_eq!(vpa.items[0].video_bit_rate.as_deref(), Some("4096"));
+                assert_eq!(vpa.items[1].video_bit_rate, None);
+            }
+            other => panic!("kind = {:?}", other),
+        }
+
+        // A.2.3.2.6 VideoRecordPlan (two weekdays, two segments on one).
+        let body = "<Control><CmdType>DeviceConfig</CmdType><SN>72</SN><DeviceID>d1</DeviceID>\
+<VideoRecordPlan><RecordEnable>1</RecordEnable><RecordScheduleSumNum>2</RecordScheduleSumNum>\
+<RecordSchedule><WeekDayNum>1</WeekDayNum><TimeSegmentSumNum>1</TimeSegmentSumNum>\
+<TimeSegment><StartHour>0</StartHour><StartMin>0</StartMin><StartSec>0</StartSec>\
+<StopHour>12</StopHour><StopMin>0</StopMin><StopSec>0</StopSec></TimeSegment></RecordSchedule>\
+<RecordSchedule><WeekDayNum>7</WeekDayNum><TimeSegmentSumNum>2</TimeSegmentSumNum>\
+<TimeSegment><StartHour>8</StartHour><StartMin>30</StartMin><StartSec>0</StartSec>\
+<StopHour>11</StopHour><StopMin>45</StopMin><StopSec>30</StopSec></TimeSegment>\
+<TimeSegment><StartHour>14</StartHour><StartMin>0</StartMin><StartSec>0</StartSec>\
+<StopHour>23</StopHour><StopMin>59</StopMin><StopSec>59</StopSec></TimeSegment>\
+</RecordSchedule><StreamNumber>0</StreamNumber></VideoRecordPlan></Control>";
+        let cfg = parse_device_config(body).expect("vrp parses");
+        match cfg.kind {
+            DeviceConfigKind::VideoRecordPlan(vrp) => {
+                assert_eq!(vrp.record_enable, 1);
+                assert_eq!(vrp.schedules.len(), 2);
+                assert_eq!(vrp.schedules[0].time_segments[0].stop_hour, 12);
+                assert_eq!(vrp.schedules[1].time_segments.len(), 2);
+                assert_eq!(vrp.schedules[1].time_segments[1].stop_sec, 59);
+                assert_eq!(vrp.stream_number, 0);
+            }
+            other => panic!("kind = {:?}", other),
+        }
+
+        // A.2.3.2.7 VideoAlarmRecord (optional pre/record roll).
+        let body = "<Control><CmdType>DeviceConfig</CmdType><SN>73</SN><DeviceID>d1</DeviceID>\
+<VideoAlarmRecord><RecordEnable>1</RecordEnable><RecordTime>30</RecordTime>\
+<PreRecordTime>10</PreRecordTime><StreamNumber>1</StreamNumber></VideoAlarmRecord></Control>";
+        let cfg = parse_device_config(body).expect("var parses");
+        match cfg.kind {
+            DeviceConfigKind::VideoAlarmRecord(var) => {
+                assert_eq!(var.record_time, Some(30));
+                assert_eq!(var.pre_record_time, Some(10));
+                assert_eq!(var.stream_number, 1);
+            }
+            other => panic!("kind = {:?}", other),
+        }
+
+        // A.2.3.2.8 PictureMask (RegionList Num attr + regions).
+        let body = "<Control><CmdType>DeviceConfig</CmdType><SN>74</SN><DeviceID>d1</DeviceID>\
+<PictureMask><On>1</On><SumNum>2</SumNum>\
+<RegionList Num=\"2\">\
+<Item><Seq>1</Seq><Point>20,30,50,60</Point></Item>\
+<Item><Seq>2</Seq><Point>100,200,300,400</Point></Item>\
+</RegionList></PictureMask></Control>";
+        let cfg = parse_device_config(body).expect("pm parses");
+        match cfg.kind {
+            DeviceConfigKind::PictureMask(pm) => {
+                assert_eq!(pm.on, 1);
+                assert_eq!(pm.region_list_num, Some(2));
+                assert_eq!(pm.regions.len(), 2);
+                assert_eq!(pm.regions[0].point, "20,30,50,60");
+            }
+            other => panic!("kind = {:?}", other),
+        }
+
+        // A.2.3.2.11 OSDConfig (optional switches + items).
+        let body = "<Control><CmdType>DeviceConfig</CmdType><SN>75</SN><DeviceID>d1</DeviceID>\
+<OSDConfig><Length>1920</Length><Width>1080</Width>\
+<TimeX>10</TimeX><TimeY>10</TimeY><TimeEnable>1</TimeEnable><TimeType>0</TimeType>\
+<TextEnable>1</TextEnable><SumNum>2</SumNum>\
+<Item><Text>Front door</Text><X>100</X><Y>200</Y></Item>\
+<Item><Text>Zone B</Text><X>300</X><Y>400</Y></Item>\
+</OSDConfig></Control>";
+        let cfg = parse_device_config(body).expect("osd parses");
+        match cfg.kind {
+            DeviceConfigKind::OsdConfig(osd) => {
+                assert_eq!(osd.length, 1920);
+                assert_eq!(osd.time_enable, Some(1));
+                assert_eq!(osd.time_type, Some(0));
+                assert_eq!(osd.items.len(), 2);
+                assert_eq!(osd.items[0].text, "Front door");
+                assert_eq!(osd.items[1].y, 400);
+            }
+            other => panic!("kind = {:?}", other),
+        }
+    }
+
     use super::*;
 
     // ── DeviceControl sub-command decode (#58) ────────────────────────────

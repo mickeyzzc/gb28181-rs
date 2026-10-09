@@ -11,6 +11,18 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(manscdp)` DeviceConfig closure family (twin of gb28181-go
+  #109): five more 2022 sub-commands decode and fire optional
+  `DeviceConfigHandler` hooks — `VideoParamAttribute` (A.2.3.2.5),
+  `VideoRecordPlan` (A.2.3.2.6), `VideoAlarmRecord` (A.2.3.2.7),
+  `PictureMask` (A.2.3.2.8) and `OSDConfig` (A.2.3.2.11), wire forms
+  verified against the standard text (A.2.1.12-17); SVAC
+  encode/decode configs stay explicitly unsupported.
+- `feat` ConfigDownload grows the `VideoParamOpt` block (A.2.1.20):
+  download speeds + resolutions from the new
+  `Gb28181Config::video_param_opt_download_speed`/`_resolution`
+  ("/"-joined, serde-defaulted; empty omits the block).
+
 - `fix(manscdp)` snapshot rides the device-config channel (twin of
   gb28181-go #107): the 2022 image-snapshot command is a `Control` body
   with `CmdType=DeviceConfig` carrying `SnapShotConfig` (A.2.1.24) —
