@@ -462,6 +462,64 @@ pub fn parse_config_snapshot(body: &str) -> Option<ConfigSnapShot> {
     (c.cmd_type == "DeviceConfig").then_some(c)
 }
 
+/// The A.2.5.9 设备软件升级结果通知: OK/ERROR plus the firmware in
+/// effect after the attempt and, on failure, a reason (01 download
+/// timeout, 02 package corrupt, 03 system error, 99 other).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(rename = "Notify")]
+pub struct DeviceUpgradeResult {
+    #[serde(rename = "CmdType")]
+    pub cmd_type: String,
+    #[serde(rename = "SN")]
+    pub sn: String,
+    #[serde(rename = "DeviceID")]
+    pub device_id: String,
+    #[serde(rename = "SessionID")]
+    pub session_id: String,
+    #[serde(rename = "UpgradeResult")]
+    pub upgrade_result: String,
+    #[serde(rename = "Firmware")]
+    pub firmware: String,
+    #[serde(
+        rename = "UpgradeFailedReason",
+        skip_serializing_if = "String::is_empty"
+    )]
+    pub upgrade_failed_reason: String,
+}
+
+impl DeviceUpgradeResult {
+    /// Serializes the notify body as a `<Notify>` document (caller wraps
+    /// it in a SIP MESSAGE); the XML declaration is stripped to match
+    /// the Go twin's wire bytes.
+    pub fn to_xml(&self) -> anyhow::Result<String> {
+        let out = serde_xml_rs::to_string(self)?;
+        let body = out
+            .strip_prefix("<?xml version=\"1.0\" encoding=\"UTF-8\"?>")
+            .unwrap_or(&out);
+        Ok(body.to_string())
+    }
+}
+
+/// Builds the device-side completion report.
+pub fn build_device_upgrade_result(
+    sn: u32,
+    device_id: &str,
+    session_id: &str,
+    ok: bool,
+    firmware: &str,
+    failed_reason: &str,
+) -> DeviceUpgradeResult {
+    DeviceUpgradeResult {
+        cmd_type: "DeviceUpgradeResult".to_string(),
+        sn: sn.to_string(),
+        device_id: device_id.to_string(),
+        session_id: session_id.to_string(),
+        upgrade_result: if ok { "OK" } else { "ERROR" }.to_string(),
+        firmware: firmware.to_string(),
+        upgrade_failed_reason: failed_reason.to_string(),
+    }
+}
+
 /// Builds the device-side completion report.
 pub fn build_upload_snapshot_finished(
     sn: u32,
@@ -647,8 +705,9 @@ pub fn parse_ptz_command(a505_hex: &str) -> PtzCommand {
     }
 }
 
-/// A decoded DeviceControl sub-command (issue #58).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A decoded DeviceControl sub-command (issue #58). Not `Eq`:
+/// [`DeviceControlKind::PTZPrecise`] carries `f64` angles.
+#[derive(Debug, Clone, PartialEq)]
 pub enum DeviceControlKind {
     /// `<IFrameCmd>Send</IFrameCmd>` — force the next encoded frame to be
     /// an IDR. Platforms send this when starting a pull or after loss.
@@ -679,6 +738,41 @@ pub enum DeviceControlKind {
     /// (A.2.3.1.8/9): box coordinates in playback-window pixels
     /// ([`DragZoom`], issue #58).
     DragZoom(DragZoom),
+    /// `<FormatSDCard>` — A.2.3.1.13 storage-card format: card number
+    /// starting at 1; 0 formats every card (gb28181-go #108 twin).
+    FormatSDCard(u32),
+    /// `<PTZPreciseCtrl>` — A.2.3.1.11 absolute Pan/Tilt/Zoom angles
+    /// (A.2.1.11, every field optional; gb28181-go #108 twin).
+    PTZPrecise(PtzPrecise),
+    /// `<DeviceUpgrade>` — A.2.3.1.12 firmware-upgrade command; the
+    /// completion report is the A.2.5.9 `DeviceUpgradeResult` notify
+    /// (gb28181-go #108 twin).
+    DeviceUpgrade(DeviceUpgradeCmd),
+}
+
+/// A.2.1.11 PTZPreciseCtrlType: absolute pan (0..360.00), tilt
+/// (typically -30.00..90.00) and zoom (>1.00) angles; every field
+/// optional (`None` = keep).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PtzPrecise {
+    pub pan: Option<f64>,
+    pub tilt: Option<f64>,
+    pub zoom: Option<f64>,
+}
+
+/// A.2.3.1.12 设备软件升级 command payload: every child required. The
+/// host downloads `file_url` and flashes; the A.2.5.9 completion report
+/// echoes `session_id`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceUpgradeCmd {
+    /// Current device firmware version.
+    pub firmware: String,
+    /// Full path of the upgrade file.
+    pub file_url: String,
+    /// Device vendor.
+    pub manufacturer: String,
+    /// Platform-generated session ID ([A-Za-z0-9-], 32..128 bytes).
+    pub session_id: String,
 }
 
 /// 拉框放大/缩小 control payload (A.2.3.1.8 DragZoomIn / A.2.3.1.9
@@ -708,7 +802,7 @@ pub struct DragZoom {
 /// Only the child-element form is parsed (the production-validated form
 /// for controls, matching [`parse_config_snapshot`]); unknown or absent
 /// sub-commands yield `None` so the server keeps its reject behavior.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DeviceControl {
     pub sn: String,
     pub device_id: String,
@@ -757,6 +851,16 @@ struct DeviceControlBody {
     ptz_cmd: Option<String>,
     #[serde(rename = "HomePosition", default)]
     home_position: Option<HomePositionBody>,
+    #[serde(
+        rename = "FormatSDCard",
+        default,
+        deserialize_with = "empty_string_as_none"
+    )]
+    format_sd_card: Option<String>,
+    #[serde(rename = "PTZPreciseCtrl", default)]
+    ptz_precise: Option<PtzPreciseBody>,
+    #[serde(rename = "DeviceUpgrade", default)]
+    device_upgrade: Option<DeviceUpgradeBody>,
     #[serde(rename = "DragZoomIn", default)]
     drag_zoom_in: Option<DragZoomBody>,
     #[serde(rename = "DragZoomOut", default)]
@@ -802,6 +906,28 @@ struct DragZoomBody {
 }
 
 /// Parses an inbound DeviceControl body; `None` when the body is not a
+#[derive(Deserialize)]
+struct PtzPreciseBody {
+    #[serde(rename = "Pan", default, deserialize_with = "empty_string_as_none")]
+    pan: Option<String>,
+    #[serde(rename = "Tilt", default, deserialize_with = "empty_string_as_none")]
+    tilt: Option<String>,
+    #[serde(rename = "Zoom", default, deserialize_with = "empty_string_as_none")]
+    zoom: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DeviceUpgradeBody {
+    #[serde(rename = "Firmware", default)]
+    firmware: String,
+    #[serde(rename = "FileURL", default)]
+    file_url: String,
+    #[serde(rename = "Manufacturer", default)]
+    manufacturer: String,
+    #[serde(rename = "SessionID", default)]
+    session_id: String,
+}
+
 /// DeviceControl or carries no recognized sub-command (the caller keeps
 /// its control-reject behavior for those).
 pub fn parse_device_control(body: &str) -> Option<DeviceControl> {
@@ -847,6 +973,31 @@ pub fn parse_device_control(body: &str) -> Option<DeviceControl> {
         parse_drag_zoom(dz, true).map(DeviceControlKind::DragZoom)
     } else if let Some(dz) = c.drag_zoom_out {
         parse_drag_zoom(dz, false).map(DeviceControlKind::DragZoom)
+    } else if let Some(card) = c
+        .format_sd_card
+        .as_deref()
+        .and_then(|v| v.trim().parse::<u32>().ok())
+    {
+        Some(DeviceControlKind::FormatSDCard(card))
+    } else if let Some(pp) = c.ptz_precise {
+        Some(DeviceControlKind::PTZPrecise(PtzPrecise {
+            pan: pp.pan.and_then(|v| v.trim().parse::<f64>().ok()),
+            tilt: pp.tilt.and_then(|v| v.trim().parse::<f64>().ok()),
+            zoom: pp.zoom.and_then(|v| v.trim().parse::<f64>().ok()),
+        }))
+    } else if let Some(du) = c.device_upgrade {
+        if du.firmware.is_empty() || du.file_url.is_empty() {
+            None
+        } else {
+            Some(DeviceControlKind::DeviceUpgrade(
+                crate::manscdp::DeviceUpgradeCmd {
+                    firmware: du.firmware,
+                    file_url: du.file_url,
+                    manufacturer: du.manufacturer,
+                    session_id: du.session_id,
+                },
+            ))
+        }
     } else {
         c.ptz_cmd
             .map(|hex| DeviceControlKind::Ptz(parse_ptz_command(&hex)))
@@ -1434,6 +1585,86 @@ mod proptests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn parse_device_control_2022_closure_golden() {
+        use super::*;
+
+        // A.2.3.1.13 FormatSDCard: integer element, 0 formats every card.
+        let body = "<Control><CmdType>DeviceControl</CmdType><SN>21</SN><DeviceID>d1</DeviceID>\
+<FormatSDCard>0</FormatSDCard></Control>";
+        let c = parse_device_control(body).expect("fmt parses");
+        assert!(matches!(c.kind, DeviceControlKind::FormatSDCard(0)));
+
+        // A.2.3.1.11 PTZPreciseCtrl: optional absolute angles.
+        let body = "<Control><CmdType>DeviceControl</CmdType><SN>22</SN><DeviceID>d1</DeviceID>\
+<PTZPreciseCtrl><Pan>180.50</Pan><Tilt>-12.25</Tilt><Zoom>4.00</Zoom></PTZPreciseCtrl></Control>";
+        let c = parse_device_control(body).expect("ppc parses");
+        match c.kind {
+            DeviceControlKind::PTZPrecise(p) => {
+                assert_eq!(p.pan, Some(180.50));
+                assert_eq!(p.tilt, Some(-12.25));
+                assert_eq!(p.zoom, Some(4.00));
+            }
+            other => panic!("kind = {:?}", other),
+        }
+        let bare = "<Control><CmdType>DeviceControl</CmdType><SN>23</SN><DeviceID>d1</DeviceID>\
+<PTZPreciseCtrl></PTZPreciseCtrl></Control>";
+        let c = parse_device_control(bare).expect("bare ppc parses");
+        match c.kind {
+            DeviceControlKind::PTZPrecise(p) => {
+                assert!(p.pan.is_none() && p.tilt.is_none() && p.zoom.is_none());
+            }
+            other => panic!("kind = {:?}", other),
+        }
+
+        // A.2.3.1.12 DeviceUpgrade: every child required.
+        let body = "<Control><CmdType>DeviceControl</CmdType><SN>24</SN><DeviceID>d1</DeviceID>\
+<DeviceUpgrade><Firmware>v1.0.0</Firmware><FileURL>http://192.168.63.30/fw.bin</FileURL>\
+<Manufacturer>MiBee</Manufacturer><SessionID>0123456789abcdef0123456789abcdef</SessionID>\
+</DeviceUpgrade></Control>";
+        let c = parse_device_control(body).expect("upg parses");
+        match c.kind {
+            DeviceControlKind::DeviceUpgrade(cmd) => {
+                assert_eq!(cmd.firmware, "v1.0.0");
+                assert_eq!(cmd.file_url, "http://192.168.63.30/fw.bin");
+                assert_eq!(cmd.session_id, "0123456789abcdef0123456789abcdef");
+            }
+            other => panic!("kind = {:?}", other),
+        }
+    }
+
+    #[test]
+    fn device_upgrade_result_golden() {
+        use super::*;
+        let n = build_device_upgrade_result(
+            31,
+            "34020000001320000001",
+            "0123456789abcdef0123456789abcdef",
+            false,
+            "v1.0.0",
+            "02",
+        );
+        let xml = n.to_xml().expect("xml");
+        assert!(
+            xml.contains("<CmdType>DeviceUpgradeResult</CmdType>")
+                && xml.contains("<UpgradeResult>ERROR</UpgradeResult>")
+                && xml.contains("<Firmware>v1.0.0</Firmware>")
+                && xml.contains("<UpgradeFailedReason>02</UpgradeFailedReason>"),
+            "xml: {xml}"
+        );
+        let ok = build_device_upgrade_result(
+            32,
+            "d",
+            "0123456789abcdef0123456789abcdef",
+            true,
+            "v9.9.9",
+            "",
+        );
+        let xml = ok.to_xml().expect("xml");
+        assert!(xml.contains("<UpgradeResult>OK</UpgradeResult>"));
+        assert!(!xml.contains("UpgradeFailedReason"), "xml: {xml}");
+    }
+
     #[test]
     fn parse_device_config_2022_closure_golden() {
         use super::*;

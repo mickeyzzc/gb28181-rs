@@ -655,6 +655,75 @@ static SNAPSHOT_NOTIFY_CSEQ: std::sync::atomic::AtomicU32 = std::sync::atomic::A
 /// (GB/T 28181-2022 A.2.5.7), wrapping the manscdp body. Sent after a
 /// snapshot executor finishes its capture/upload exchange; `file_ids`
 /// empty reports the exchange as wholly/partially failed.
+/// Builds the device→platform DeviceUpgradeResult notify MESSAGE
+/// (A.2.5.9, gb28181-go #108 twin) with fresh routing headers.
+#[allow(clippy::too_many_arguments)]
+pub fn build_device_upgrade_result_message(
+    sn: u32,
+    device_id: &str,
+    session_id: &str,
+    ok: bool,
+    firmware: &str,
+    failed_reason: &str,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+) -> Result<SipMessage> {
+    let body = super::manscdp::build_device_upgrade_result(
+        sn,
+        device_id,
+        session_id,
+        ok,
+        firmware,
+        failed_reason,
+    )
+    .to_xml()?;
+
+    let cseq = SNAPSHOT_NOTIFY_CSEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut headers = Vec::new();
+    headers.push((
+        "Via".to_string(),
+        format!(
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
+        ),
+    ));
+    headers.push((
+        "From".to_string(),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
+    ));
+    headers.push(("To".to_string(), format!("<sip:{}@{}>", domain, domain)));
+    headers.push((
+        "Call-ID".to_string(),
+        format!(
+            "upgrade-{}@{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+            local_ip
+        ),
+    ));
+    headers.push(("CSeq".to_string(), format!("{cseq} MESSAGE")));
+    headers.push((
+        "Content-Type".to_string(),
+        "Application/MANSCDP+xml".to_string(),
+    ));
+    headers.push(("Max-Forwards".to_string(), "70".to_string()));
+
+    Ok(SipMessage {
+        start_line: format!("MESSAGE sip:{domain}@{domain} SIP/2.0"),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some(format!("sip:{domain}@{domain}")),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body,
+    })
+}
+
 pub fn build_upload_snapshot_finished_message(
     sn: u32,
     device_id: &str,
