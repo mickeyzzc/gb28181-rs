@@ -1,8 +1,9 @@
 //! Device-side snapshot command execution (issue #28 / GB/T 28181-2022
-//! A.2.1.24 + A.2.5.7): a DeviceControl(SnapShot) MESSAGE is answered 200,
-//! handed to the installed executor, and completes asynchronously with an
-//! UploadSnapShotFinished notify echoing the SessionID. Without an
-//! executor the historical control-reject behavior is preserved.
+//! A.2.1.24 + A.2.5.7): a DeviceConfig(SnapShotConfig) MESSAGE is
+//! answered 200 plus the A.2.6.8 OK response, handed to the installed
+//! executor, and completes asynchronously with an UploadSnapShotFinished
+//! notify echoing the SessionID. Without an executor the config reject
+//! (ERROR on the same channel) is preserved.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -97,13 +98,15 @@ fn response(status: &str, req: &SipMessage, extra: &[(&str, String)]) -> String 
     out
 }
 
-fn snapshot_control_message(call_id: &str) -> String {
+/// Byte-shaped after the real 2022 platform capture (gb28181-go #107):
+/// the snapshot rides the device-config channel.
+fn snapshot_config_message(call_id: &str) -> String {
     let body = format!(
-        "<Control><CmdType>DeviceControl</CmdType><SN>17</SN>\
+        "<Control><CmdType>DeviceConfig</CmdType><SN>17</SN>\
          <DeviceID>34020000001320000001</DeviceID>\
-         <SnapShot><SnapNum>3</SnapNum><Interval>2</Interval>\
+         <SnapShotConfig><SnapNum>3</SnapNum><Interval>2</Interval>\
          <UploadURL>{UPLOAD_URL}</UploadURL>\
-         <SessionID>{SESSION_ID}</SessionID></SnapShot></Control>"
+         <SessionID>{SESSION_ID}</SessionID></SnapShotConfig></Control>"
     );
     format!(
         "MESSAGE sip:34020000001320000001@3402000000 SIP/2.0\r\n\
@@ -195,7 +198,7 @@ async fn snapshot_command_executes_and_notifies_with_file_ids() {
         start_server(Some(Arc::clone(&exec) as Arc<dyn SnapshotExecutor>)).await;
 
     platform
-        .send_to(snapshot_control_message("snap1").as_bytes(), peer)
+        .send_to(snapshot_config_message("snap1").as_bytes(), peer)
         .await
         .unwrap();
 
@@ -203,7 +206,22 @@ async fn snapshot_command_executes_and_notifies_with_file_ids() {
     let (ok, _) = recv_skipping_keepalive(&platform).await;
     assert_eq!(ok.status_code.map(|c| c.code()), Some(200), "got: {ok:?}");
 
-    // 2) The completion notify arrives asynchronously on the platform
+    // 2) The config accept goes back on the DeviceConfig channel
+    //    (A.2.6.8 Result=OK) before the exchange runs.
+    let (accept, _) = recv_skipping_keepalive(&platform).await;
+    assert_eq!(
+        accept.method.map(|m| m.to_string()).as_deref(),
+        Some("MESSAGE"),
+        "got: {accept:?}"
+    );
+    assert!(
+        accept.body.contains("CmdType=\"DeviceConfig\"")
+            && accept.body.contains("<Result>OK</Result>"),
+        "accept body: {}",
+        accept.body
+    );
+
+    // 3) The completion notify arrives asynchronously on the platform
     //    socket, echoing the SessionID and the uploaded-file IDs.
     let (notify, _) = recv_skipping_keepalive(&platform).await;
     assert_eq!(
@@ -223,7 +241,7 @@ async fn snapshot_command_executes_and_notifies_with_file_ids() {
     assert_eq!(body.matches("<SnapShotFileID>").count(), 2, "body: {body}");
     assert!(body.contains("store/2026/09/09/a.jpg"), "body: {body}");
 
-    // 3) The executor saw the fully parsed command.
+    // 4) The executor saw the fully parsed command.
     let cmd = exec.cmd.lock().unwrap().clone().expect("executor ran");
     assert_eq!(cmd.snap_num, 3);
     assert_eq!(cmd.interval, Some(2));
@@ -238,12 +256,24 @@ async fn failed_exchange_notifies_with_empty_list() {
     let (platform, peer, mut handle) = start_server(Some(Arc::new(ErrExec))).await;
 
     platform
-        .send_to(snapshot_control_message("snap2").as_bytes(), peer)
+        .send_to(snapshot_config_message("snap2").as_bytes(), peer)
         .await
         .unwrap();
 
     let (ok, _) = recv_skipping_keepalive(&platform).await;
     assert_eq!(ok.status_code.map(|c| c.code()), Some(200));
+
+    // The exchange is accepted first; the failure surfaces in the notify.
+    let (accept, _) = recv_skipping_keepalive(&platform).await;
+    assert_eq!(
+        accept.method.map(|m| m.to_string()).as_deref(),
+        Some("MESSAGE")
+    );
+    assert!(
+        accept.body.contains("<Result>OK</Result>"),
+        "body: {}",
+        accept.body
+    );
 
     let (notify, _) = recv_skipping_keepalive(&platform).await;
     assert_eq!(
@@ -269,21 +299,22 @@ async fn without_executor_the_control_is_rejected_as_before() {
     let (platform, peer, mut handle) = start_server(None).await;
 
     platform
-        .send_to(snapshot_control_message("snap3").as_bytes(), peer)
+        .send_to(snapshot_config_message("snap3").as_bytes(), peer)
         .await
         .unwrap();
 
     let (ok, _) = recv_skipping_keepalive(&platform).await;
     assert_eq!(ok.status_code.map(|c| c.code()), Some(200));
 
-    // Historical behavior: a control-reject Response MESSAGE follows.
+    // Without an executor the config is rejected on the same
+    // DeviceConfig channel (fast failure for the platform).
     let (reject, _) = recv_skipping_keepalive(&platform).await;
     assert_eq!(
         reject.method.map(|m| m.to_string()).as_deref(),
         Some("MESSAGE")
     );
     let body = &reject.body;
-    assert!(body.contains("CmdType=\"DeviceControl\""), "body: {body}");
+    assert!(body.contains("CmdType=\"DeviceConfig\""), "body: {body}");
     assert!(body.contains("<Result>ERROR</Result>"), "body: {body}");
 
     let _ = handle.shutdown().await;
