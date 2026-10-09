@@ -247,6 +247,18 @@ pub trait DeviceConfigHandler: Send + Sync {
     /// A.2.3.2.10 报警上报开关配置 — motion-detection /
     /// field-detection event report switches (0 off, 1 on).
     fn on_alarm_report(&self, _motion_detection: u32, _field_detection: u32) {}
+    /// A.2.3.2.5 视频参数属性配置 (gb28181-go #109 twin) — per-stream
+    /// codec attributes; hosts decide what sticks.
+    fn on_video_param_attribute(&self, _cfg: &crate::manscdp::VideoParamAttributeCfg) {}
+    /// A.2.3.2.6 录像计划配置 — the weekly schedule hosts gate their
+    /// recorder on.
+    fn on_video_record_plan(&self, _cfg: &crate::manscdp::VideoRecordPlanCfg) {}
+    /// A.2.3.2.7 报警录像配置 — alarm recording with pre/post roll.
+    fn on_video_alarm_record(&self, _cfg: &crate::manscdp::VideoAlarmRecordCfg) {}
+    /// A.2.3.2.8 视频画面遮挡配置 — privacy masking regions.
+    fn on_picture_mask(&self, _cfg: &crate::manscdp::PictureMaskCfg) {}
+    /// A.2.3.2.11 前端 OSD 配置 — time/text overlay layout.
+    fn on_osd_config(&self, _cfg: &crate::manscdp::OsdConfigCfg) {}
 }
 
 /// Stamp the Annex I X-GB-Ver header on a REGISTER when configured.
@@ -301,6 +313,11 @@ fn dispatch_device_config(
             motion_detection,
             field_detection,
         } => handler.on_alarm_report(*motion_detection, *field_detection),
+        DeviceConfigKind::VideoParamAttribute(cfg) => handler.on_video_param_attribute(cfg),
+        DeviceConfigKind::VideoRecordPlan(cfg) => handler.on_video_record_plan(cfg),
+        DeviceConfigKind::VideoAlarmRecord(cfg) => handler.on_video_alarm_record(cfg),
+        DeviceConfigKind::PictureMask(cfg) => handler.on_picture_mask(cfg),
+        DeviceConfigKind::OsdConfig(cfg) => handler.on_osd_config(cfg),
     }
 }
 
@@ -1850,22 +1867,32 @@ impl Gb28181Server {
                 // for it; every other config block is optional and
                 // omitted. ConfigType may list several types
                 // "/"-separated.
-                let requested_basic = query
+                let types = query
                     .config_type
                     .as_deref()
                     .unwrap_or("")
                     .split('/')
-                    .any(|t| t.trim() == "BasicParam");
+                    .map(|t| t.trim())
+                    .collect::<Vec<_>>();
+                let requested_basic = types.contains(&"BasicParam");
                 let basic = requested_basic.then(|| super::client::BasicParamBlock {
                     name: Some(self.config.effective_device_name()),
                     expiration: Some(self.config.register_interval_secs),
                     heartbeat_interval: Some(self.config.heartbeat_interval_secs),
                     heartbeat_count: Some(self.config.heartbeat_timeout_count),
                 });
+                // A.2.1.20 VideoParamOpt (gb28181-go #109 twin): answer
+                // from the configured download speeds / resolutions;
+                // empty config omits the block.
+                let requested_vpo = types.contains(&"VideoParamOpt");
+                let speed = self.config.video_param_opt_download_speed.as_str();
+                let resolution = self.config.video_param_opt_resolution.as_str();
+                let video_param_opt = requested_vpo.then_some((speed, resolution));
                 let response = super::client::build_config_download_response(
                     &query.sn,
                     &query.device_id,
                     basic.as_ref(),
+                    video_param_opt,
                     &self.config.sip_domain,
                     &self.local_ip,
                     self.config.local_sip_port,

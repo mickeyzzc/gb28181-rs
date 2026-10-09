@@ -75,6 +75,13 @@ pub struct Gb28181Config {
     /// [`ServerHandle::platform_protocol_version`](crate::ServerHandle::platform_protocol_version).
     /// `None` (default) omits the header — byte-identical to the
     /// pre-2022 wire form.
+    /// ConfigDownload VideoParamOpt block (A.2.1.20, gb28181-go #109
+    /// twin): the device's download speeds and supported resolutions as
+    /// "/"-joined strings (e.g. "1/2/4"). Empty (default) omits the block.
+    #[serde(default)]
+    pub video_param_opt_download_speed: String,
+    #[serde(default)]
+    pub video_param_opt_resolution: String,
     #[serde(default)]
     pub protocol_version: Option<String>,
     /// Catalog/DeviceInfo `Name`. `None` → `Camera <device_id>`.
@@ -249,6 +256,8 @@ impl Default for Gb28181Config {
             manufacturer: None,
             model: None,
             firmware: None,
+            video_param_opt_download_speed: String::new(),
+            video_param_opt_resolution: String::new(),
         }
     }
 }

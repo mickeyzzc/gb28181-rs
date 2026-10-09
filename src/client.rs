@@ -1180,6 +1180,7 @@ pub fn build_config_download_response(
     sn: &str,
     device_id: &str,
     basic: Option<&BasicParamBlock>,
+    video_param_opt: Option<(&str, &str)>,
     domain: &str,
     local_ip: &str,
     local_port: u16,
@@ -1210,6 +1211,24 @@ pub fn build_config_download_response(
             body.push_str(&format!("<HeartBeatCount>{count}</HeartBeatCount>"));
         }
         body.push_str("</BasicParam>");
+    }
+    if let Some((speed, resolution)) = video_param_opt {
+        if !speed.is_empty() || !resolution.is_empty() {
+            body.push_str("<VideoParamOpt>");
+            if !speed.is_empty() {
+                body.push_str(&format!(
+                    "<DownloadSpeed>{}</DownloadSpeed>",
+                    xml_escape(speed)
+                ));
+            }
+            if !resolution.is_empty() {
+                body.push_str(&format!(
+                    "<Resolution>{}</Resolution>",
+                    xml_escape(resolution)
+                ));
+            }
+            body.push_str("</VideoParamOpt>");
+        }
     }
     body.push_str("</Response>");
 
@@ -1488,6 +1507,7 @@ mod tests {
             "74",
             "34020000001320000001",
             None,
+            None,
             "3402000000",
             "192.168.62.104",
             5060,
@@ -1510,6 +1530,7 @@ mod tests {
                 heartbeat_interval: Some(61),
                 heartbeat_count: Some(4),
             }),
+            None,
             "3402000000",
             "192.168.62.104",
             5060,
@@ -1526,6 +1547,40 @@ mod tests {
             <HeartBeatInterval>61</HeartBeatInterval><HeartBeatCount>4</HeartBeatCount>\
             </BasicParam></Response>"
         );
+        // A.2.1.20 VideoParamOpt block (gb28181-go #109 twin).
+        let with_vpo = build_config_download_response(
+            "76",
+            "34020000001320000001",
+            None,
+            Some(("1/2/4", "1920x1080/640x480")),
+            "3402000000",
+            "192.168.62.104",
+            5060,
+            11,
+        )
+        .expect("build");
+        assert_eq!(
+            with_vpo.body,
+            "<?xml version=\"1.0\" encoding=\"GB2312\"?>\
+            <Response CmdType=\"ConfigDownload\" SN=\"76\">\
+            <DeviceID>34020000001320000001</DeviceID>\
+            <Result>OK</Result>\
+            <VideoParamOpt><DownloadSpeed>1/2/4</DownloadSpeed>\
+            <Resolution>1920x1080/640x480</Resolution></VideoParamOpt></Response>"
+        );
+        // Configured-but-empty fields omit the block entirely.
+        let empty_vpo = build_config_download_response(
+            "77",
+            "d",
+            None,
+            Some(("", "")),
+            "3402000000",
+            "192.168.62.104",
+            5060,
+            12,
+        )
+        .expect("build");
+        assert!(!empty_vpo.body.contains("VideoParamOpt"));
     }
 
     #[test]
