@@ -224,6 +224,12 @@ pub trait DeviceControlHandler: Send + Sync {
     /// coordinates are window pixels with the origin at the top-left.
     /// Hosts without a PTZ keep the default no-op (ack-only).
     fn on_drag_zoom(&self, _cmd: &crate::manscdp::DragZoom) {}
+    /// A.2.3.1.13 存储卡格式化 (gb28181-go #108 twin): card number
+    /// starting at 1; 0 formats every card.
+    fn on_format_sd_card(&self, _card: u32) {}
+    /// A.2.3.1.11 PTZ 精准控制 (gb28181-go #108 twin): absolute
+    /// Pan/Tilt/Zoom angles, every field optional (`None` = keep).
+    fn on_ptz_precise(&self, _p: &crate::manscdp::PtzPrecise) {}
 }
 
 /// Host seam for DeviceConfig sub-commands (GB/T 28181-2022 §9.3.3 /
@@ -287,6 +293,11 @@ fn dispatch_device_control(
             preset_index,
         } => handler.on_home_position(*enabled, *reset_time, *preset_index),
         DeviceControlKind::DragZoom(cmd) => handler.on_drag_zoom(cmd),
+        DeviceControlKind::FormatSDCard(card) => handler.on_format_sd_card(*card),
+        DeviceControlKind::PTZPrecise(p) => handler.on_ptz_precise(p),
+        // DeviceUpgrade never reaches here — the Message dispatch
+        // intercepts it for the upgrader seam (A.2.3.1.12 / A.2.5.9).
+        DeviceControlKind::DeviceUpgrade(_) => {}
     }
 }
 
@@ -416,6 +427,9 @@ pub struct Gb28181Server {
     platform_date: Arc<std::sync::Mutex<Option<i64>>>,
     /// Device-side snapshot executor (A.2.1.24). `None` = control reject.
     snapshot_executor: Option<Arc<dyn crate::snapshot::SnapshotExecutor>>,
+    /// A.2.3.1.12 DeviceUpgrade executor (gb28181-go #108 twin); `None`
+    /// keeps the control reject.
+    device_upgrader: Option<Arc<dyn crate::upgrade::DeviceUpgrader>>,
     /// DeviceControl sub-command handler (issue #58). `None` = recognized
     /// sub-commands keep the control-reject behavior.
     control_handler: Option<Arc<dyn DeviceControlHandler>>,
@@ -572,6 +586,7 @@ impl Gb28181Server {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -604,6 +619,17 @@ impl Gb28181Server {
         executor: Option<Arc<dyn crate::snapshot::SnapshotExecutor>>,
     ) -> Self {
         self.snapshot_executor = executor;
+        self
+    }
+
+    /// Installs the A.2.3.1.12 firmware-upgrade executor (issue twin of
+    /// gb28181-go #108). `None` (default) keeps every DeviceUpgrade
+    /// command rejected.
+    pub fn with_device_upgrader(
+        mut self,
+        upgrader: Option<Arc<dyn crate::upgrade::DeviceUpgrader>>,
+    ) -> Self {
+        self.device_upgrader = upgrader;
         self
     }
 
@@ -1440,6 +1466,36 @@ impl Gb28181Server {
                         log::warn!(
                             "gb28181: snapshot config over TCP transport — executor requires UDP, rejecting"
                         );
+                    }
+                }
+
+                // DeviceControl(DeviceUpgrade) (A.2.3.1.12, gb28181-go
+                // #108 twin): with an upgrader installed the 200 above
+                // is the whole synchronous answer; the upgrade runs in a
+                // spawned task and completes asynchronously via the
+                // A.2.5.9 DeviceUpgradeResult notify. Without an
+                // upgrader — or over the TCP transport — the fall-through
+                // control reject keeps the historical behavior.
+                if let Some(control) = crate::manscdp::parse_device_control(&msg.body) {
+                    if let crate::manscdp::DeviceControlKind::DeviceUpgrade(cmd) = &control.kind {
+                        if let Some(upgrader) = self.device_upgrader.clone() {
+                            // UDP only: the notify leaves through the shared
+                            // SIP UDP socket; per-connection TCP servers carry
+                            // a placeholder UDP socket, so key off tcp_conn.
+                            if self.tcp_conn.is_none() && self.sip_socket.is_some() {
+                                let sn = control.sn.parse::<u32>().unwrap_or(0);
+                                self.spawn_upgrade_exchange(
+                                    sn,
+                                    cmd.clone(),
+                                    upgrader,
+                                    platform_addr,
+                                );
+                                return Ok(());
+                            }
+                            log::warn!(
+                                "gb28181: device upgrade over TCP transport — upgrader requires UDP, rejecting"
+                            );
+                        }
                     }
                 }
 
@@ -2686,6 +2742,63 @@ impl Gb28181Server {
     /// (A.2.5.7) goes out over the SIP UDP socket — same source port as
     /// every other device MESSAGE. Executor errors report a failed
     /// exchange (empty SnapShotList); `file_ids` pass through verbatim.
+    /// Runs one upgrade to completion in a background task: the upgrader
+    /// downloads/applies, then the A.2.5.9 DeviceUpgradeResult notify
+    /// goes out over the SIP UDP socket — same source port as every
+    /// other device MESSAGE. Upgrader errors report reason 99 (other).
+    fn spawn_upgrade_exchange(
+        &self,
+        sn: u32,
+        cmd: crate::manscdp::DeviceUpgradeCmd,
+        upgrader: Arc<dyn crate::upgrade::DeviceUpgrader>,
+        platform_addr: SocketAddr,
+    ) {
+        let device_id = self.config.device_id.clone();
+        let domain = self.config.sip_domain.clone();
+        let local_ip = self.local_ip.clone();
+        let local_port = self.config.local_sip_port;
+        let socket = self
+            .sip_socket
+            .clone()
+            .expect("caller checked UDP transport");
+        let session_id = cmd.session_id.clone();
+
+        tokio::spawn(async move {
+            let outcome = match upgrader.upgrade(cmd).await {
+                Ok(o) => o,
+                Err(e) => {
+                    log::warn!("gb28181: device upgrade failed: {e}");
+                    crate::upgrade::DeviceUpgradeOutcome {
+                        success: false,
+                        firmware: String::new(),
+                        failed_reason: "99".to_string(),
+                    }
+                }
+            };
+            let notify = match super::client::build_device_upgrade_result_message(
+                sn,
+                &device_id,
+                &session_id,
+                outcome.success,
+                &outcome.firmware,
+                &outcome.failed_reason,
+                &domain,
+                &local_ip,
+                local_port,
+            ) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::error!("gb28181: upgrade-result notify build failed: {e}");
+                    return;
+                }
+            };
+            let data = serialize_wire(&notify);
+            if let Err(e) = socket.send_to(&data, platform_addr).await {
+                log::error!("gb28181: upgrade-result notify send failed: {e}");
+            }
+        });
+    }
+
     fn spawn_snapshot_exchange(
         &self,
         config: &crate::manscdp::ConfigSnapShot,
@@ -3400,6 +3513,7 @@ async fn handle_tcp_connection(
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         // DeviceControl dispatch over TCP is a follow-up (issue #58);
         // controls keep the reject path here.
         control_handler: None,
@@ -4075,6 +4189,7 @@ async fn test_recordinfo_dispatch_with_source() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         control_handler: None,
         config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4170,6 +4285,7 @@ async fn test_subscribe_books_and_echoes_expires() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         control_handler: None,
         config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4272,6 +4388,7 @@ async fn test_gb2022_information_queries_dispatch() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         control_handler: None,
         config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4377,6 +4494,7 @@ async fn test_deviceconfig_and_configdownload_dispatch() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         control_handler: None,
         config_handler: Some(Arc::new(RecordingConfig(seen))),
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4595,6 +4713,7 @@ async fn test_recordinfo_dispatch_without_source() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         control_handler: None,
         config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4668,6 +4787,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         control_handler: None,
         config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4771,6 +4891,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         control_handler: None,
         config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -4871,6 +4992,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         control_handler: None,
         config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5031,6 +5153,7 @@ async fn test_info_playback_control_live_session_noop() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        device_upgrader: None,
         control_handler: None,
         config_handler: None,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5134,6 +5257,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5273,6 +5397,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5364,6 +5489,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5473,6 +5599,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5577,6 +5704,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5675,6 +5803,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5779,6 +5908,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5850,6 +5980,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -5920,6 +6051,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -6112,6 +6244,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -6230,6 +6363,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -6323,6 +6457,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -6397,6 +6532,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -6480,6 +6616,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -6552,6 +6689,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -6689,6 +6827,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
@@ -6903,6 +7042,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            device_upgrader: None,
             control_handler: None,
             config_handler: None,
             notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
