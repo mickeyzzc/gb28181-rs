@@ -123,21 +123,31 @@ impl SubscriptionRegistry {
 
     /// The live subscription for `event`, or `None` when absent/expired
     /// (expired entries are dropped on read).
-    fn active(&self, event: SubscribeEvent) -> Option<(SocketAddr, String, String, String, u32)> {
+    fn active(
+        &self,
+        event: SubscribeEvent,
+    ) -> Option<(SocketAddr, String, String, String, u32, u64)> {
         let mut g = self.inner.lock().expect("subscription lock");
         let sub = g.get_mut(&event)?;
-        if sub.expires_at <= Instant::now() {
+        let now = Instant::now();
+        if sub.expires_at <= now {
             g.remove(&event);
             return None;
         }
         let cseq = sub.next_cseq;
         sub.next_cseq = sub.next_cseq.wrapping_add(1);
+        let remaining = sub
+            .expires_at
+            .saturating_duration_since(now)
+            .as_secs()
+            .max(1);
         Some((
             sub.peer,
             sub.from.clone(),
             sub.to.clone(),
             sub.call_id.clone(),
             cseq,
+            remaining,
         ))
     }
 
@@ -327,7 +337,9 @@ impl DeviceNotifier {
     /// Sends one NOTIFY on the subscription dialog. Direction mirrors the
     /// SUBSCRIBE: our From is the device, To is the platform subscriber.
     fn send_notify(&self, event: SubscribeEvent, body: String, state: &str) -> bool {
-        let Some((peer, sub_from, sub_to, call_id, cseq)) = self.registry.active(event) else {
+        let Some((peer, sub_from, sub_to, call_id, cseq, remaining_secs)) =
+            self.registry.active(event)
+        else {
             return false;
         };
         let Some(socket) = self.sip.get() else {
@@ -358,9 +370,12 @@ impl DeviceNotifier {
         headers.push(("CSeq".to_string(), format!("{cseq} NOTIFY")));
         headers.push(("Max-Forwards".to_string(), "70".to_string()));
         headers.push(("Event".to_string(), event.as_str().to_string()));
+        // The advertised expiry is the subscription's real remaining
+        // lifetime (was a hard-coded 3600), so a client watching the
+        // header knows when the subscription actually lapses.
         headers.push((
             "Subscription-State".to_string(),
-            format!("{state};expires=3600"),
+            format!("{state};expires={remaining_secs}"),
         ));
         headers.push((
             "Content-Type".to_string(),
@@ -560,5 +575,25 @@ mod tests {
         assert!(n.send_alarm("1", "5", "t", "", "b"));
         let t2 = recv_text(&platform);
         assert!(t2.contains("CSeq: 3 NOTIFY"), "{t2}");
+    }
+
+    #[test]
+    fn subscription_state_carries_remaining_lifetime() {
+        let (n, _sip, platform, peer) = bound_notifier();
+        // A 120s subscription must NOT advertise the old hard-coded 3600.
+        book(&n, SubscribeEvent::Alarm, 120, peer);
+        assert!(n.send_alarm("1", "5", "t", "", "a"));
+        let t = recv_text(&platform);
+        let idx = t.find("Subscription-State: ").expect("header");
+        let rest = &t[idx..];
+        let end = rest.find("\r\n").unwrap_or(rest.len());
+        let header = &rest[..end];
+        let expires: u64 = header
+            .split("expires=")
+            .nth(1)
+            .and_then(|v| v.split(';').next())
+            .and_then(|v| v.trim().parse().ok())
+            .expect("numeric expires");
+        assert!(expires > 0 && expires <= 120, "header: {header}");
     }
 }

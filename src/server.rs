@@ -23,8 +23,8 @@ use crate::frame::{AccessUnit, FrameSource};
 
 use super::client::{
     build_catalog_response, build_device_info_response, build_keepalive_notify,
-    parse_401_challenge, parse_invite, AudioCodec, InviteInfo, MediaKind, MediaTransport,
-    SipDeviceClient,
+    build_preset_list_response, parse_401_challenge, parse_invite, AudioCodec, InviteInfo,
+    MediaKind, MediaTransport, SipDeviceClient,
 };
 use super::manscdp::{ChannelItem, DeviceItem};
 use super::playback::{parse_playback_control, run_playback_task, PlaybackControl};
@@ -427,6 +427,11 @@ pub struct Gb28181Server {
     platform_date: Arc<std::sync::Mutex<Option<i64>>>,
     /// Device-side snapshot executor (A.2.1.24). `None` = control reject.
     snapshot_executor: Option<Arc<dyn crate::snapshot::SnapshotExecutor>>,
+    /// Platform-negotiated registration expiry (seconds) as last carried
+    /// by a REGISTER 200 OK (`Expires` header, Contact `;expires=`
+    /// fallback). `None` = platform did not negotiate; the local config
+    /// cadence applies.
+    negotiated_register_expires: Option<u64>,
     /// A.2.3.1.12 DeviceUpgrade executor (gb28181-go #108 twin); `None`
     /// keeps the control reject.
     device_upgrader: Option<Arc<dyn crate::upgrade::DeviceUpgrader>>,
@@ -586,6 +591,7 @@ impl Gb28181Server {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -1036,10 +1042,22 @@ impl Gb28181Server {
         // Refresh the registration at half the negotiated expiry (RFC 3261
         // §10.2) so a platform restart recovers without waiting for keepalive
         // timeouts (issue #19).
+        let refresh_base = self
+            .negotiated_register_expires
+            .filter(|s| *s >= MIN_NEGOTIATED_EXPIRY_SECS)
+            .unwrap_or(self.config.register_interval_secs);
         let mut re_register_interval = tokio::time::interval(Duration::from_secs(
-            registration_refresh_interval_secs(self.config.register_interval_secs),
+            registration_refresh_interval_secs(refresh_base),
         ));
         re_register_interval.tick().await; // skip immediate first tick
+
+        // Silent-platform detection: the historical keepalive accounting
+        // only reacts to explicit non-OK responses — a platform that stops
+        // answering entirely never tripped re-registration. Any SIP
+        // response proves liveness, so the recv loop stamps this on every
+        // status-bearing message and a periodic check trips at the same
+        // heartbeat_timeout_count threshold.
+        let mut last_platform_contact = tokio::time::Instant::now();
 
         loop {
             tokio::select! {
@@ -1059,6 +1077,9 @@ impl Gb28181Server {
                                 }
                             };
                             if let Ok(msg) = parsed {
+                                if msg.status_code.is_some() {
+                                    last_platform_contact = tokio::time::Instant::now();
+                                }
                                 if let Err(e) = self
                                     .handle_message(
                                         &msg,
@@ -1077,6 +1098,25 @@ impl Gb28181Server {
                             log::error!("gb28181: socket recv error: {e}");
                             tokio::time::sleep(Duration::from_secs(1)).await;
                         }
+                    }
+                }
+                _ = tokio::time::sleep(Duration::from_secs(SILENCE_CHECK_INTERVAL_SECS)) => {
+                    let elapsed = last_platform_contact.elapsed().as_secs();
+                    if platform_silent(
+                        elapsed,
+                        self.config.heartbeat_interval_secs,
+                        self.config.heartbeat_timeout_count,
+                    ) {
+                        log::warn!(
+                            "gb28181: platform silent for {elapsed}s (>= {} heartbeats) — re-registering",
+                            self.config.heartbeat_timeout_count
+                        );
+                        self.metrics.keepalive_fail();
+                        if let Err(e) = self.perform_register(&mut sip_client, platform_sip_addr).await {
+                            log::warn!("gb28181: silence re-registration failed: {e}");
+                        }
+                        last_platform_contact = tokio::time::Instant::now();
+                        keepalive_failures = 0;
                     }
                 }
                 _ = re_register_interval.tick() => {
@@ -1299,6 +1339,19 @@ impl Gb28181Server {
             auth.verify_ok(msg.get_header("SecurityInfo").unwrap_or(""))?;
         }
 
+        // Platform-negotiated expiry (RFC 3261 §10.2.4): when the 200 OK
+        // carries it, the refresh cadence follows the negotiation instead
+        // of the local config.
+        let negotiated = parse_negotiated_expires(&msg);
+        if negotiated != self.negotiated_register_expires {
+            log::info!(
+                "gb28181: platform-negotiated registration expiry: {:?}s (configured {}s)",
+                negotiated,
+                self.config.register_interval_secs
+            );
+        }
+        self.negotiated_register_expires = negotiated;
+
         client.inc_cseq();
         Ok(())
     }
@@ -1427,6 +1480,16 @@ impl Gb28181Server {
             }
             Some(SipMethod::Bye) => {
                 self.handle_bye(msg, peer_addr).await?;
+            }
+            Some(SipMethod::Cancel) => {
+                // A platform cancelling a pending INVITE. INVITEs are
+                // answered immediately, so a CANCEL usually races the 200;
+                // per RFC 3261 §9.2 the CANCEL itself always gets a
+                // response — without per-transaction state we answer 200
+                // OK rather than leaving the platform waiting.
+                log::info!("gb28181: CANCEL received — answering 200 OK");
+                let ok = build_error_response(msg, 200, "OK");
+                self.send_sip_message(&ok, peer_addr).await?;
             }
             Some(SipMethod::Message) => {
                 // Dispatch inbound MESSAGE and respond
@@ -1819,6 +1882,22 @@ impl Gb28181Server {
                     self.config.local_sip_port,
                     cseq,
                     &[channel],
+                )?;
+                Ok(Some(response))
+            }
+            "PresetQuery" => {
+                // A.2.4.8: the device's preset list. The library carries
+                // no PTZ of its own, so the minimal valid answer is an
+                // empty list (SumNum=0 / PresetList Num=0) — same stance
+                // as the 2022 five queries.
+                let response = build_preset_list_response(
+                    &query.sn,
+                    &self.config.device_id,
+                    &self.config.sip_domain,
+                    &self.local_ip,
+                    self.config.local_sip_port,
+                    cseq,
+                    &[],
                 )?;
                 Ok(Some(response))
             }
@@ -2919,6 +2998,37 @@ fn registration_refresh_interval_secs(expires_secs: u64) -> u64 {
     (expires_secs / 2).max(1)
 }
 
+/// Shortest platform-negotiated expiry the refresh cadence follows.
+/// Below this the local config wins — a platform dictating seconds-scale
+/// registrations would otherwise hammer the wire.
+const MIN_NEGOTIATED_EXPIRY_SECS: u64 = 60;
+
+/// Cadence of the silent-platform check in the UDP run loop.
+const SILENCE_CHECK_INTERVAL_SECS: u64 = 5;
+
+/// Platform-negotiated registration expiry of a REGISTER 200 OK: the
+/// `Expires` header, falling back to the Contact header's `;expires=`
+/// parameter (RFC 3261 §10.2.4 permits either; GB28181 platforms
+/// commonly carry the header).
+/// Whether a platform unheard for `elapsed_secs` counts as gone: at least
+/// `timeout_count` heartbeat intervals without any SIP response.
+fn platform_silent(elapsed_secs: u64, heartbeat_interval_secs: u64, timeout_count: u32) -> bool {
+    let heartbeat = heartbeat_interval_secs.max(1);
+    elapsed_secs >= heartbeat * timeout_count.max(1) as u64
+}
+
+fn parse_negotiated_expires(msg: &SipMessage) -> Option<u64> {
+    if let Some(v) = msg.get_header("Expires") {
+        if let Ok(secs) = v.trim().parse::<u64>() {
+            return Some(secs);
+        }
+    }
+    let contact = msg.get_header("Contact").unwrap_or("");
+    let rest = contact.split("expires=").nth(1)?;
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
 /// Serialize a SIP message for the wire with charset-correct body encoding.
 ///
 /// Headers are always ASCII. The body is encoded by [`crate::charset`]:
@@ -3513,6 +3623,7 @@ async fn handle_tcp_connection(
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         // DeviceControl dispatch over TCP is a follow-up (issue #58);
         // controls keep the reject path here.
@@ -4189,6 +4300,7 @@ async fn test_recordinfo_dispatch_with_source() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         control_handler: None,
         config_handler: None,
@@ -4285,6 +4397,7 @@ async fn test_subscribe_books_and_echoes_expires() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         control_handler: None,
         config_handler: None,
@@ -4388,6 +4501,7 @@ async fn test_gb2022_information_queries_dispatch() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         control_handler: None,
         config_handler: None,
@@ -4494,6 +4608,7 @@ async fn test_deviceconfig_and_configdownload_dispatch() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         control_handler: None,
         config_handler: Some(Arc::new(RecordingConfig(seen))),
@@ -4713,6 +4828,7 @@ async fn test_recordinfo_dispatch_without_source() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         control_handler: None,
         config_handler: None,
@@ -4787,6 +4903,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         control_handler: None,
         config_handler: None,
@@ -4891,6 +5008,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         control_handler: None,
         config_handler: None,
@@ -4992,6 +5110,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         control_handler: None,
         config_handler: None,
@@ -5153,6 +5272,7 @@ async fn test_info_playback_control_live_session_noop() {
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
+        negotiated_register_expires: None,
         device_upgrader: None,
         control_handler: None,
         config_handler: None,
@@ -5257,6 +5377,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -5397,6 +5518,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -5489,6 +5611,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -5599,6 +5722,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -5704,6 +5828,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -5803,6 +5928,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -5908,6 +6034,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -5980,6 +6107,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -6051,6 +6179,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -6244,6 +6373,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -6363,6 +6493,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -6457,6 +6588,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -6532,6 +6664,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -6616,6 +6749,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -6689,6 +6823,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -6827,6 +6962,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -7042,6 +7178,7 @@ mod tcp_media_tests {
             platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
             platform_date: Arc::new(std::sync::Mutex::new(None)),
             snapshot_executor: None,
+            negotiated_register_expires: None,
             device_upgrader: None,
             control_handler: None,
             config_handler: None,
@@ -7225,5 +7362,264 @@ mod tcp_media_tests {
         let resp3 = recv_sip(&platform).await;
         assert!(resp3.body.contains("<Result>ERROR</Result>"));
         assert!(server.broadcast_pending.is_none());
+    }
+
+    /// PresetQuery (A.2.4.8) dispatches to the minimal valid answer: an
+    /// empty preset list (SumNum=0 / PresetList Num=0 — 未配置预置位).
+    #[tokio::test]
+    async fn test_preset_query_dispatch() {
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let server = Gb28181Server {
+            config: Gb28181Config {
+                enabled: true,
+                platform_sip_address: "127.0.0.1".to_string(),
+                platform_sip_port: 5060,
+                device_id: "34020000001320000001".to_string(),
+                channel_id: "34020000001320000001".to_string(),
+                sip_domain: "3402000000".to_string(),
+                password: "12345678".to_string(),
+                local_sip_port: 5060,
+                register_interval_secs: 3600,
+                heartbeat_interval_secs: 60,
+                heartbeat_timeout_count: 3,
+                transport: Transport::Udp,
+                ..Gb28181Config::default()
+            },
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            broadcast_pending: None,
+            local_ip: "192.168.62.104".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            talkback_source: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            negotiated_register_expires: None,
+            device_upgrader: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+        };
+
+        let msg = SipMessage {
+            start_line: "MESSAGE sip:3402000000@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Message),
+            status_code: None,
+            uri: Some("sip:3402000000@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![(
+                "Content-Type".to_string(),
+                "Application/MANSCDP+xml".to_string(),
+            )],
+            body: "<Query><CmdType>PresetQuery</CmdType><SN>33</SN><DeviceID>34020000001320000001</DeviceID></Query>".to_string(),
+        };
+
+        let response = server
+            .build_query_response(&msg)
+            .expect("dispatch")
+            .expect("PresetQuery produces a response");
+        assert!(
+            response
+                .body
+                .contains("<Response CmdType=\"PresetQuery\" SN=\"33\">"),
+            "{}",
+            response.body
+        );
+        assert!(response.body.contains("<SumNum>0</SumNum>"));
+        assert!(response.body.contains("<PresetList Num=\"0\">"));
+    }
+
+    /// The preset-list builder's non-empty golden: A.2.6 wire shape with
+    /// PresetID/PresetName items.
+    #[test]
+    fn test_build_preset_list_response_golden() {
+        let msg = crate::client::build_preset_list_response(
+            "7",
+            "34020000001320000001",
+            "3402000000",
+            "192.168.62.104",
+            5060,
+            42,
+            &[
+                ("1".to_string(), "正门".to_string()),
+                ("2".to_string(), "后院".to_string()),
+            ],
+        )
+        .expect("build");
+        assert!(
+            msg.body.contains(
+                "<SumNum>2</SumNum><PresetList Num=\"2\">\
+                 <Item><PresetID>1</PresetID><PresetName>正门</PresetName></Item>\
+                 <Item><PresetID>2</PresetID><PresetName>后院</PresetName></Item>\
+                 </PresetList>"
+            ),
+            "{}",
+            msg.body
+        );
+    }
+
+    /// Negotiated expiry parsing: the Expires header wins, Contact
+    /// `;expires=` is the fallback, absence is None.
+    #[test]
+    fn test_parse_negotiated_expires() {
+        let msg = |headers: Vec<(&str, &str)>| SipMessage {
+            start_line: "SIP/2.0 200 OK".to_string(),
+            method: None,
+            status_code: Some(SipStatusCode::Ok),
+            uri: None,
+            version: "SIP/2.0".to_string(),
+            headers: headers
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+            body: String::new(),
+        };
+
+        assert_eq!(
+            parse_negotiated_expires(&msg(vec![("Expires", "7200")])),
+            Some(7200)
+        );
+        assert_eq!(
+            parse_negotiated_expires(&msg(vec![(
+                "Contact",
+                "<sip:34020000002000000001@3402000000>;expires=1800"
+            )])),
+            Some(1800)
+        );
+        // Header takes precedence over the Contact parameter.
+        assert_eq!(
+            parse_negotiated_expires(&msg(vec![
+                ("Expires", "600"),
+                ("Contact", "<sip:x>;expires=9999")
+            ])),
+            Some(600)
+        );
+        assert_eq!(parse_negotiated_expires(&msg(vec![])), None);
+        assert_eq!(
+            parse_negotiated_expires(&msg(vec![("Expires", "not-a-number")])),
+            None
+        );
+    }
+
+    /// Silence threshold: at least timeout_count heartbeat intervals
+    /// without any SIP response counts as gone.
+    #[test]
+    fn test_platform_silent_threshold() {
+        assert!(!platform_silent(179, 60, 3));
+        assert!(platform_silent(180, 60, 3));
+        assert!(platform_silent(10_000, 60, 3));
+        // Degenerate configs clamp instead of dividing by zero.
+        assert!(!platform_silent(0, 0, 3));
+        assert!(!platform_silent(5, 60, 0));
+    }
+
+    /// CANCEL is always answered (RFC 3261 §9.2) — 200 OK here, since the
+    /// device answers INVITEs immediately and keeps no pending server
+    /// transactions.
+    #[tokio::test]
+    async fn test_cancel_answered_200() {
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let mut server = Gb28181Server {
+            config: Gb28181Config {
+                enabled: true,
+                platform_sip_address: "127.0.0.1".to_string(),
+                platform_sip_port: 5060,
+                device_id: "34020000001320000001".to_string(),
+                channel_id: "34020000001320000001".to_string(),
+                sip_domain: "3402000000".to_string(),
+                password: "12345678".to_string(),
+                local_sip_port: 5060,
+                register_interval_secs: 3600,
+                heartbeat_interval_secs: 60,
+                heartbeat_timeout_count: 3,
+                transport: Transport::Udp,
+                ..Gb28181Config::default()
+            },
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            broadcast_pending: None,
+            local_ip: "127.0.0.1".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            talkback_source: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            negotiated_register_expires: None,
+            device_upgrader: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+        };
+
+        let peer = UdpSocket::bind("127.0.0.1:0").await.expect("peer bind");
+        let peer_addr = peer.local_addr().expect("peer addr");
+        let mut client = SipDeviceClient::new(
+            "34020000001320000001",
+            peer_addr,
+            "127.0.0.1",
+            5060,
+            "3402000000",
+            "12345678",
+            3600,
+        );
+        let mut keepalive_failures = 0u32;
+
+        let cancel = SipMessage {
+            start_line: "CANCEL sip:34020000001320000001@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Cancel),
+            status_code: None,
+            uri: Some("sip:34020000001320000001@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![
+                ("Call-ID".to_string(), "inv-1".to_string()),
+                ("CSeq".to_string(), "1 INVITE".to_string()),
+            ],
+            body: String::new(),
+        };
+
+        server
+            .handle_message(
+                &cancel,
+                peer_addr,
+                &mut client,
+                peer_addr,
+                &mut keepalive_failures,
+            )
+            .await
+            .expect("handle");
+
+        let mut buf = vec![0u8; 65535];
+        let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
+            .await
+            .expect("timed out")
+            .expect("recv");
+        let reply = String::from_utf8_lossy(&buf[..len]).to_string();
+        assert!(reply.starts_with("SIP/2.0 200 OK"), "CANCEL reply: {reply}");
     }
 }
