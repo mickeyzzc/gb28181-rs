@@ -541,9 +541,10 @@ pub fn build_upload_snapshot_finished(
 // ---------------------------------------------------------------------------
 // DeviceControl sub-command decode (GB/T 28181-2016 §9.3.2 / 2022 §9.3,
 // issue #58). The family shares one `<Control><CmdType>DeviceControl…`
-// body with exactly one sub-command child element. DragZoom (2022 拉框
-// 放大/缩小) is deferred until its wire form is verified against the
-// standard text; PTZCmd is bit-level decoded (§A.3-A.4, issue #57) —
+// body with exactly one sub-command child element. DragZoom In/Out (2022
+// A.2.3.1.8/9, PR #72) and the 2022 closure controls (PTZPreciseCtrl /
+// DeviceUpgrade / FormatSDCard, PR #85) are decoded alongside the family;
+// PTZCmd is bit-level decoded (§A.3-A.4, issue #57) —
 // [`parse_ptz_command`] is the byte-exact inverse of the gb28181-go
 // platform builders, and the golden hex table is shared across the
 // twins.
@@ -1028,9 +1029,12 @@ fn parse_drag_zoom(b: DragZoomBody, zoom_in: bool) -> Option<DragZoom> {
 // ---------------------------------------------------------------------------
 // DeviceConfig sub-command decode (GB/T 28181-2022 §9.3.3 / A.2.3.2,
 // issue #57 minimum). The command family carries one sub-command child
-// (A.2.3.2.2-12); this crate decodes the subset a fixed camera can act
-// on — BasicParam, FrameMirror, AlarmReport — everything else keeps the
-// control-reject behavior. 校时 is NOT part of this family (2022 §9.10.2
+// (A.2.3.2.2-12); this crate decodes the fixed-camera subset —
+// BasicParam, FrameMirror, AlarmReport plus the closure family
+// (VideoParamAttribute / VideoRecordPlan / VideoAlarmRecord / PictureMask
+// / OSDConfig, PR #84) and SnapShotConfig (PR #83) on the same channel;
+// SVAC encode/decode (A.2.3.2.3/4) stays rejected by design. 校时 is NOT
+// part of this family (2022 §9.10.2
 // does it via the REGISTER response's SIP Date header).
 // ---------------------------------------------------------------------------
 

@@ -11,6 +11,31 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` device-side completeness wave (twins incoming in
+  gb28181-go): five gaps surfaced by the full-coverage audit —
+  - **PresetQuery response** (A.2.4.8 → the A.2.6 answer): the preset
+    list query now answers with the wire shape
+    `SumNum` + `PresetList Num` + `Item{PresetID,PresetName}`; the
+    library carries no PTZ of its own so the default answer is the valid
+    empty list, same stance as the 2022 five queries.
+  - **Platform-negotiated registration expiry**: the REGISTER 200 OK's
+    `Expires` header (Contact `;expires=` fallback) now drives the
+    refresh cadence (half the negotiated window, ≥60s floor); the local
+    config applies only when the platform does not negotiate.
+  - **Incoming CANCEL**: answered 200 OK per RFC 3261 §9.2 — the device
+    answers INVITEs immediately so a CANCEL usually races the 200, and
+    leaving it unanswered left platforms waiting.
+  - **Silent-platform detection**: keepalive accounting only reacted to
+    explicit non-OK responses — a platform that stopped answering
+    entirely never tripped re-registration. Any SIP response now stamps
+    a contact clock, and heartbeat_timeout_count unheard intervals
+    trigger re-registration (same threshold as explicit failures).
+  - **Subscription-State honesty**: NOTIFYs advertised a hard-coded
+    `expires=3600`; they now carry the subscription's real remaining
+    lifetime.
+  - Doc rot: two stale module comments (DragZoom-deferred,
+    BasicParam-only DeviceConfig) refreshed to the post-closure reality.
+
 - `feat` 2022 closure controls (twin of gb28181-go #108):
   `DeviceUpgrade` (A.2.3.1.12) lands behind a
   `with_device_upgrader` seam shaped like the snapshot executor —

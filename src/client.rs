@@ -455,6 +455,75 @@ pub fn parse_invite(msg: &SipMessage) -> Result<InviteInfo> {
 /// channels/devices with their status and configuration. The message uses
 /// fresh Call-ID/CSeq headers (like the keepalive notify) and child-element
 /// MANSCDP XML per the NVR interop requirement.
+/// Response to a `PresetQuery` (A.2.4.8 → the A.2.6 answer): the preset
+/// list as `(PresetID, PresetName)` pairs. An empty slice is the valid
+/// no-presets answer (未配置预置位时 Item 省略、Num=0).
+pub fn build_preset_list_response(
+    sn: &str,
+    device_id: &str,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+    presets: &[(String, String)],
+) -> Result<SipMessage> {
+    let items = presets
+        .iter()
+        .map(|(id, name)| {
+            format!(
+                "<Item><PresetID>{}</PresetID><PresetName>{}</PresetName></Item>",
+                xml_escape(id),
+                xml_escape(name)
+            )
+        })
+        .collect::<String>();
+    let body = format!(
+        "<Response CmdType=\"PresetQuery\" SN=\"{}\"><DeviceID>{}</DeviceID><SumNum>{}</SumNum><PresetList Num=\"{}\">{}</PresetList></Response>",
+        xml_escape(sn),
+        xml_escape(device_id),
+        presets.len(),
+        presets.len(),
+        items
+    );
+
+    let mut headers = Vec::new();
+    headers.push((
+        "Via".to_string(),
+        format!(
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
+        ),
+    ));
+    headers.push((
+        "From".to_string(),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
+    ));
+    headers.push(("To".to_string(), format!("<sip:{}@{}>", domain, domain)));
+    headers.push((
+        "Call-ID".to_string(),
+        format!("{}-preset-{}", device_id, cseq),
+    ));
+    headers.push(("CSeq".to_string(), format!("{} MESSAGE", cseq)));
+    headers.push(("Max-Forwards".to_string(), "70".to_string()));
+    headers.push((
+        "Content-Type".to_string(),
+        "Application/MANSCDP+xml".to_string(),
+    ));
+    headers.push(("Content-Length".to_string(), body.len().to_string()));
+
+    Ok(SipMessage {
+        start_line: "MESSAGE sip:{}@{} SIP/2.0".replace("{}", domain),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some(format!("sip:{}@{}", device_id, domain)),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body,
+    })
+}
+
 pub fn build_catalog_response(
     sn: &str,
     device_id: &str,
