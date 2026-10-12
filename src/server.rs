@@ -1623,11 +1623,19 @@ impl Gb28181Server {
                     }
                 }
 
-                // Build and send Catalog/DeviceInfo response if this was a query
-                if let Some(response_msg) = self.build_query_response(msg)? {
+                // Build and send Catalog/DeviceInfo response if this was a
+                // query. Large answers arrive as multiple pages (same SN,
+                // SumNum = total); pace them slightly so a UDP burst does
+                // not drop the tail pages — the platform accumulates by SN.
+                if let Some(pages) = self.build_query_response(msg)? {
                     // Small delay to let 200 OK be processed first
                     tokio::time::sleep(Duration::from_millis(100)).await;
-                    self.send_sip_message(&response_msg, peer_addr).await?;
+                    for (i, page) in pages.iter().enumerate() {
+                        if i > 0 {
+                            tokio::time::sleep(Duration::from_millis(50)).await;
+                        }
+                        self.send_sip_message(page, peer_addr).await?;
+                    }
                 }
             }
             Some(SipMethod::Info) => {
@@ -1844,7 +1852,7 @@ impl Gb28181Server {
     }
 
     /// Build a Catalog or DeviceInfo response MESSAGE for an inbound MANSCDP query.
-    fn build_query_response(&self, msg: &SipMessage) -> Result<Option<SipMessage>> {
+    fn build_query_response(&self, msg: &SipMessage) -> Result<Option<Vec<SipMessage>>> {
         if msg.get_header("Content-Type").unwrap_or("") != "Application/MANSCDP+xml" {
             return Ok(None);
         }
@@ -1883,7 +1891,7 @@ impl Gb28181Server {
                     cseq,
                     &[channel],
                 )?;
-                Ok(Some(response))
+                Ok(Some(vec![response]))
             }
             "PresetQuery" => {
                 // A.2.4.8: the device's preset list. The library carries
@@ -1899,7 +1907,7 @@ impl Gb28181Server {
                     cseq,
                     &[],
                 )?;
-                Ok(Some(response))
+                Ok(Some(vec![response]))
             }
             "DeviceInfo" => {
                 let info = DeviceItem {
@@ -1918,7 +1926,7 @@ impl Gb28181Server {
                     cseq,
                     &info,
                 )?;
-                Ok(Some(response))
+                Ok(Some(vec![response]))
             }
             "RecordInfo" => {
                 let riq = match super::manscdp::parse_recordinfo_query_dual(&msg.body) {
@@ -1949,16 +1957,32 @@ impl Gb28181Server {
                     }
                     _ => Vec::new(),
                 };
-                let response = super::client::build_recordinfo_response(
-                    &riq.sn,
-                    &riq.device_id,
-                    &self.config.sip_domain,
-                    &self.local_ip,
-                    self.config.local_sip_port,
-                    cseq,
-                    &items,
-                )?;
-                Ok(Some(response))
+                // A.2.6.4: large answers page across multiple MESSAGEs —
+                // every page carries the TOTAL SumNum, the platform
+                // accumulates by SN. Pages of 10 keep one UDP datagram
+                // well under the 64 KiB SIP limit.
+                let mut pages = Vec::new();
+                let total = items.len();
+                // An empty answer is still ONE page (the valid empty
+                // list) — chunks() over an empty slice yields none.
+                let chunked: Vec<&[super::client::RecordItem]> = if items.is_empty() {
+                    vec![&[]]
+                } else {
+                    items.chunks(RESPONSE_PAGE_ITEMS).collect()
+                };
+                for (i, chunk) in chunked.into_iter().enumerate() {
+                    pages.push(super::client::build_recordinfo_response_page(
+                        &riq.sn,
+                        &riq.device_id,
+                        &self.config.sip_domain,
+                        &self.local_ip,
+                        self.config.local_sip_port,
+                        cseq + i as u32,
+                        chunk,
+                        total,
+                    )?);
+                }
+                Ok(Some(pages))
             }
             "DeviceStatus" => {
                 let response = super::client::build_device_status_response(
@@ -1969,7 +1993,7 @@ impl Gb28181Server {
                     self.config.local_sip_port,
                     cseq,
                 )?;
-                Ok(Some(response))
+                Ok(Some(vec![response]))
             }
             "HomePositionQuery"
             | "CruiseTrackListQuery"
@@ -1993,7 +2017,7 @@ impl Gb28181Server {
                     self.config.local_sip_port,
                     cseq,
                 )?;
-                Ok(Some(response))
+                Ok(Some(vec![response]))
             }
             "ConfigDownload" => {
                 // A.2.4.7 / A.2.6.9: answer the minimal valid Response —
@@ -2033,7 +2057,7 @@ impl Gb28181Server {
                     self.config.local_sip_port,
                     cseq,
                 )?;
-                Ok(Some(response))
+                Ok(Some(vec![response]))
             }
             "DeviceControl" | "Broadcast" | "DeviceConfig" | "HomePosition" => {
                 log::warn!("gb28181: control command not supported: {}", query.cmd_type);
@@ -2046,7 +2070,7 @@ impl Gb28181Server {
                     self.config.local_sip_port,
                     cseq,
                 )?;
-                Ok(Some(response))
+                Ok(Some(vec![response]))
             }
             _ => Ok(None),
         }
@@ -3005,6 +3029,12 @@ const MIN_NEGOTIATED_EXPIRY_SECS: u64 = 60;
 
 /// Cadence of the silent-platform check in the UDP run loop.
 const SILENCE_CHECK_INTERVAL_SECS: u64 = 5;
+
+/// Multi-MESSAGE page size for large Catalog/RecordInfo answers
+/// (A.2.6.1/A.2.6.4): each MESSAGE carries at most this many items,
+/// SumNum the total, so a large answer never overflows one UDP
+/// datagram. Platforms accumulate by SN until they hold SumNum items.
+const RESPONSE_PAGE_ITEMS: usize = 10;
 
 /// Platform-negotiated registration expiry of a REGISTER 200 OK: the
 /// `Expires` header, falling back to the Contact header's `;expires=`
@@ -4252,6 +4282,110 @@ impl super::RecordingSource for FakeRecordingSource {
     }
 }
 
+/// Large RecordInfo answers page across multiple MESSAGEs (A.2.6.4):
+/// every page carries the TOTAL SumNum, RecordList Num the page's own
+/// count; the platform accumulates by SN.
+#[tokio::test]
+async fn test_recordinfo_pagination() {
+    let config = Gb28181Config {
+        enabled: true,
+        platform_sip_address: "127.0.0.1".to_string(),
+        platform_sip_port: 5060,
+        device_id: "34020000001320000001".to_string(),
+        channel_id: "34020000001320000001".to_string(),
+        sip_domain: "3402000000".to_string(),
+        password: "12345678".to_string(),
+        local_sip_port: 5060,
+        register_interval_secs: 3600,
+        heartbeat_interval_secs: 60,
+        heartbeat_timeout_count: 3,
+        transport: Transport::Udp,
+        ..Gb28181Config::default()
+    };
+    let base_ms: u64 = 1_790_000_000_000;
+    let mut segments = Vec::new();
+    for i in 0..25u64 {
+        segments.push(super::SegmentMeta {
+            file: format!("2026/10/13/{i:02}-00-00.h264"),
+            start_ms: base_ms + i * 60_000,
+            end_ms: base_ms + i * 60_000 + 30_000,
+        });
+    }
+    let source = FakeRecordingSource { segments };
+    let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+    let server = Gb28181Server {
+        config,
+        au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+        metrics: Arc::new(crate::metrics::NoopMetrics),
+        sip_socket: Some(sip_socket),
+        tcp_conn: None,
+        media_socket: None,
+        media_tcp_conn: None,
+        media_task: None,
+        subscriber_id: None,
+        invite_info: None,
+        broadcast_pending: None,
+        local_ip: "192.168.62.104".to_string(),
+        recording_index: Some(Arc::new(source)),
+        playback_ctl: None,
+        audio_sink: None,
+        talkback_source: None,
+        authenticator: None,
+        platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+        platform_date: Arc::new(std::sync::Mutex::new(None)),
+        snapshot_executor: None,
+        negotiated_register_expires: None,
+        device_upgrader: None,
+        control_handler: None,
+        config_handler: None,
+        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        position_source: None,
+        position_cancel: None,
+        notifier_std_sock: None,
+    };
+
+    let start_s = super::client::format_gb_time_ms(base_ms);
+    let end_s = super::client::format_gb_time_ms(base_ms + 3_600_000);
+    let body = format!(
+        "<Query><CmdType>RecordInfo</CmdType><SN>77</SN><DeviceID>34020000001320000001</DeviceID><StartTime>{start_s}</StartTime><EndTime>{end_s}</EndTime></Query>"
+    );
+    let msg = SipMessage {
+        start_line: "MESSAGE sip:3402000000@3402000000 SIP/2.0".to_string(),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some("sip:3402000000@3402000000".to_string()),
+        version: "SIP/2.0".to_string(),
+        headers: vec![(
+            "Content-Type".to_string(),
+            "Application/MANSCDP+xml".to_string(),
+        )],
+        body: body.to_string(),
+    };
+
+    let pages = server
+        .build_query_response(&msg)
+        .expect("dispatch")
+        .expect("RecordInfo pages");
+    assert_eq!(pages.len(), 3, "25 segments at page size 10");
+    let want_nums = ["Num=\"10\"", "Num=\"10\"", "Num=\"5\""];
+    for (i, page) in pages.iter().enumerate() {
+        assert!(
+            page.body.contains("<SumNum>25</SumNum>"),
+            "page {i}: SumNum must carry the total: {}",
+            page.body
+        );
+        assert!(
+            page.body
+                .contains(&format!("<RecordList {}>", want_nums[i])),
+            "page {i}: {} missing: {}",
+            want_nums[i],
+            page.body
+        );
+    }
+    assert!(pages[0].body.contains("00-00-00.h264"));
+    assert!(pages[2].body.contains("24-00-00.h264"));
+}
+
 /// A RecordInfo query dispatched through `build_query_response` with a
 /// recording source yields a response carrying one Item per segment.
 #[tokio::test]
@@ -4333,7 +4467,9 @@ async fn test_recordinfo_dispatch_with_source() {
     let response = server
         .build_query_response(&msg)
         .expect("dispatch should succeed")
-        .expect("RecordInfo should produce a response");
+        .expect("RecordInfo should produce a response")
+        .pop()
+        .expect("page");
     assert!(response.body.contains("<SumNum>1</SumNum>"));
     assert!(response.body.contains("<RecordList Num=\"1\">"));
     assert!(response
@@ -4533,6 +4669,7 @@ async fn test_gb2022_information_queries_dispatch() {
         let response = server
             .build_query_response(&msg)
             .expect("dispatch should succeed")
+            .and_then(|pages| pages.into_iter().next())
             .unwrap_or_else(|| panic!("{cmd_type} must produce a response"));
         assert!(response.body.contains(want), "{cmd_type} body: {}", response.body);
     }
@@ -4759,7 +4896,9 @@ async fn test_deviceconfig_and_configdownload_dispatch() {
     let with_basic = server
         .build_query_response(&query("BasicParam/FrameMirror"))
         .expect("dispatch")
-        .expect("response");
+        .expect("response")
+        .pop()
+        .expect("page");
     assert!(
         with_basic
             .body
@@ -4779,7 +4918,9 @@ async fn test_deviceconfig_and_configdownload_dispatch() {
     let without = server
         .build_query_response(&query("OSDConfig"))
         .expect("dispatch")
-        .expect("response");
+        .expect("response")
+        .pop()
+        .expect("page");
     assert!(
         without.body.contains("<Result>OK</Result>") && !without.body.contains("<BasicParam>"),
         "bare OK body: {}",
@@ -4855,7 +4996,9 @@ async fn test_recordinfo_dispatch_without_source() {
     let response = server
         .build_query_response(&msg)
         .expect("dispatch should succeed")
-        .expect("RecordInfo should produce a response");
+        .expect("RecordInfo should produce a response")
+        .pop()
+        .expect("page");
     assert_eq!(
             response.body,
             "<?xml version=\"1.0\" encoding=\"GB2312\"?><Response CmdType=\"RecordInfo\" SN=\"9\"><DeviceID>34020000001320000001</DeviceID><Name>34020000001320000001</Name><SumNum>0</SumNum><RecordList Num=\"0\"></RecordList></Response>"
@@ -7430,7 +7573,9 @@ mod tcp_media_tests {
         let response = server
             .build_query_response(&msg)
             .expect("dispatch")
-            .expect("PresetQuery produces a response");
+            .expect("PresetQuery produces a response")
+            .pop()
+            .expect("page");
         assert!(
             response
                 .body

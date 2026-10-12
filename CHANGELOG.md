@@ -11,6 +11,16 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **Catalog/RecordInfo pagination** (A.2.6.1/A.2.6.4):
+  large answers now page across multiple MESSAGEs — every page carries
+  the TOTAL `SumNum` while the list `Num` carries the page's own count
+  (platforms accumulate by SN until they hold SumNum items; pages of 10
+  keep one UDP datagram well under the 64 KiB SIP limit, paced 50ms
+  apart). `build_query_response` returns `Vec<SipMessage>`;
+  `build_{catalog,recordinfo}_response_page` join the public builder
+  surface with the total as an explicit argument. An empty answer is
+  still one valid empty page.
+
 - `feat(server)` device-side completeness wave (twins incoming in
   gb28181-go): five gaps surfaced by the full-coverage audit —
   - **PresetQuery response** (A.2.4.8 → the A.2.6 answer): the preset

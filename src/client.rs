@@ -533,11 +533,38 @@ pub fn build_catalog_response(
     cseq: u32,
     items: &[ChannelItem],
 ) -> Result<SipMessage> {
+    build_catalog_response_page(
+        sn,
+        device_id,
+        domain,
+        local_ip,
+        local_port,
+        cseq,
+        items,
+        items.len(),
+    )
+}
+
+/// One page of a possibly multi-MESSAGE Catalog answer (A.2.6.1):
+/// `sum_num` carries the TOTAL across all pages (the platform
+/// accumulates by SN until it holds SumNum items), DeviceList Num this
+/// page's count.
+#[allow(clippy::too_many_arguments)] // page variant mirrors the original builder + the total
+pub fn build_catalog_response_page(
+    sn: &str,
+    device_id: &str,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+    items: &[ChannelItem],
+    sum_num: usize,
+) -> Result<SipMessage> {
     let body = format!(
         "<Response CmdType=\"Catalog\" SN=\"{}\"><DeviceID>{}</DeviceID><SumNum>{}</SumNum><DeviceList Num=\"{}\">{}</DeviceList></Response>",
         xml_escape(sn),
         xml_escape(device_id),
-        items.len(),
+        sum_num,
         items.len(),
         items
             .iter()
@@ -879,6 +906,31 @@ pub fn build_recordinfo_response(
     cseq: u32,
     items: &[RecordItem],
 ) -> Result<SipMessage> {
+    build_recordinfo_response_page(
+        sn,
+        device_id,
+        domain,
+        local_ip,
+        local_port,
+        cseq,
+        items,
+        items.len(),
+    )
+}
+
+/// One page of a possibly multi-MESSAGE RecordInfo answer: `sum_num`
+/// carries the TOTAL across all pages, RecordList Num this page's count.
+#[allow(clippy::too_many_arguments)] // page variant mirrors the original builder + the total
+pub fn build_recordinfo_response_page(
+    sn: &str,
+    device_id: &str,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+    items: &[RecordItem],
+    sum_num: usize,
+) -> Result<SipMessage> {
     let items_xml = items
         .iter()
         .map(|it| {
@@ -898,7 +950,7 @@ pub fn build_recordinfo_response(
         <Response CmdType=\"RecordInfo\" SN=\"{}\">\
         <DeviceID>{}</DeviceID>\
         <Name>{}</Name>\
-        <SumNum>{}</SumNum>\
+        <SumNum>{sum_num}</SumNum>\
         <RecordList Num=\"{}\">\
         {}\
         </RecordList>\
@@ -906,7 +958,6 @@ pub fn build_recordinfo_response(
         xml_escape(sn),
         xml_escape(device_id),
         xml_escape(device_id),
-        items.len(),
         items.len(),
         items_xml
     );
