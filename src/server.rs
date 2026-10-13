@@ -1054,7 +1054,7 @@ impl Gb28181Server {
                 // Per-connection keepalive stop: a re-dial must not leave
                 // the old connection's keepalive hammering a broken pipe.
                 let (conn_stop_tx, mut conn_stop_rx) = watch::channel(ShutdownMode::Init);
-                let keepalive_sink = KeepaliveSink::Stream(Arc::clone(&writer));
+                let keepalive_sink = SipSink::Stream(Arc::clone(&writer));
                 let keepalive_device_id = self.config.device_id.clone();
                 let keepalive_domain = self.config.sip_domain.clone();
                 let keepalive_interval = self.config.heartbeat_interval_secs;
@@ -1449,7 +1449,7 @@ impl Gb28181Server {
             let keepalive_metrics = Arc::clone(&self.metrics);
             tokio::spawn(async move {
                 if let Err(e) = run_keepalive(
-                    KeepaliveSink::Udp(sip_socket_for_keepalive, platform_sip_addr),
+                    SipSink::Udp(sip_socket_for_keepalive, platform_sip_addr),
                     platform_sip_addr,
                     &keepalive_device_id,
                     &keepalive_domain,
@@ -1605,7 +1605,7 @@ impl Gb28181Server {
                                 let keepalive_metrics = Arc::clone(&self.metrics);
                                 tokio::spawn(async move {
                                     if let Err(e) = run_keepalive(
-                                        KeepaliveSink::Udp(
+                                        SipSink::Udp(
                                             sip_socket_for_keepalive,
                                             platform_sip_addr,
                                         ),
@@ -1942,15 +1942,16 @@ impl Gb28181Server {
                 // channel. With an executor installed the A.2.6.8
                 // Result=OK response is the synchronous answer; the
                 // exchange runs in a spawned task and completes
-                // asynchronously via the A.2.5.7 notify. Without an
-                // executor — or over the TCP transport — the fall-through
-                // reject answers ERROR on the same DeviceConfig channel.
+                // asynchronously via the A.2.5.7 notify (the notify rides
+                // the live transport — UDP socket or stream writer).
+                // Without an executor the fall-through reject answers
+                // ERROR on the same DeviceConfig channel.
                 if let Some(config) = crate::manscdp::parse_config_snapshot(&msg.body) {
                     if let Some(executor) = self.snapshot_executor.clone() {
                         // UDP only: the notify leaves through the shared
                         // SIP UDP socket; per-connection TCP servers carry
                         // a placeholder UDP socket, so key off tcp_conn.
-                        if self.tcp_conn.is_none() && self.sip_socket.is_some() {
+                        if self.tcp_conn.is_some() || self.sip_socket.is_some() {
                             let cseq = random_cseq();
                             let ok_response = super::client::build_device_config_response(
                                 true,
@@ -1966,9 +1967,7 @@ impl Gb28181Server {
                             self.spawn_snapshot_exchange(&config, executor, platform_addr);
                             return Ok(());
                         }
-                        log::warn!(
-                            "gb28181: snapshot config over TCP transport — executor requires UDP, rejecting"
-                        );
+                        log::warn!("gb28181: snapshot config without a live transport — rejecting");
                     }
                 }
 
@@ -1985,7 +1984,7 @@ impl Gb28181Server {
                             // UDP only: the notify leaves through the shared
                             // SIP UDP socket; per-connection TCP servers carry
                             // a placeholder UDP socket, so key off tcp_conn.
-                            if self.tcp_conn.is_none() && self.sip_socket.is_some() {
+                            if self.tcp_conn.is_some() || self.sip_socket.is_some() {
                                 let sn = control.sn.parse::<u32>().unwrap_or(0);
                                 self.spawn_upgrade_exchange(
                                     sn,
@@ -1996,7 +1995,7 @@ impl Gb28181Server {
                                 return Ok(());
                             }
                             log::warn!(
-                                "gb28181: device upgrade over TCP transport — upgrader requires UDP, rejecting"
+                                "gb28181: device upgrade without a live transport — rejecting"
                             );
                         }
                     }
@@ -2051,11 +2050,11 @@ impl Gb28181Server {
 
                 // Voice broadcast (§9.12.1, A.2.5.5): acknowledge the
                 // notification, then — with an audio sink installed —
-                // run the 信令3/信令5 device half. UDP transport only
-                // (the response and INVITE leave through the shared SIP
-                // UDP socket).
+                // run the 信令3/信令5 device half. The response and
+                // INVITE leave through send_sip_message (any live
+                // transport); the media leg is its own UDP socket.
                 if let Some(notify) = crate::manscdp::parse_broadcast_notify(&msg.body) {
-                    if self.tcp_conn.is_none() && self.sip_socket.is_some() {
+                    if self.tcp_conn.is_some() || self.sip_socket.is_some() {
                         let ok = build_error_response(msg, 200, "OK");
                         self.send_sip_message(&ok, peer_addr).await?;
                         self.start_broadcast(notify, platform_addr).await?;
@@ -3309,10 +3308,7 @@ impl Gb28181Server {
         let domain = self.config.sip_domain.clone();
         let local_ip = self.local_ip.clone();
         let local_port = self.config.local_sip_port;
-        let socket = self
-            .sip_socket
-            .clone()
-            .expect("caller checked UDP transport");
+        let sink = self.exchange_sink(platform_addr);
         let session_id = cmd.session_id.clone();
 
         tokio::spawn(async move {
@@ -3345,10 +3341,25 @@ impl Gb28181Server {
                 }
             };
             let data = serialize_wire(&notify);
-            if let Err(e) = socket.send_to(&data, platform_addr).await {
+            if let Err(e) = sink.send(&data).await {
                 log::error!("gb28181: upgrade-result notify send failed: {e}");
             }
         });
+    }
+
+    /// The async-exchange notify send path: the stream writer when one is
+    /// live (outbound stream transport or inbound TCP connection), the
+    /// shared UDP socket otherwise.
+    fn exchange_sink(&self, platform_addr: SocketAddr) -> SipSink {
+        if let Some(writer) = self.tcp_conn.as_ref() {
+            return SipSink::Stream(Arc::clone(writer));
+        }
+        SipSink::Udp(
+            self.sip_socket
+                .clone()
+                .expect("caller checked a live transport"),
+            platform_addr,
+        )
     }
 
     fn spawn_snapshot_exchange(
@@ -3371,10 +3382,7 @@ impl Gb28181Server {
         let domain = self.config.sip_domain.clone();
         let local_ip = self.local_ip.clone();
         let local_port = self.config.local_sip_port;
-        let socket = self
-            .sip_socket
-            .clone()
-            .expect("caller checked UDP transport");
+        let sink = self.exchange_sink(platform_addr);
 
         tokio::spawn(async move {
             let file_ids = match executor.execute(cmd).await {
@@ -3400,7 +3408,7 @@ impl Gb28181Server {
                 }
             };
             let data = serialize_wire(&notify);
-            if let Err(e) = socket.send_to(&data, platform_addr).await {
+            if let Err(e) = sink.send(&data).await {
                 log::error!("gb28181: snapshot-finished notify send failed: {e}");
             }
         });
@@ -3861,16 +3869,38 @@ fn build_error_response(request: &SipMessage, code: u16, reason: &str) -> SipMes
 
 /// Run the keepalive task (stops when `shutdown` fires).
 #[allow(clippy::too_many_arguments)]
-/// The keepalive send path: the shared UDP socket (UDP transport) or
-/// the outbound stream writer (`tcp-out`/`tls`).
-enum KeepaliveSink {
+/// A SIP send path: the shared UDP socket (UDP transport) or a stream
+/// writer (`tcp-out`/`tls`, or an inbound TCP connection) — used by the
+/// keepalive loop and the async snapshot/upgrade exchange notifies.
+enum SipSink {
     Udp(Arc<UdpSocket>, SocketAddr),
     Stream(SharedSipWriter),
 }
 
+impl SipSink {
+    async fn send(&self, data: &[u8]) -> Result<()> {
+        match self {
+            SipSink::Udp(socket, addr) => {
+                socket
+                    .send_to(data, *addr)
+                    .await
+                    .context("gb28181: UDP send failed")?;
+            }
+            SipSink::Stream(writer) => {
+                let mut guard = writer.lock().await;
+                guard
+                    .write_all(data)
+                    .await
+                    .context("gb28181: stream write failed")?;
+            }
+        }
+        Ok(())
+    }
+}
+
 #[allow(clippy::too_many_arguments)] // one arg per keepalive context; predates the sink split
 async fn run_keepalive(
-    sink: KeepaliveSink,
+    sink: SipSink,
     _platform_addr: SocketAddr,
     device_id: &str,
     domain: &str,
@@ -3912,23 +3942,7 @@ async fn run_keepalive(
                 }
 
                 let data = serialize_wire(&notify);
-                let sent = match &sink {
-                    KeepaliveSink::Udp(socket, addr) => socket
-                        .send_to(&data, *addr)
-                        .await
-                        .map(|_| ())
-                        .map_err(|e| e.to_string()),
-                    KeepaliveSink::Stream(writer) => async {
-                        let mut guard = writer.lock().await;
-                        guard
-                            .write_all(&data)
-                            .await
-                            .map(|_| ())
-                            .map_err(|e| e.to_string())
-                    }
-                    .await,
-                };
-                if let Err(e) = sent {
+                if let Err(e) = sink.send(&data).await {
                     metrics.keepalive_fail();
                     log::error!("gb28181: keepalive send failed: {e}");
                 }

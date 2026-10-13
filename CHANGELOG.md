@@ -11,6 +11,14 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **async snapshot/upgrade/broadcast exchanges on any
+  live transport**: the A.2.5.7 / A.2.5.9 completion notifies and the
+  §9.12.1 broadcast flow ride the stream writer when one is live
+  (outbound `tcp-out`/`tls` connection or an inbound TCP connection) —
+  previously UDP-transport-only by guard. `KeepaliveSink` generalizes
+  to `SipSink` (shared `send`), the exchange tasks take it, and the
+  three UDP-only dispatch guards became live-transport guards.
+
 - `feat(server)` **outbound stream transports — the full lifecycle over
   a dialed connection** (`transport: "tcp-out"` and, with the opt-in
   `tls` feature, `transport: "tls"` / SIPS,
