@@ -11,6 +11,12 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **multi-channel catalog** (A.2.1):
+  `Gb28181Config::extra_channels` (`CatalogChannel`: device_id/name +
+  optional manufacturer/model/status) lists additional channels after
+  the device's own entry — large lists page across MESSAGEs
+  automatically via the A.2.6.1 machinery.
+
 - `feat(server)` **passive TCP media** (Annex C.2, issue #14
   follow-up): an `a=setup:active` offer (the platform dials the
   device's media port) is answered `a=setup:passive` with a real

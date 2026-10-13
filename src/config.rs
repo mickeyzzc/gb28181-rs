@@ -31,6 +31,34 @@ pub enum Transport {
     Tls,
 }
 
+/// One extra catalog channel advertised in Catalog answers (A.2.1): a
+/// multi-channel device (e.g. an NVR-ish host or a multi-sensor camera)
+/// lists itself plus each channel. Defaults fill like the device's own
+/// entry: `ON` status, no parent overrides, coordinates zero.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CatalogChannel {
+    /// The channel's 20-digit GB ID (must be unique under the device).
+    pub device_id: String,
+    pub name: String,
+    #[serde(default)]
+    pub manufacturer: String,
+    #[serde(default)]
+    pub model: String,
+    /// `ON`/`OFF` — defaults to `ON`.
+    #[serde(default)]
+    pub status: String,
+}
+
+impl CatalogChannel {
+    pub(crate) fn effective_status(&self) -> &str {
+        if self.status.is_empty() {
+            "ON"
+        } else {
+            &self.status
+        }
+    }
+}
+
 /// GB28181 SIP device settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Gb28181Config {
@@ -66,6 +94,11 @@ pub struct Gb28181Config {
     pub strict_example_defaults: bool,
     #[serde(default)]
     pub transport: Transport,
+    /// Extra catalog channels (A.2.1): the device's own entry comes
+    /// first, then these — large lists page across multiple MESSAGEs
+    /// automatically.
+    #[serde(default)]
+    pub extra_channels: Vec<CatalogChannel>,
     /// TLS trust anchor for [`Transport::Tls`]: PEM file of the CA (or
     /// the platform's self-signed certificate — the GB convention is a
     /// self-signed CA whose serial is the entity ID) used to verify the
@@ -273,6 +306,7 @@ impl Default for Gb28181Config {
             heartbeat_timeout_count: default_gb28181_heartbeat_timeout_count(),
             strict_example_defaults: false,
             transport: Transport::default(),
+            extra_channels: Vec::new(),
             tls_ca_file: String::new(),
             tls_cert_file: String::new(),
             tls_key_file: String::new(),
