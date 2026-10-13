@@ -832,6 +832,7 @@ impl Gb28181Server {
             config_handler: self.config_handler.clone(),
             talkback_source: self.talkback_source.clone(),
             metrics: Arc::clone(&self.metrics),
+            notifier: Arc::clone(&self.notifier),
         };
         let platform_proto_ver = Arc::clone(&self.platform_proto_ver);
         let platform_date = Arc::clone(&self.platform_date);
@@ -853,6 +854,7 @@ impl Gb28181Server {
                                     config_handler: seams.config_handler.clone(),
                                     talkback_source: seams.talkback_source.clone(),
                                     metrics: Arc::clone(&seams.metrics),
+                                    notifier: Arc::clone(&seams.notifier),
                                 };
                                 let mut shutdown_conn = shutdown_rx.clone();
                                 tokio::spawn(async move {
@@ -3629,6 +3631,9 @@ struct TcpSeams {
     config_handler: Option<Arc<dyn DeviceConfigHandler>>,
     talkback_source: Option<Arc<TalkbackSource>>,
     metrics: Arc<dyn crate::metrics::MetricsHooks>,
+    /// The host-facing notifier, shared so a TCP SUBSCRIBE books where
+    /// host senders (send_alarm / position loop / catalog change) see it.
+    notifier: Arc<crate::subscribe::DeviceNotifier>,
 }
 
 #[allow(clippy::too_many_arguments)] // one arg per connection resource; the seams travel bundled
@@ -3699,11 +3704,34 @@ async fn handle_tcp_connection(
         // connection via send_sip_message → tcp_conn.
         control_handler: seams.control_handler,
         config_handler: seams.config_handler,
-        notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+        notifier: Arc::clone(&seams.notifier),
         position_source: None,
         position_cancel: None,
         notifier_std_sock: None,
     };
+
+    // TCP NOTIFY path (single-platform model): NOTIFYs of subscriptions
+    // booked on this connection ride it — a drain task moves channel
+    // writes onto the dialog's stream. The binding clears when the
+    // connection closes (unless a newer connection rebound).
+    let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+    let notify_conn = server.tcp_conn.clone();
+    let (notify_closed_tx, mut notify_closed_rx) = watch::channel(());
+    seams.notifier.bind_tcp(notify_tx.clone());
+    let notify_drain = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                Some(bytes) = notify_rx.recv() => {
+                    if let Some(conn) = notify_conn.as_ref() {
+                        if let Err(e) = conn.lock().await.write_all(&bytes).await {
+                            log::warn!("gb28181: NOTIFY TCP write failed: {e}");
+                        }
+                    }
+                }
+                _ = notify_closed_rx.changed() => break,
+            }
+        }
+    });
 
     // Create SIP device client (User-Agent from config; neutral default)
     let mut sip_client = SipDeviceClient::new(
@@ -3763,6 +3791,9 @@ async fn handle_tcp_connection(
         }
     }
 
+    seams.notifier.unbind_tcp(&notify_tx);
+    let _ = notify_closed_tx.send(());
+    let _ = notify_drain.await;
     Ok(())
 }
 

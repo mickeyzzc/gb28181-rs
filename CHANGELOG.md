@@ -11,6 +11,18 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **subscriptions and NOTIFYs over TCP dialogs** (audit
+  follow-up): a SUBSCRIBE arriving on a TCP connection books on the
+  shared host-facing notifier (previously answered 200 but never
+  booked), and the subscription's NOTIFYs ride the connection — the
+  notifier gains a TCP binding (`bind_tcp`/`unbind_tcp`) drained by a
+  per-connection task into the dialog's stream (`try_send` keeps host
+  sends panic-free from both async and blocking contexts). The
+  single-platform model keeps one transport at a time: the UDP run
+  loop never binds; a connection binds on accept and clears on close
+  (a newer connection may rebind). Unbinding compares by
+  `same_channel`, not struct address.
+
 - `feat(server)` **TCP transport parity, inbound half** (issue #58/#60
   follow-ups): inbound TCP connections now carry the host seams —
   DeviceControl/DeviceConfig handlers (answers ride the connection via

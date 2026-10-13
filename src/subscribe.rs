@@ -21,7 +21,7 @@ use crate::sip::{random_branch, SipMessage, SipMethod};
 use std::collections::HashMap;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// A subscription subject (SIP `Event` header / MANSCDP `CmdType`).
@@ -188,6 +188,13 @@ pub struct DeviceNotifier {
     domain: OnceLock<String>,
     local_ip: OnceLock<String>,
     local_port: OnceLock<u16>,
+    /// TCP/TLS-dialog NOTIFY path: when a platform connection is live,
+    /// NOTIFYs ride it through this channel (drained by the connection
+    /// task into the dialog's stream) instead of the UDP socket. The
+    /// single-platform model keeps one transport at a time: the UDP run
+    /// loop never binds it, a connection binds on accept and clears on
+    /// close.
+    tcp_tx: RwLock<Option<tokio::sync::mpsc::Sender<Vec<u8>>>>,
 }
 
 /// `Arc<UdpSocket>` alias kept short for the OnceLock fields. A std
@@ -212,6 +219,7 @@ impl DeviceNotifier {
             domain: OnceLock::new(),
             local_ip: OnceLock::new(),
             local_port: OnceLock::new(),
+            tcp_tx: RwLock::new(None),
         }
     }
 
@@ -234,6 +242,24 @@ impl DeviceNotifier {
 
     pub(crate) fn registry(&self) -> &SubscriptionRegistry {
         &self.registry
+    }
+
+    /// Bind the TCP NOTIFY path: the connection task drains the channel
+    /// into the dialog's stream. A newer connection may rebind freely.
+    pub(crate) fn bind_tcp(&self, tx: tokio::sync::mpsc::Sender<Vec<u8>>) {
+        *self.tcp_tx.write().expect("tcp_tx lock") = Some(tx);
+    }
+
+    /// Clear the TCP NOTIFY path (connection closed) unless a newer
+    /// connection already rebound it.
+    pub(crate) fn unbind_tcp(&self, tx: &tokio::sync::mpsc::Sender<Vec<u8>>) {
+        let mut guard = self.tcp_tx.write().expect("tcp_tx lock");
+        // same_channel compares the shared inner state, not the Sender
+        // struct address (a clone of the sender binds and the original
+        // unbinds in the connection handler).
+        if guard.as_ref().is_some_and(|s| s.same_channel(tx)) {
+            *guard = None;
+        }
     }
 
     /// Whether the platform currently holds a live subscription to
@@ -393,6 +419,22 @@ impl DeviceNotifier {
             body,
         };
         let data = crate::server::serialize_wire(&msg);
+        // A live TCP binding rides the connection (try_send: NOTIFY
+        // rates are far below the channel capacity, and blocking_send
+        // would panic in async contexts).
+        if let Some(tx) = self.tcp_tx.read().expect("tcp_tx lock").as_ref() {
+            return match tx.try_send(data) {
+                Ok(()) => true,
+                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                    log::warn!("gb28181: {event:?} NOTIFY TCP channel full — dropped");
+                    false
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    log::warn!("gb28181: {event:?} NOTIFY TCP channel closed");
+                    false
+                }
+            };
+        }
         match socket.send_to(&data, peer) {
             Ok(_) => true,
             Err(e) => {
@@ -595,5 +637,44 @@ mod tests {
             .and_then(|v| v.trim().parse().ok())
             .expect("numeric expires");
         assert!(expires > 0 && expires <= 120, "header: {header}");
+    }
+
+    #[tokio::test]
+    async fn tcp_bound_notify_rides_the_channel() {
+        // The single-platform TCP model: with a connection binding live,
+        // NOTIFYs ride the drain channel instead of the UDP socket.
+        let (n, _sip, _platform, peer) = bound_notifier();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        n.bind_tcp(tx.clone());
+
+        book(&n, SubscribeEvent::Alarm, 120, peer);
+        assert!(n.send_alarm("2", "5", "t", "", "a"));
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
+            .await
+            .expect("timeout")
+            .expect("bytes");
+        let text = String::from_utf8_lossy(&bytes).to_string();
+        assert!(text.contains("NOTIFY"), "{text}");
+        assert!(text.contains("Event: Alarm"), "{text}");
+
+        // Unbinding restores the UDP path (a stale sender must not win).
+        n.unbind_tcp(&tx);
+        assert!(n.send_alarm("2", "5", "t", "", "b"));
+        assert!(
+            rx.try_recv().is_err(),
+            "post-unbind NOTIFY must not ride the channel"
+        );
+    }
+
+    #[tokio::test]
+    async fn tcp_bound_notify_rides_the_channel_async() {
+        let (n, _sip, _platform, peer) = bound_notifier();
+        let (tx, _rx) = tokio::sync::mpsc::channel::<Vec<u8>>(8);
+        n.bind_tcp(tx.clone());
+        book(&n, SubscribeEvent::Catalog, 120, peer);
+        // try_send keeps this safe from async contexts (the position
+        // loop is a tokio task).
+        assert!(n.send_catalog_change(&[]));
+        n.unbind_tcp(&tx);
     }
 }
