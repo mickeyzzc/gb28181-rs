@@ -208,23 +208,35 @@ fn apply_control(
     }
 }
 
+/// Which SIP transport the §9.4.2 INFO leaves through — the one the
+/// INVITE arrived on (a TCP-SIP dialog answers on its connection, a
+/// UDP-SIP dialog through the shared UDP socket).
+pub enum MediaEndChannel {
+    Udp {
+        socket: Arc<UdpSocket>,
+        addr: SocketAddr,
+    },
+    Tcp(Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>),
+}
+
 /// §9.4.2 media-end notification context: a naturally finished
 /// playback/download session sends the in-dialog `MediaStatus` INFO so
 /// the platform can tear the fetch down promptly. Captured at INVITE
-/// time; UDP SIP only (over TCP-SIP the dialog write half stays with
-/// the connection handler — follow-up on #60).
+/// time; carries the dialog's own transport (issue #60 follow-up: the
+/// INFO now rides TCP-SIP dialogs too).
 pub struct MediaEndInfo {
-    /// The shared SIP UDP socket the INFO leaves through.
-    pub sip_socket: Arc<UdpSocket>,
-    /// Platform SIP address (the INVITE's source — same path back).
-    pub platform_sip_addr: SocketAddr,
+    pub channel: MediaEndChannel,
     /// Prebuilt in-dialog INFO request (§9.4.2 body).
     pub info: crate::sip::SipMessage,
 }
 
 async fn send_media_end(end: &MediaEndInfo) {
     let data = crate::server::serialize_wire(&end.info);
-    if let Err(e) = end.sip_socket.send_to(&data, end.platform_sip_addr).await {
+    let result = match &end.channel {
+        MediaEndChannel::Udp { socket, addr } => socket.send_to(&data, addr).await.map(|_| ()),
+        MediaEndChannel::Tcp(conn) => conn.lock().await.write_all(&data).await,
+    };
+    if let Err(e) = result {
         log::warn!("gb28181: MediaStatus INFO send failed: {e}");
     }
 }
@@ -599,8 +611,10 @@ mod tests {
             false, // download pacing: finish immediately
             no_control(),
             Some(MediaEndInfo {
-                sip_socket,
-                platform_sip_addr: sip_platform_addr,
+                channel: MediaEndChannel::Udp {
+                    socket: sip_socket,
+                    addr: sip_platform_addr,
+                },
                 info,
             }),
         ));
@@ -676,8 +690,10 @@ mod tests {
             true,
             rx,
             Some(MediaEndInfo {
-                sip_socket,
-                platform_sip_addr: sip_platform_addr,
+                channel: MediaEndChannel::Udp {
+                    socket: sip_socket,
+                    addr: sip_platform_addr,
+                },
                 info,
             }),
         ));
@@ -1095,5 +1111,43 @@ mod tests {
 
         drop(ctl_tx);
         task.await.expect("task join").expect("task ok");
+    }
+
+    /// Issue #60 follow-up: the §9.4.2 INFO rides a TCP-SIP dialog's
+    /// connection (byte-verbatim SIP on the stream).
+    #[tokio::test]
+    async fn media_end_info_rides_tcp_channel() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let (_, write_half) = conn.into_split();
+        let (mut server_side, _) = listener.accept().await.unwrap();
+
+        let end = MediaEndInfo {
+            channel: MediaEndChannel::Tcp(Arc::new(tokio::sync::Mutex::new(write_half))),
+            info: crate::sip::SipMessage {
+                start_line: "INFO sip:dev@domain SIP/2.0".to_string(),
+                method: Some(crate::sip::SipMethod::Info),
+                status_code: None,
+                uri: Some("sip:dev@domain".to_string()),
+                version: "SIP/2.0".to_string(),
+                headers: vec![("Content-Length".to_string(), "34".to_string())],
+                body: "MediaStatus: Play Finished\r\n".to_string(),
+            },
+        };
+        send_media_end(&end).await;
+
+        use tokio::io::AsyncReadExt;
+        let mut buf = [0u8; 1024];
+        let n = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            server_side.read(&mut buf),
+        )
+        .await
+        .expect("timeout")
+        .expect("read");
+        let text = String::from_utf8_lossy(&buf[..n]).to_string();
+        assert!(text.starts_with("INFO sip:dev@domain SIP/2.0"), "{text}");
+        assert!(text.contains("MediaStatus: Play Finished"), "{text}");
     }
 }
