@@ -99,6 +99,11 @@ pub struct Gb28181Config {
     pub strict_example_defaults: bool,
     #[serde(default)]
     pub transport: Transport,
+    /// IP_MULTICAST_TTL for media sends when the INVITE's media address
+    /// is a multicast group (0 = OS default; the LAN default of 1 stays
+    /// within one subnet). Unix only — a no-op elsewhere.
+    #[serde(default)]
+    pub multicast_ttl: u32,
     /// Extra catalog channels (A.2.1): the device's own entry comes
     /// first, then these — large lists page across multiple MESSAGEs
     /// automatically.
@@ -310,6 +315,7 @@ impl Default for Gb28181Config {
             heartbeat_interval_secs: default_gb28181_heartbeat_interval_secs(),
             heartbeat_timeout_count: default_gb28181_heartbeat_timeout_count(),
             strict_example_defaults: false,
+            multicast_ttl: 0,
             transport: Transport::default(),
             extra_channels: Vec::new(),
             tls_ca_file: String::new(),
