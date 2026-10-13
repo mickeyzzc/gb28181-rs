@@ -2876,6 +2876,22 @@ impl Gb28181Server {
         let media_dest = format!("{}:{}", invite_info.media_address, invite_info.media_port)
             .parse::<SocketAddr>()
             .context("gb28181: invalid media address from INVITE SDP")?;
+
+        // Multicast media: raise IP_MULTICAST_TTL past the LAN default
+        // when configured (unix; no-op elsewhere).
+        if media_dest.ip().is_multicast() && self.config.multicast_ttl > 0 {
+            if let Err(e) = set_multicast_ttl(&media_socket, self.config.multicast_ttl) {
+                log::warn!(
+                    "gb28181: failed to set multicast TTL {}: {e}",
+                    self.config.multicast_ttl
+                );
+            } else {
+                log::info!(
+                    "gb28181: multicast media TTL set to {}",
+                    self.config.multicast_ttl
+                );
+            }
+        }
         // Playback/Download: resolve the requested recording range. An empty
         // or unresolvable range is answered with 488 Not Acceptable Here
         // (plan binding #10).
@@ -4158,6 +4174,35 @@ fn build_error_response(request: &SipMessage, code: u16, reason: &str) -> SipMes
 
 /// Run the keepalive task (stops when `shutdown` fires).
 #[allow(clippy::too_many_arguments)]
+/// Set IP_MULTICAST_TTL on a bound media socket (unix; no-op on
+/// non-unix where the OS default applies).
+fn set_multicast_ttl(socket: &UdpSocket, ttl: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let fd = socket.as_raw_fd();
+        let val = ttl as libc::c_int;
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IP,
+                libc::IP_MULTICAST_TTL,
+                &val as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc != 0 {
+            return Err(anyhow::anyhow!(
+                "setsockopt IP_MULTICAST_TTL: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = (socket, ttl);
+    Ok(())
+}
+
 /// A SIP send path: the shared UDP socket (UDP transport) or a stream
 /// writer (`tcp-out`/`tls`, or an inbound TCP connection) — used by the
 /// keepalive loop and the async snapshot/upgrade exchange notifies.
@@ -9051,5 +9096,13 @@ mod tcp_media_tests {
             "{}",
             resp.body
         );
+    }
+
+    /// The multicast TTL helper applies to a real socket (unix; no-op
+    /// elsewhere).
+    #[tokio::test]
+    async fn test_set_multicast_ttl() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
+        set_multicast_ttl(&socket, 4).expect("ttl");
     }
 }

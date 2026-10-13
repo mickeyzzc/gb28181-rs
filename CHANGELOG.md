@@ -11,6 +11,11 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **multicast media sends** (issue #111 follow-up): RTP
+  to a multicast group address in the INVITE's c= line works, with a
+  `multicast_ttl` config knob (unix `IP_MULTICAST_TTL` via libc;
+  non-unix keeps the OS default) — previously unicast-only.
+
 - `feat(server)` **inbound SIPS listener** (`transport: "tls-listen"`,
   `tls` feature): the platform dials the device over TLS — the device's
   own certificate pair (`tls_cert_file` + `tls_key_file`, required)
