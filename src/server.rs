@@ -384,7 +384,7 @@ pub struct Gb28181Server {
     /// by the TCP connection handler)
     sip_socket: Option<Arc<UdpSocket>>,
     /// TCP connection for SIP (when transport == Tcp)
-    tcp_conn: Option<OwnedWriteHalf>,
+    tcp_conn: Option<Arc<tokio::sync::Mutex<OwnedWriteHalf>>>,
     /// Media (RTP) socket (bound on INVITE)
     media_socket: Option<Arc<UdpSocket>>,
     /// TCP media connection (when transport == Tcp — active mode: device
@@ -826,6 +826,13 @@ impl Gb28181Server {
         let config = self.config;
         let recording_index = self.recording_index;
         let audio_sink = self.audio_sink;
+        let seams = TcpSeams {
+            authenticator: self.authenticator.clone(),
+            control_handler: self.control_handler.clone(),
+            config_handler: self.config_handler.clone(),
+            talkback_source: self.talkback_source.clone(),
+            metrics: Arc::clone(&self.metrics),
+        };
         let platform_proto_ver = Arc::clone(&self.platform_proto_ver);
         let platform_date = Arc::clone(&self.platform_date);
 
@@ -840,6 +847,13 @@ impl Gb28181Server {
                                 let config_clone = config.clone();
                                 let rec_clone = recording_index.clone();
                                 let sink_clone = audio_sink.clone();
+                                let seams_conn = TcpSeams {
+                                    authenticator: seams.authenticator.clone(),
+                                    control_handler: seams.control_handler.clone(),
+                                    config_handler: seams.config_handler.clone(),
+                                    talkback_source: seams.talkback_source.clone(),
+                                    metrics: Arc::clone(&seams.metrics),
+                                };
                                 let mut shutdown_conn = shutdown_rx.clone();
                                 tokio::spawn(async move {
                                     if let Err(e) = handle_tcp_connection(
@@ -849,6 +863,7 @@ impl Gb28181Server {
                                         config_clone,
                                         rec_clone,
                                         sink_clone,
+                                        seams_conn,
                                         &mut shutdown_conn,
                                     )
                                     .await
@@ -2306,8 +2321,15 @@ impl Gb28181Server {
                             .map(str::to_string)
                             .unwrap_or_else(|| self.config.sip_domain.clone());
                         Some(super::playback::MediaEndInfo {
-                            sip_socket: Arc::clone(sock),
-                            platform_sip_addr: peer_addr,
+                            channel: match self.tcp_conn.as_ref() {
+                                Some(conn) => {
+                                    super::playback::MediaEndChannel::Tcp(Arc::clone(conn))
+                                }
+                                None => super::playback::MediaEndChannel::Udp {
+                                    socket: Arc::clone(sock),
+                                    addr: peer_addr,
+                                },
+                            },
                             info: build_media_status_info_request(
                                 &self.config.device_id,
                                 &self.local_ip,
@@ -2825,8 +2847,10 @@ impl Gb28181Server {
     /// historical format) and Content-Length always matches the wire bytes.
     async fn send_sip_message(&mut self, msg: &SipMessage, dest: SocketAddr) -> Result<()> {
         let data = serialize_wire(msg);
-        if let Some(conn) = self.tcp_conn.as_mut() {
-            conn.write_all(&data)
+        if let Some(conn) = self.tcp_conn.as_ref() {
+            conn.lock()
+                .await
+                .write_all(&data)
                 .await
                 .context("gb28181: TCP write failed")?;
         } else if let Some(socket) = self.sip_socket.as_ref() {
@@ -3594,6 +3618,20 @@ pub(super) fn frame_rtp_over_tcp(rtp_packet: &[u8]) -> Vec<u8> {
 /// Reads Content-Length framed SIP messages from the connection and
 /// dispatches them through the same `handle_message` logic as UDP. Stops
 /// cleanly when `shutdown` fires.
+/// Host seams shared into every inbound TCP connection (issue #58
+/// follow-up): the callbacks whose answers ride the connection itself.
+/// The notifier-driven exchanges (snapshot/upgrade/broadcast NOTIFY,
+/// SUBSCRIBE booking) stay UDP-only — their sends leave through the
+/// shared UDP socket.
+struct TcpSeams {
+    authenticator: Option<Arc<dyn RegisterAuthenticator>>,
+    control_handler: Option<Arc<dyn DeviceControlHandler>>,
+    config_handler: Option<Arc<dyn DeviceConfigHandler>>,
+    talkback_source: Option<Arc<TalkbackSource>>,
+    metrics: Arc<dyn crate::metrics::MetricsHooks>,
+}
+
+#[allow(clippy::too_many_arguments)] // one arg per connection resource; the seams travel bundled
 async fn handle_tcp_connection(
     conn: TcpStream,
     peer_addr: SocketAddr,
@@ -3601,6 +3639,7 @@ async fn handle_tcp_connection(
     config: Gb28181Config,
     recording_index: Option<Arc<dyn RecordingSource>>,
     audio_sink: Option<Arc<dyn AudioTalkbackSink>>,
+    seams: TcpSeams,
     shutdown: &mut watch::Receiver<ShutdownMode>,
 ) -> Result<()> {
     use tokio::io::BufReader;
@@ -3635,9 +3674,9 @@ async fn handle_tcp_connection(
     let mut server = Gb28181Server {
         config,
         au_hub,
-        metrics: Arc::new(crate::metrics::NoopMetrics),
+        metrics: seams.metrics,
         sip_socket: Some(placeholder_udp),
-        tcp_conn: Some(write_half),
+        tcp_conn: Some(Arc::new(tokio::sync::Mutex::new(write_half))),
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -3648,17 +3687,18 @@ async fn handle_tcp_connection(
         recording_index,
         playback_ctl: None,
         audio_sink,
-        talkback_source: None,
-        authenticator: None,
+        talkback_source: seams.talkback_source,
+        authenticator: seams.authenticator,
         platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
         platform_date: Arc::new(std::sync::Mutex::new(None)),
         snapshot_executor: None,
         negotiated_register_expires: None,
         device_upgrader: None,
-        // DeviceControl dispatch over TCP is a follow-up (issue #58);
-        // controls keep the reject path here.
-        control_handler: None,
-        config_handler: None,
+        // DeviceControl/DeviceConfig dispatch over TCP (issue #58
+        // follow-up): the handlers are shared in; their answers ride the
+        // connection via send_sip_message → tcp_conn.
+        control_handler: seams.control_handler,
+        config_handler: seams.config_handler,
         notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
         position_source: None,
         position_cancel: None,

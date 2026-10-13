@@ -11,6 +11,20 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **TCP transport parity, inbound half** (issue #58/#60
+  follow-ups): inbound TCP connections now carry the host seams —
+  DeviceControl/DeviceConfig handlers (answers ride the connection via
+  `send_sip_message`), the GB35114 authenticator (incoming Note
+  verification), the talkback upstream source, and real metrics —
+  previously every per-connection server hard-`None`d them. The
+  notifier-driven exchanges (snapshot/upgrade/broadcast NOTIFY,
+  SUBSCRIBE booking) stay UDP-only: their sends leave through the
+  shared UDP socket. `tcp_conn` becomes a shared
+  `Arc<Mutex<OwnedWriteHalf>>` so background tasks can write the
+  connection — and the §9.4.2 `MediaStatus` completion INFO now rides
+  TCP-SIP dialogs too (`MediaEndChannel::{Udp,Tcp}`), closing the
+  UDP-SIP-only limitation of the playback/download end notification.
+
 - `feat(server)` **Catalog/RecordInfo pagination** (A.2.6.1/A.2.6.4):
   large answers now page across multiple MESSAGEs — every page carries
   the TOTAL `SumNum` while the list `Num` carries the page's own count
