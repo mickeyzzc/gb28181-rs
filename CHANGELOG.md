@@ -11,6 +11,16 @@ released out of band.
 
 ## [Unreleased]
 
+## [v0.13.0] — 2026-10-14
+
+The transport-parity package, twin of gb28181-go v0.12.0 — TCP and
+SIPS signaling with the full outbound lifecycle (dial → REGISTER →
+keepalive → redial), subscriptions and async exchanges over streams,
+passive TCP media, multi-MESSAGE pagination, the multi-channel
+catalog and five-query host seams, and multicast sends. The SIPS
+transports (`tcp-out` dial, `tls`, `tls-listen`) ride the opt-in
+`tls` cargo feature.
+
 - `feat(server)` **multicast media sends** (issue #111 follow-up): RTP
   to a multicast group address in the INVITE's c= line works, with a
   `multicast_ttl` config knob (unix `IP_MULTICAST_TTL` via libc;
