@@ -399,6 +399,9 @@ pub struct Gb28181Server {
     /// Per-connection keepalive stop signal for the stream transports —
     /// fired on drop/shutdown so a re-dial never stacks keepalive tasks.
     conn_stop: Option<watch::Sender<ShutdownMode>>,
+    /// Host data for the 2022 five information queries (A.2.6.12-16);
+    /// `None` keeps the minimal valid answers.
+    info_query_provider: Option<Arc<dyn crate::info_query::InfoQueryProvider>>,
     /// Media (RTP) socket (bound on INVITE)
     media_socket: Option<Arc<UdpSocket>>,
     /// TCP media connection (when transport == Tcp — active mode: device
@@ -592,6 +595,7 @@ impl Gb28181Server {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -617,6 +621,17 @@ impl Gb28181Server {
             notifier_std_sock: None,
             metrics: Arc::new(crate::metrics::NoopMetrics),
         }
+    }
+
+    /// Installs the host data provider for the 2022 five information
+    /// queries (A.2.6.12-16); without one the answers stay minimal.
+    #[must_use]
+    pub fn with_info_query_provider(
+        mut self,
+        provider: Option<Arc<dyn crate::info_query::InfoQueryProvider>>,
+    ) -> Self {
+        self.info_query_provider = provider;
+        self
     }
 
     /// Installs an alternative REGISTER authentication strategy (GB 35114
@@ -2474,23 +2489,98 @@ impl Gb28181Server {
             | "CruiseTrackQuery"
             | "PTZPosition"
             | "SDCardStatus" => {
-                // GB/T 28181-2022 information queries (A.2.4.10-14):
-                // answer with the minimal valid Response (A.2.6.12-16).
-                // This device has no PTZ hardware, cruise tracks or
-                // storage card, so every optional block is omitted and
-                // required SumNum fields are zero — previously these fell
-                // through to the unknown-CmdType warn + silence.
-                // Semantics and goldens mirror gb28181-go #78 (issue #59).
-                let response = super::client::build_gb2022_query_response(
-                    &query.cmd_type,
+                // GB/T 28181-2022 information queries (A.2.4.10-14): answer
+                // with provider data when the host installed one, the
+                // minimal valid Response (A.2.6.12-16) otherwise.
+                let c_params = (
                     &query.sn,
                     &query.device_id,
-                    query.number.as_deref(),
                     &self.config.sip_domain,
                     &self.local_ip,
                     self.config.local_sip_port,
                     cseq,
-                )?;
+                );
+                let provider = self.info_query_provider.as_deref();
+                let response = match query.cmd_type.as_str() {
+                    "HomePositionQuery" => {
+                        let (sn, id, d, ip, p, c) = c_params;
+                        super::client::build_home_position_query_response(
+                            sn,
+                            id,
+                            provider.and_then(|x| x.home_position()).as_ref(),
+                            d,
+                            ip,
+                            p,
+                            c,
+                        )?
+                    }
+                    "CruiseTrackListQuery" => {
+                        let (sn, id, d, ip, p, c) = c_params;
+                        super::client::build_cruise_track_list_response(
+                            sn,
+                            id,
+                            provider.and_then(|x| x.cruise_track_list()).as_deref(),
+                            d,
+                            ip,
+                            p,
+                            c,
+                        )?
+                    }
+                    "CruiseTrackQuery" => {
+                        let number = query.number.as_deref().and_then(|n| n.parse::<i32>().ok());
+                        let detail = provider.and_then(|x| x.cruise_track(number.unwrap_or(0)));
+                        if detail.is_some() {
+                            let (sn, id, d, ip, p, c) = c_params;
+                            super::client::build_cruise_track_response(
+                                sn,
+                                id,
+                                detail.as_ref(),
+                                d,
+                                ip,
+                                p,
+                                c,
+                            )?
+                        } else {
+                            // No provider data: the minimal answer echoes
+                            // the requested track number.
+                            super::client::build_gb2022_query_response(
+                                "CruiseTrackQuery",
+                                &query.sn,
+                                &query.device_id,
+                                query.number.as_deref(),
+                                &self.config.sip_domain,
+                                &self.local_ip,
+                                self.config.local_sip_port,
+                                cseq,
+                            )?
+                        }
+                    }
+                    "PTZPosition" => {
+                        let (sn, id, d, ip, p, c) = c_params;
+                        super::client::build_ptz_position_response(
+                            sn,
+                            id,
+                            provider.and_then(|x| x.ptz_position()).as_ref(),
+                            d,
+                            ip,
+                            p,
+                            c,
+                        )?
+                    }
+                    _ => {
+                        // SDCardStatus
+                        let (sn, id, d, ip, p, c) = c_params;
+                        super::client::build_sd_card_status_response(
+                            sn,
+                            id,
+                            provider.and_then(|x| x.sd_card_status()).as_deref(),
+                            d,
+                            ip,
+                            p,
+                            c,
+                        )?
+                    }
+                };
                 Ok(Some(vec![response]))
             }
             "ConfigDownload" => {
@@ -4255,6 +4345,7 @@ async fn handle_tcp_connection(
         ))),
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -4970,6 +5061,7 @@ async fn test_recordinfo_pagination() {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5072,6 +5164,7 @@ async fn test_recordinfo_dispatch_with_source() {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5173,6 +5266,7 @@ async fn test_subscribe_books_and_echoes_expires() {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5279,6 +5373,7 @@ async fn test_gb2022_information_queries_dispatch() {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5389,6 +5484,7 @@ async fn test_deviceconfig_and_configdownload_dispatch() {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5615,6 +5711,7 @@ async fn test_recordinfo_dispatch_without_source() {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5694,6 +5791,7 @@ async fn test_playback_invite_empty_range_returns_488() {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5801,6 +5899,7 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5905,6 +6004,7 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -6069,6 +6169,7 @@ async fn test_info_playback_control_live_session_noop() {
         tcp_conn: None,
         stream_rx: None,
         conn_stop: None,
+        info_query_provider: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -6176,6 +6277,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6319,6 +6421,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6442,6 +6545,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6555,6 +6659,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6663,6 +6768,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6765,6 +6871,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6873,6 +6980,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6948,6 +7056,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7022,6 +7131,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7216,6 +7326,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7340,6 +7451,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7437,6 +7549,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7513,6 +7626,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7602,6 +7716,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7676,6 +7791,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7819,6 +7935,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -8037,6 +8154,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -8265,6 +8383,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -8432,6 +8551,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -8542,6 +8662,7 @@ mod tcp_media_tests {
             tcp_conn: None,
             stream_rx: None,
             conn_stop: None,
+            info_query_provider: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -8597,5 +8718,203 @@ mod tcp_media_tests {
         assert!(!pages[0].body.contains("cam-10"));
         assert!(pages[1].body.contains("cam-10"));
         assert!(pages[1].body.contains("cam-11"));
+    }
+
+    /// The 2022 five information queries answer with provider data when a
+    /// host provider is installed (A.2.6.12-16 wire shapes).
+    #[tokio::test]
+    async fn test_info_query_provider_answers() {
+        use crate::info_query::*;
+        struct Full;
+        impl InfoQueryProvider for Full {
+            fn home_position(&self) -> Option<HomePositionInfo> {
+                Some(HomePositionInfo {
+                    enabled: 1,
+                    reset_time_secs: Some(15),
+                    preset_index: Some(3),
+                })
+            }
+            fn cruise_track_list(&self) -> Option<Vec<CruiseTrackInfo>> {
+                Some(vec![
+                    CruiseTrackInfo {
+                        number: 0,
+                        name: "day".into(),
+                    },
+                    CruiseTrackInfo {
+                        number: 1,
+                        name: "night".into(),
+                    },
+                ])
+            }
+            fn cruise_track(&self, number: i32) -> Option<CruiseTrackDetail> {
+                Some(CruiseTrackDetail {
+                    number,
+                    name: "day".into(),
+                    points: vec![
+                        CruisePointInfo {
+                            preset_index: 1,
+                            stay_time_secs: 10,
+                            speed: 8,
+                        },
+                        CruisePointInfo {
+                            preset_index: 2,
+                            stay_time_secs: 20,
+                            speed: 12,
+                        },
+                    ],
+                })
+            }
+            fn ptz_position(&self) -> Option<PtzPositionInfo> {
+                Some(PtzPositionInfo {
+                    pan: Some(45.5),
+                    tilt: Some(-10.0),
+                    zoom: Some(3.2),
+                    horizontal_field_angle: Some(52.0),
+                    vertical_field_angle: None,
+                    max_view_distance: Some(120.0),
+                })
+            }
+            fn sd_card_status(&self) -> Option<Vec<SdCardInfo>> {
+                Some(vec![SdCardInfo {
+                    id: 0,
+                    hdd_name: "card0".into(),
+                    status: "ok".into(),
+                    format_progress: None,
+                    capacity_mb: 65536,
+                    free_space_mb: 32768,
+                }])
+            }
+        }
+
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 3600,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
+            info_query_provider: Some(Arc::new(Full)),
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            broadcast_pending: None,
+            local_ip: "192.168.62.104".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            talkback_source: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            negotiated_register_expires: None,
+            device_upgrader: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+        };
+
+        let ask = |cmd: &str, extra: &str| {
+            SipMessage {
+                start_line: "MESSAGE sip:3402000000@3402000000 SIP/2.0".to_string(),
+                method: Some(SipMethod::Message),
+                status_code: None,
+                uri: Some("sip:3402000000@3402000000".to_string()),
+                version: "SIP/2.0".to_string(),
+                headers: vec![(
+                    "Content-Type".to_string(),
+                    "Application/MANSCDP+xml".to_string(),
+                )],
+                body: format!(
+                    "<Query><CmdType>{cmd}</CmdType><SN>31</SN><DeviceID>34020000001320000001</DeviceID>{extra}</Query>"
+                ),
+            }
+        };
+
+        let resp = &server
+            .build_query_response(&ask("HomePositionQuery", ""))
+            .expect("d")
+            .expect("r")[0];
+        assert!(
+            resp.body.contains("<HomePosition><Enabled>1</Enabled><ResetTime>15</ResetTime><PresetIndex>3</PresetIndex></HomePosition>"),
+            "{}",
+            resp.body
+        );
+
+        let resp = &server
+            .build_query_response(&ask("CruiseTrackListQuery", ""))
+            .expect("d")
+            .expect("r")[0];
+        assert!(resp.body.contains("<SumNum>2</SumNum>"), "{}", resp.body);
+        assert!(
+            resp.body
+                .contains("<CruiseTrack><Number>1</Number><Name>night</Name></CruiseTrack>"),
+            "{}",
+            resp.body
+        );
+
+        let resp = &server
+            .build_query_response(&ask("CruiseTrackQuery", "<Number>0</Number>"))
+            .expect("d")
+            .expect("r")[0];
+        assert!(
+            resp.body.contains("<CruisePointList Num=\"2\"><CruisePoint><PresetIndex>1</PresetIndex><StayTime>10</StayTime><Speed>8</Speed></CruisePoint>"),
+            "{}",
+            resp.body
+        );
+
+        let resp = &server
+            .build_query_response(&ask("PTZPosition", ""))
+            .expect("d")
+            .expect("r")[0];
+        assert!(
+            resp.body
+                .contains("<Pan>45.5</Pan><Tilt>-10</Tilt><Zoom>3.2</Zoom>"),
+            "{}",
+            resp.body
+        );
+        assert!(
+            resp.body
+                .contains("<HorizontalFieldAngle>52</HorizontalFieldAngle>"),
+            "{}",
+            resp.body
+        );
+        assert!(
+            !resp.body.contains("VerticalFieldAngle"),
+            "None fields must be omitted: {}",
+            resp.body
+        );
+
+        let resp = &server
+            .build_query_response(&ask("SDCardStatus", ""))
+            .expect("d")
+            .expect("r")[0];
+        assert!(
+            resp.body.contains("<SDCardStatusInfo Num=\"1\"><Item><ID>0</ID><HddName>card0</HddName><Status>ok</Status><Capacity>65536</Capacity><FreeSpace>32768</FreeSpace></Item>"),
+            "{}",
+            resp.body
+        );
     }
 }
