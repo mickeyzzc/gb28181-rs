@@ -278,3 +278,78 @@ mod tls_outbound {
         handle.shutdown().await.expect("shutdown");
     }
 }
+
+#[cfg(feature = "tls")]
+mod tls_listen {
+    use super::*;
+    use gb28181_rs::Gb28181Server;
+    use tokio_rustls::rustls::pki_types::ServerName;
+    use tokio_rustls::rustls::{ClientConfig, RootCertStore};
+    use tokio_rustls::TlsConnector;
+
+    /// The inbound SIPS listener: TLS handshake, framed DeviceInfo query
+    /// through the stream, answers back over TLS. The listener device
+    /// never REGISTERs — it answers requests.
+    #[tokio::test]
+    async fn tls_listen_answers_queries() {
+        // Ephemeral port for the listener.
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = probe.local_addr().unwrap().port();
+        drop(probe);
+
+        let mut config = super::stream_config(port);
+        config.transport = Transport::TlsListen;
+        config.local_sip_port = port;
+        config.tls_cert_file = "tests/testdata/platform-cert.pem".to_string();
+        config.tls_key_file = "tests/testdata/platform-key.pem".to_string();
+
+        let server = Gb28181Server::new(config, Arc::new(MockFrameHub::new()));
+        let mut handle = server.spawn().await.expect("spawn");
+
+        // Dial, pinning the device's certificate (the same fixture).
+        let cert_pem = std::fs::read("tests/testdata/platform-cert.pem").unwrap();
+        let mut roots = RootCertStore::empty();
+        let mut cr = std::io::BufReader::new(&cert_pem[..]);
+        let certs: Vec<_> = rustls_pemfile::certs(&mut cr)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        roots.add_parsable_certificates(certs);
+        let client_cfg = ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = TlsConnector::from(std::sync::Arc::new(client_cfg));
+        let raw = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("dial");
+        let name = ServerName::try_from("127.0.0.1").unwrap();
+        let tls = tokio::time::timeout(Duration::from_secs(5), connector.connect(name, raw))
+            .await
+            .expect("handshake timeout")
+            .expect("handshake");
+        let (r, mut w) = tokio::io::split(tls);
+        let mut reader = BufReader::new(r);
+
+        // Framed DeviceInfo query; 200 OK first, then the answer.
+        let body = "<Query><CmdType>DeviceInfo</CmdType><SN>1</SN><DeviceID>34020000001320000001</DeviceID></Query>";
+        let frame = format!(
+            "MESSAGE sip:34020000001320000001@3402000000 SIP/2.0\r\nVia: SIP/2.0/TLS 127.0.0.1:9;branch=z9hG4bKtli1\r\nFrom: <sip:34020000002000000001@3402000000>;tag=p\r\nTo: <sip:34020000001320000001@3402000000>\r\nCall-ID: tls-li-1\r\nCSeq: 1 MESSAGE\r\nContent-Type: Application/MANSCDP+xml\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        w.write_all(frame.as_bytes()).await.unwrap();
+
+        let first = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader))
+            .await
+            .expect("answer within 5s");
+        assert!(first.contains("200 OK"), "{first}");
+        let second = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut reader))
+            .await
+            .expect("device info within 5s");
+        assert!(
+            second.contains("<Response CmdType=\"DeviceInfo\" SN=\"1\">"),
+            "{second}"
+        );
+
+        let _ = tokio::time::timeout(Duration::from_secs(3), handle.shutdown()).await;
+    }
+}

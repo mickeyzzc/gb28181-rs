@@ -788,7 +788,44 @@ impl Gb28181Server {
                     ))
                 }
             }
+            Transport::TlsListen => {
+                #[cfg(feature = "tls")]
+                {
+                    self.spawn_tls_listen().await
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = self;
+                    Err(anyhow!(
+                        "gb28181: transport \"tls-listen\" requires building with the `tls` feature"
+                    ))
+                }
+            }
         }
+    }
+
+    /// Inbound SIPS listener (`tls-listen`): the platform dials the
+    /// device over TLS; the device's own certificate pair identifies it.
+    /// Connections flow through the same per-connection handler as plain
+    /// inbound TCP (all host seams).
+    #[cfg(feature = "tls")]
+    async fn spawn_tls_listen(self) -> Result<ServerHandle> {
+        if self.config.tls_cert_file.is_empty() || self.config.tls_key_file.is_empty() {
+            return Err(anyhow!(
+                "gb28181: transport \"tls-listen\" requires tls_cert_file + tls_key_file (the device's own certificate)"
+            ));
+        }
+        let acceptor = crate::tls::server_acceptor(&self.config)?;
+        let sip_addr = format!("0.0.0.0:{}", self.config.local_sip_port);
+        let listener = TcpListener::bind(&sip_addr).await.context(format!(
+            "gb28181: failed to bind SIPS listener on {sip_addr}"
+        ))?;
+        log::info!(
+            "gb28181: inbound SIPS listener on port {} (TLS)",
+            self.config.local_sip_port
+        );
+        self.config.check_example_defaults().ok();
+        self.run_tls_listen_bound(listener, acceptor).await
     }
 
     /// Common post-bind path for the outbound stream transports
@@ -1198,6 +1235,101 @@ impl Gb28181Server {
             // dropped: the outer loop re-dials (the dial loop selects on
             // shutdown, so a stop request is honored immediately).
         }
+    }
+
+    /// Post-bind accept loop for the inbound SIPS listener: each accepted
+    /// connection is TLS-wrapped, then served by the shared per-connection
+    /// handler (all host seams).
+    #[cfg(feature = "tls")]
+    async fn run_tls_listen_bound(
+        self,
+        listener: TcpListener,
+        acceptor: tokio_rustls::TlsAcceptor,
+    ) -> Result<ServerHandle> {
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(ShutdownMode::Init);
+        let au_hub = self.au_hub;
+        let config = self.config;
+        let recording_index = self.recording_index;
+        let audio_sink = self.audio_sink;
+        let seams = TcpSeams {
+            authenticator: self.authenticator.clone(),
+            control_handler: self.control_handler.clone(),
+            config_handler: self.config_handler.clone(),
+            talkback_source: self.talkback_source.clone(),
+            metrics: Arc::clone(&self.metrics),
+            notifier: Arc::clone(&self.notifier),
+        };
+        let handle = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    accepted = listener.accept() => {
+                        match accepted {
+                            Ok((conn, peer_addr)) => {
+                                let acceptor = acceptor.clone();
+                                let au_hub_clone = Arc::clone(&au_hub);
+                                let config_clone = config.clone();
+                                let rec_clone = recording_index.clone();
+                                let sink_clone = audio_sink.clone();
+                                let seams_conn = TcpSeams {
+                                    authenticator: seams.authenticator.clone(),
+                                    control_handler: seams.control_handler.clone(),
+                                    config_handler: seams.config_handler.clone(),
+                                    talkback_source: seams.talkback_source.clone(),
+                                    metrics: Arc::clone(&seams.metrics),
+                                    notifier: Arc::clone(&seams.notifier),
+                                };
+                                let mut shutdown_conn = shutdown_rx.clone();
+                                tokio::spawn(async move {
+                                    match acceptor.accept(conn).await {
+                                        Ok(tls_stream) => {
+                                            log::info!(
+                                                "gb28181: SIPS connection from {peer_addr}"
+                                            );
+                                            if let Err(e) = handle_tcp_connection(
+                                                tls_stream,
+                                                peer_addr,
+                                                au_hub_clone,
+                                                config_clone,
+                                                rec_clone,
+                                                sink_clone,
+                                                seams_conn,
+                                                &mut shutdown_conn,
+                                            )
+                                            .await
+                                            {
+                                                log::error!(
+                                                    "gb28181: SIPS connection error from {peer_addr}: {e}"
+                                                );
+                                            }
+                                        }
+                                        Err(e) => {
+                                            log::warn!(
+                                                "gb28181: SIPS handshake with {peer_addr} failed: {e}"
+                                            );
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                log::error!("gb28181: SIPS accept error: {e}");
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            }
+                        }
+                    }
+                    _ = shutdown_rx.changed() => {
+                        log::info!("gb28181: shutdown requested — closing SIPS accept loop");
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(ServerHandle {
+            task: handle,
+            shutdown: shutdown_tx,
+            platform_proto_ver: Arc::clone(&self.platform_proto_ver),
+            platform_date: Arc::clone(&self.platform_date),
+        })
     }
 
     async fn spawn_tcp(self) -> Result<ServerHandle> {
@@ -4296,8 +4428,8 @@ struct TcpSeams {
 }
 
 #[allow(clippy::too_many_arguments)] // one arg per connection resource; the seams travel bundled
-async fn handle_tcp_connection(
-    conn: TcpStream,
+async fn handle_tcp_connection<S>(
+    conn: S,
     peer_addr: SocketAddr,
     au_hub: Arc<dyn FrameSource>,
     config: Gb28181Config,
@@ -4305,12 +4437,15 @@ async fn handle_tcp_connection(
     audio_sink: Option<Arc<dyn AudioTalkbackSink>>,
     seams: TcpSeams,
     shutdown: &mut watch::Receiver<ShutdownMode>,
-) -> Result<()> {
+) -> Result<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     use tokio::io::BufReader;
 
     // Split the stream into read/write halves. The write half is
     // stored in the server's tcp_conn and used by send_sip_message.
-    let (read_half, write_half) = conn.into_split();
+    let (read_half, write_half) = tokio::io::split(conn);
     let mut reader = BufReader::new(read_half);
 
     // Detect local IP by probing the route to the platform

@@ -140,3 +140,20 @@ impl tokio_rustls::rustls::client::danger::ServerCertVerifier for NoVerifier {
         self.0.signature_verification_algorithms.supported_schemes()
     }
 }
+
+/// Build the inbound SIPS listener's acceptor from the device's own
+/// certificate pair (the GB self-signed convention).
+pub(crate) fn server_acceptor(
+    config: &crate::config::Gb28181Config,
+) -> Result<tokio_rustls::TlsAcceptor> {
+    let cert = load_cert(&config.tls_cert_file)?;
+    let key = load_key(&config.tls_key_file)?;
+    let provider = Arc::new(tokio_rustls::rustls::crypto::ring::default_provider());
+    let server_config = tokio_rustls::rustls::ServerConfig::builder_with_provider(provider)
+        .with_safe_default_protocol_versions()
+        .map_err(|e| anyhow!("gb28181: tls protocol versions: {e}"))?
+        .with_no_client_auth()
+        .with_single_cert(cert, key)
+        .map_err(|e| anyhow!("gb28181: tls server certificate: {e}"))?;
+    Ok(tokio_rustls::TlsAcceptor::from(Arc::new(server_config)))
+}

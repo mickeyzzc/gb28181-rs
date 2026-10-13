@@ -29,6 +29,11 @@ pub enum Transport {
     /// Outbound SIPS (TLS, GB/T 28181-2022 A-level): like [`Transport::TcpOut`]
     /// over TLS; platform trust anchors come from the TLS config fields.
     Tls,
+    /// Inbound SIPS listener (`tls` feature): the platform dials the
+    /// device over TLS; the device's own certificate pair
+    /// (`tls_cert_file` + `tls_key_file`, required) identifies it.
+    #[serde(rename = "tls-listen")]
+    TlsListen,
 }
 
 /// One extra catalog channel advertised in Catalog answers (A.2.1): a
