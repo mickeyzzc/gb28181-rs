@@ -21,9 +21,9 @@ use crate::config::{Gb28181Config, Transport};
 use crate::frame::{AccessUnit, FrameSource};
 
 use super::client::{
-    build_catalog_response, build_device_info_response, build_keepalive_notify,
-    build_preset_list_response, parse_401_challenge, parse_invite, AudioCodec, InviteInfo,
-    MediaKind, MediaTransport, SipDeviceClient,
+    build_device_info_response, build_keepalive_notify, build_preset_list_response,
+    parse_401_challenge, parse_invite, AudioCodec, InviteInfo, MediaKind, MediaTransport,
+    SipDeviceClient,
 };
 use super::manscdp::{ChannelItem, DeviceItem};
 use super::playback::{parse_playback_control, run_playback_task, PlaybackControl};
@@ -2302,7 +2302,10 @@ impl Gb28181Server {
         let cseq = random_cseq();
         match query.cmd_type.as_str() {
             "Catalog" => {
-                let channel = ChannelItem {
+                // The device's own entry first, then the configured extra
+                // channels (A.2.1) — large lists page across MESSAGEs
+                // automatically (A.2.6.1).
+                let mut channels = vec![ChannelItem {
                     device_id: self.config.device_id.clone(),
                     name: self.config.effective_device_name(),
                     manufacturer: self.config.effective_manufacturer(),
@@ -2320,17 +2323,49 @@ impl Gb28181Server {
                     port: self.config.local_sip_port,
                     longitude: 0.0,
                     latitude: 0.0,
+                }];
+                for extra in &self.config.extra_channels {
+                    channels.push(ChannelItem {
+                        device_id: extra.device_id.clone(),
+                        name: extra.name.clone(),
+                        manufacturer: extra.manufacturer.clone(),
+                        model: extra.model.clone(),
+                        owner: String::new(),
+                        civil_code: String::new(),
+                        address: String::new(),
+                        parental: 0,
+                        parent_id: self.config.device_id.clone(),
+                        safety_way: 0,
+                        register_way: 1,
+                        secrecy: 0,
+                        status: extra.effective_status().to_string(),
+                        ip_address: self.local_ip.clone(),
+                        port: self.config.local_sip_port,
+                        longitude: 0.0,
+                        latitude: 0.0,
+                    });
+                }
+                // One page per RESPONSE_PAGE_ITEMS items, SumNum = total.
+                let mut pages = Vec::new();
+                let total = channels.len();
+                let chunked: Vec<&[ChannelItem]> = if channels.is_empty() {
+                    vec![&[]]
+                } else {
+                    channels.chunks(RESPONSE_PAGE_ITEMS).collect()
                 };
-                let response = build_catalog_response(
-                    &query.sn,
-                    &self.config.device_id,
-                    &self.config.sip_domain,
-                    &self.local_ip,
-                    self.config.local_sip_port,
-                    cseq,
-                    &[channel],
-                )?;
-                Ok(Some(vec![response]))
+                for (i, chunk) in chunked.into_iter().enumerate() {
+                    pages.push(super::client::build_catalog_response_page(
+                        &query.sn,
+                        &self.config.device_id,
+                        &self.config.sip_domain,
+                        &self.local_ip,
+                        self.config.local_sip_port,
+                        cseq + i as u32,
+                        chunk,
+                        total,
+                    )?);
+                }
+                Ok(Some(pages))
             }
             "PresetQuery" => {
                 // A.2.4.8: the device's preset list. The library carries
@@ -8466,5 +8501,101 @@ mod tcp_media_tests {
             .expect("recv");
         let reply = String::from_utf8_lossy(&buf[..len]).to_string();
         assert!(reply.starts_with("SIP/2.0 200 OK"), "CANCEL reply: {reply}");
+    }
+
+    /// Extra catalog channels (A.2.1): the device entry rides first, the
+    /// extras follow, and 13 items page across 2 MESSAGEs with SumNum=13.
+    #[tokio::test]
+    async fn test_catalog_extra_channels_page() {
+        let mut extra = Vec::new();
+        for i in 0..12 {
+            extra.push(crate::config::CatalogChannel {
+                device_id: format!("34020000001320010{i:02}"),
+                name: format!("cam-{i}"),
+                manufacturer: String::new(),
+                model: String::new(),
+                status: String::new(),
+            });
+        }
+        let config = Gb28181Config {
+            enabled: true,
+            platform_sip_address: "127.0.0.1".to_string(),
+            platform_sip_port: 5060,
+            device_id: "34020000001320000001".to_string(),
+            channel_id: "34020000001320000001".to_string(),
+            sip_domain: "3402000000".to_string(),
+            password: "12345678".to_string(),
+            local_sip_port: 5060,
+            register_interval_secs: 3600,
+            heartbeat_interval_secs: 60,
+            heartbeat_timeout_count: 3,
+            transport: Transport::Udp,
+            extra_channels: extra,
+            ..Gb28181Config::default()
+        };
+        let sip_socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        let server = Gb28181Server {
+            config,
+            au_hub: Arc::new(crate::mock::MockFrameHub::new()),
+            metrics: Arc::new(crate::metrics::NoopMetrics),
+            sip_socket: Some(sip_socket),
+            tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
+            media_socket: None,
+            media_tcp_conn: None,
+            media_task: None,
+            subscriber_id: None,
+            invite_info: None,
+            broadcast_pending: None,
+            local_ip: "192.168.62.104".to_string(),
+            recording_index: None,
+            playback_ctl: None,
+            audio_sink: None,
+            talkback_source: None,
+            authenticator: None,
+            platform_proto_ver: Arc::new(std::sync::Mutex::new(None)),
+            platform_date: Arc::new(std::sync::Mutex::new(None)),
+            snapshot_executor: None,
+            negotiated_register_expires: None,
+            device_upgrader: None,
+            control_handler: None,
+            config_handler: None,
+            notifier: Arc::new(crate::subscribe::DeviceNotifier::new()),
+            position_source: None,
+            position_cancel: None,
+            notifier_std_sock: None,
+        };
+
+        let msg = SipMessage {
+            start_line: "MESSAGE sip:3402000000@3402000000 SIP/2.0".to_string(),
+            method: Some(SipMethod::Message),
+            status_code: None,
+            uri: Some("sip:3402000000@3402000000".to_string()),
+            version: "SIP/2.0".to_string(),
+            headers: vec![(
+                "Content-Type".to_string(),
+                "Application/MANSCDP+xml".to_string(),
+            )],
+            body: "<Query><CmdType>Catalog</CmdType><SN>21</SN><DeviceID>34020000001320000001</DeviceID></Query>".to_string(),
+        };
+
+        let pages = server
+            .build_query_response(&msg)
+            .expect("dispatch")
+            .expect("pages");
+        assert_eq!(pages.len(), 2, "13 items at page size 10");
+        for page in &pages {
+            assert!(
+                page.body.contains("<SumNum>13</SumNum>"),
+                "SumNum must carry the total: {}",
+                page.body
+            );
+        }
+        assert!(pages[0].body.contains("34020000001320000001"));
+        assert!(pages[0].body.contains("cam-8")); // items 0..=9 on page 1
+        assert!(!pages[0].body.contains("cam-10"));
+        assert!(pages[1].body.contains("cam-10"));
+        assert!(pages[1].body.contains("cam-11"));
     }
 }

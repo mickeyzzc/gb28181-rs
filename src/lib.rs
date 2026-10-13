@@ -97,7 +97,7 @@ pub mod upgrade;
 pub use client::{
     parse_401_challenge, parse_invite, AudioCodec, InviteInfo, MediaKind, SipDeviceClient,
 };
-pub use config::Gb28181Config;
+pub use config::{CatalogChannel, Gb28181Config};
 pub use device_id::device_types;
 pub use device_id::{format_device_id, parse_device_id, DeviceIdParts};
 pub use frame::{AccessUnit, FrameSource, FrameSubscription, Nalu};
