@@ -13,7 +13,7 @@ Hand-written SIP (no SIP framework), MANSCDP XML codec, RTP/PS media push, and a
 
 ## Features
 
-- **SIP signaling** — hand-written parser/serializer for the GB/T 28181 subset (REGISTER + digest auth, INVITE, MESSAGE, BYE, ACK, OPTIONS), UDP and TCP. Inbound TCP connections share the host seams (DeviceControl/DeviceConfig dispatch, GB35114 incoming-Note verification, talkback upstream, real metrics), book subscriptions whose NOTIFYs ride the connection, and carry the §9.4.2 completion INFO; the REGISTER/keepalive lifecycle and the async snapshot/upgrade/broadcast notify exchanges remain UDP transport (outbound-TCP registration is the open follow-up)
+- **SIP signaling** — hand-written parser/serializer for the GB/T 28181 subset (REGISTER + digest auth, INVITE, MESSAGE, BYE, ACK, OPTIONS), UDP, TCP and SIPS (TLS, opt-in `tls` feature). **Outbound stream transports** (`transport: "tcp-out"` / `"tls"`): the device dials the platform and runs the full REGISTER/keepalive/re-registration/deregister lifecycle over the one connection (the GB28181 reality behind NAT); inbound requests arrive on the same stream with every host seam, and a dropped connection re-dials. Inbound-TCP (`"tcp"`) connections share the host seams, book subscriptions whose NOTIFYs ride the connection, and carry the §9.4.2 completion INFO; the async snapshot/upgrade/broadcast notify exchanges remain UDP transport
 - **Registration lifecycle** — REGISTER with 401 digest challenge (MD5 + SHA-256, qop=auth), periodic re-register, keepalive heartbeat with timeout
 - **X-GB-Ver protocol version** (2022 Annex I, opt-in) — set `protocol_version` in the config (conventionally `"3.0"` = 2022, `"2.0"` = 2016) and every REGISTER carries the `X-GB-Ver` header, initial and authenticated alike; the platform's version, when its response announces one, is exposed via `ServerHandle::platform_protocol_version()`. Unset (default) omits the header — byte-identical to the pre-2022 wire form. Semantics ported from the Go twin (gb28181-go #78)
 - **MANSCDP XML** — Catalog / DeviceInfo / DeviceStatus / RecordInfo / Keepalive, element **and** attribute forms; inbound bodies accepted as UTF-8 **or** GB2312/GBK/GB18030, outbound GB2312-declared bodies wire-encoded correctly
@@ -30,7 +30,7 @@ Hand-written SIP (no SIP framework), MANSCDP XML codec, RTP/PS media push, and a
 - **GB 35114 A-level security, both sides** *(opt-in, `gb35114` feature)* — device-side SM2-certificate mutual authentication over the REGISTER flow (`with_register_authenticator`) and platform-side challenge/verify/Note state machine (`security35114::Platform`); VKEK negotiation inside the `cryptkey` SM2 DER envelope, keyed-SM3 `Note`-header integrity; golden fixtures shared with the Go twin prove cross-implementation interop
 - **Reference segment format** — bare Annex-B H.264 + `.ts.jsonl` per-frame timestamp sidecar ([`segment`](src/segment.rs))
 
-Not included (by design): platform/UAS role, SIP over TLS/WebSocket, GB 35114 B/C levels (those require SVAC hardware media per GB/T 25724).
+Not included (by design): platform/UAS role, SIP over WebSocket, GB 35114 B/C levels (those require SVAC hardware media per GB/T 25724).
 
 ## Usage
 

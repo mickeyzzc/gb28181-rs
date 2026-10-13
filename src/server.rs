@@ -13,7 +13,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
-use tokio::net::tcp::OwnedWriteHalf;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{mpsc, watch, Mutex};
 
@@ -375,6 +374,12 @@ impl std::fmt::Debug for TalkbackSource {
     }
 }
 
+/// The stream-mode SIP write end: TCP or TLS write half behind one
+/// dynamic type so every send path (send_sip_message, the notifier
+/// drain, MediaStatus INFO) is transport-agnostic.
+pub(crate) type SharedSipWriter =
+    Arc<tokio::sync::Mutex<Box<dyn tokio::io::AsyncWrite + Send + Unpin>>>;
+
 pub struct Gb28181Server {
     /// Configuration for the GB28181 server
     config: Gb28181Config,
@@ -384,7 +389,16 @@ pub struct Gb28181Server {
     /// by the TCP connection handler)
     sip_socket: Option<Arc<UdpSocket>>,
     /// TCP connection for SIP (when transport == Tcp)
-    tcp_conn: Option<Arc<tokio::sync::Mutex<OwnedWriteHalf>>>,
+    tcp_conn: Option<SharedSipWriter>,
+    /// Stream-mode (tcp-out/tls) message pump: every framed message from
+    /// the platform connection lands in this channel; the single
+    /// consumer is the run loop — or an in-flight REGISTER exchange
+    /// (`receive_with_timeout` pulls from it too, so the register flow
+    /// needs no signature change). `None` on UDP/inbound-TCP modes.
+    stream_rx: Option<Arc<tokio::sync::Mutex<tokio::sync::mpsc::Receiver<SipMessage>>>>,
+    /// Per-connection keepalive stop signal for the stream transports —
+    /// fired on drop/shutdown so a re-dial never stacks keepalive tasks.
+    conn_stop: Option<watch::Sender<ShutdownMode>>,
     /// Media (RTP) socket (bound on INVITE)
     media_socket: Option<Arc<UdpSocket>>,
     /// TCP media connection (when transport == Tcp — active mode: device
@@ -576,6 +590,8 @@ impl Gb28181Server {
             au_hub,
             sip_socket: None,
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -743,7 +759,48 @@ impl Gb28181Server {
         match self.config.transport {
             Transport::Udp => self.spawn_udp().await,
             Transport::Tcp => self.spawn_tcp().await,
+            Transport::TcpOut => self.run_stream_bound(false).await,
+            Transport::Tls => {
+                #[cfg(feature = "tls")]
+                {
+                    self.run_stream_bound(true).await
+                }
+                #[cfg(not(feature = "tls"))]
+                {
+                    let _ = self;
+                    Err(anyhow!(
+                        "gb28181: transport \"tls\" requires building with the `tls` feature"
+                    ))
+                }
+            }
         }
+    }
+
+    /// Common post-bind path for the outbound stream transports
+    /// (`tcp-out` / `tls`): the device dials the platform and runs the
+    /// full REGISTER/keepalive lifecycle over the connection.
+    async fn run_stream_bound(self, tls: bool) -> Result<ServerHandle> {
+        log::info!(
+            "gb28181: outbound stream transport {} — dialing platform",
+            if tls { "tls (SIPS)" } else { "tcp" }
+        );
+        self.config.check_example_defaults().ok();
+
+        let platform_proto_ver = Arc::clone(&self.platform_proto_ver);
+        let platform_date = Arc::clone(&self.platform_date);
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(ShutdownMode::Init);
+        let handle = tokio::spawn(async move {
+            if let Err(e) = self.run_stream(&mut shutdown_rx, tls).await {
+                log::error!("gb28181: server error: {e}");
+            }
+        });
+
+        Ok(ServerHandle {
+            task: handle,
+            shutdown: shutdown_tx,
+            platform_proto_ver,
+            platform_date,
+        })
     }
 
     async fn spawn_udp(mut self) -> Result<ServerHandle> {
@@ -763,6 +820,369 @@ impl Gb28181Server {
         self.sip_socket = Some(Arc::new(sip_socket));
         self.notifier_std_sock = Some(std::sync::Arc::new(notifier_std_sock));
         self.run_bound().await
+    }
+
+    /// Dial the platform over the outbound stream transport (TCP or, with
+    /// the `tls` feature, SIPS) and return the framed reader, the shared
+    /// writer, and the connection's local IP (the stream's own local
+    /// address — the honest value for Via/Contact; the platform would
+    /// otherwise learn a port nothing listens on).
+    async fn dial_platform_stream(
+        &self,
+        tls: bool,
+    ) -> Result<(
+        tokio::io::BufReader<Box<dyn tokio::io::AsyncRead + Send + Unpin>>,
+        SharedSipWriter,
+        String,
+        u16,
+    )> {
+        let addr = format!(
+            "{}:{}",
+            self.config.platform_sip_address, self.config.platform_sip_port
+        );
+        let stream = tokio::net::TcpStream::connect(&addr)
+            .await
+            .with_context(|| format!("gb28181: dialing {addr}"))?;
+        let local = stream.local_addr()?;
+        let local_ip = local.ip().to_string();
+        let local_port = local.port();
+
+        #[cfg(feature = "tls")]
+        if tls {
+            let connector = crate::tls::connector(&self.config)?;
+            let name = crate::tls::server_name(&self.config.platform_sip_address)?;
+            let tls_stream = connector
+                .connect(name, stream)
+                .await
+                .context("gb28181: SIPS handshake with platform")?;
+            let (read_half, write_half) = tokio::io::split(tls_stream);
+            return Ok((
+                tokio::io::BufReader::new(
+                    Box::new(read_half) as Box<dyn tokio::io::AsyncRead + Send + Unpin>
+                ),
+                Arc::new(tokio::sync::Mutex::new(
+                    Box::new(write_half) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>
+                )),
+                local_ip,
+                local_port,
+            ));
+        }
+        #[cfg(not(feature = "tls"))]
+        let _ = tls;
+
+        let (read_half, write_half) = stream.into_split();
+        Ok((
+            tokio::io::BufReader::new(Box::new(read_half) as _),
+            Arc::new(tokio::sync::Mutex::new(
+                Box::new(write_half) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>
+            )),
+            local_ip,
+            local_port,
+        ))
+    }
+
+    /// The outbound stream lifecycle: dial the platform, run the full
+    /// REGISTER/keepalive lifecycle and serve inbound requests over the
+    /// one connection; a dropped connection re-dials (outer loop). The
+    /// GB28181 reality behind NAT — the device connects out.
+    async fn run_stream(
+        mut self,
+        shutdown: &mut watch::Receiver<ShutdownMode>,
+        tls: bool,
+    ) -> Result<()> {
+        let platform_sip_addr: SocketAddr = format!(
+            "{}:{}",
+            self.config.platform_sip_address, self.config.platform_sip_port
+        )
+        .parse()
+        .context("gb28181: invalid platform SIP address")?;
+
+        loop {
+            // Dial with retry-until-shutdown: the platform may be down at
+            // boot (same wait-for-platform stance as the UDP path).
+            let (reader, writer, local_ip, local_sip_port) = loop {
+                tokio::select! {
+                    dialed = self.dial_platform_stream(tls) => match dialed {
+                        Ok(v) => break v,
+                        Err(e) => {
+                            log::warn!("gb28181: platform dial failed: {e} — retrying in 10s");
+                        }
+                    },
+                    _ = shutdown.changed() => {
+                        log::info!("gb28181: shutdown requested during dial — stopping");
+                        return Ok(());
+                    }
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {}
+                    _ = shutdown.changed() => {
+                        log::info!("gb28181: shutdown requested during dial backoff — stopping");
+                        return Ok(());
+                    }
+                }
+            };
+            self.tcp_conn = Some(Arc::clone(&writer));
+            self.local_ip = local_ip.clone();
+
+            // Message pump: every framed message from the connection
+            // lands in the channel; the run loop (or an in-flight
+            // REGISTER exchange via receive_with_timeout) consumes it.
+            let (tx, rx) = tokio::sync::mpsc::channel::<SipMessage>(64);
+            self.stream_rx = Some(Arc::new(tokio::sync::Mutex::new(rx)));
+            tokio::spawn(async move {
+                let mut reader = reader;
+                let mut buf = Vec::new();
+                loop {
+                    buf.clear();
+                    match read_sip_message_framed(&mut reader, &mut buf).await {
+                        Ok(()) => {
+                            // A clean EOF surfaces as an empty frame
+                            // (read_line returns 0 bytes) — treat it as
+                            // the stream end so the run loop re-dials.
+                            if buf.is_empty() {
+                                log::info!("gb28181: platform stream ended (EOF)");
+                                return;
+                            }
+                            let parsed = match std::str::from_utf8(&buf) {
+                                Ok(text) => SipMessage::parse(text),
+                                Err(_) => {
+                                    let decoded = crate::charset::decode_wire_body(&buf);
+                                    log::debug!("gb28181: decoded non-UTF-8 SIP frame as GB18030");
+                                    SipMessage::parse(&decoded)
+                                }
+                            };
+                            match parsed {
+                                Ok(msg) => {
+                                    if tx.send(msg).await.is_err() {
+                                        return; // consumer gone
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("gb28181: stream frame parse failed: {e}");
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::info!("gb28181: platform stream ended: {e}");
+                            return;
+                        }
+                    }
+                }
+            });
+
+            // NOTIFY drain: host senders ride the connection.
+            let (notify_tx, mut notify_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(64);
+            let (notify_closed_tx, mut notify_closed_rx) = watch::channel(());
+            self.notifier.bind_tcp(notify_tx.clone());
+            let notify_writer = Arc::clone(&writer);
+            tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        Some(bytes) = notify_rx.recv() => {
+                            let mut guard = notify_writer.lock().await;
+                            if let Err(e) = guard.write_all(&bytes).await {
+                                log::warn!("gb28181: NOTIFY stream write failed: {e}");
+                            }
+                        }
+                        _ = notify_closed_rx.changed() => break,
+                    }
+                }
+            });
+
+            // REGISTER lifecycle (mirror of the UDP path's 3-attempt loop).
+            let mut sip_client = SipDeviceClient::new(
+                &self.config.device_id,
+                platform_sip_addr,
+                &local_ip,
+                local_sip_port,
+                &self.config.sip_domain,
+                &self.config.password,
+                self.config.register_interval_secs as u32,
+            )
+            .with_user_agent(&self.config.effective_user_agent());
+
+            let mut registered = false;
+            const MAX_REG_ATTEMPTS: u32 = 3;
+            const REG_BACKOFF_SECS: u64 = 10;
+            for attempt in 1..=MAX_REG_ATTEMPTS {
+                self.metrics.register_attempt();
+                tokio::select! {
+                    result = self.perform_register(&mut sip_client, platform_sip_addr) => {
+                        match result {
+                            Ok(()) => {
+                                registered = true;
+                                self.metrics.register_ok();
+                                log::info!(
+                                    "gb28181: registered with platform {} over stream (attempt {}/{})",
+                                    platform_sip_addr, attempt, MAX_REG_ATTEMPTS
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                self.metrics.register_fail();
+                                log::warn!(
+                                    "gb28181: registration attempt {}/{} failed: {e}",
+                                    attempt, MAX_REG_ATTEMPTS
+                                );
+                            }
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        log::info!("gb28181: shutdown requested during registration — stopping");
+                        self.notifier.unbind_tcp(&notify_tx);
+                        let _ = notify_closed_tx.send(());
+                        return Ok(());
+                    }
+                }
+                if attempt < MAX_REG_ATTEMPTS {
+                    tokio::select! {
+                        _ = tokio::time::sleep(Duration::from_secs(REG_BACKOFF_SECS)) => {}
+                        _ = shutdown.changed() => {
+                            self.notifier.unbind_tcp(&notify_tx);
+                            let _ = notify_closed_tx.send(());
+                            return Ok(());
+                        }
+                    }
+                }
+            }
+            if !registered {
+                log::warn!(
+                    "gb28181: all {} registration attempts failed — staying on the connection in listen-only mode (the refresh ticker keeps retrying)",
+                    MAX_REG_ATTEMPTS
+                );
+            } else {
+                // Per-connection keepalive stop: a re-dial must not leave
+                // the old connection's keepalive hammering a broken pipe.
+                let (conn_stop_tx, mut conn_stop_rx) = watch::channel(ShutdownMode::Init);
+                let keepalive_sink = KeepaliveSink::Stream(Arc::clone(&writer));
+                let keepalive_device_id = self.config.device_id.clone();
+                let keepalive_domain = self.config.sip_domain.clone();
+                let keepalive_interval = self.config.heartbeat_interval_secs;
+                let keepalive_authenticator = self.authenticator.clone();
+                let keepalive_metrics = Arc::clone(&self.metrics);
+                tokio::spawn(async move {
+                    if let Err(e) = run_keepalive(
+                        keepalive_sink,
+                        platform_sip_addr,
+                        &keepalive_device_id,
+                        &keepalive_domain,
+                        &local_ip,
+                        local_sip_port,
+                        keepalive_interval,
+                        keepalive_authenticator,
+                        keepalive_metrics,
+                        &mut conn_stop_rx,
+                    )
+                    .await
+                    {
+                        log::error!("gb28181: keepalive error: {e}");
+                    }
+                });
+                self.conn_stop = Some(conn_stop_tx);
+            }
+
+            // Refresh cadence + silence clock (same semantics as UDP).
+            let refresh_base = self
+                .negotiated_register_expires
+                .filter(|secs| *secs >= MIN_NEGOTIATED_EXPIRY_SECS)
+                .unwrap_or(self.config.register_interval_secs);
+            let mut re_register_interval = tokio::time::interval(Duration::from_secs(
+                registration_refresh_interval_secs(refresh_base),
+            ));
+            re_register_interval.tick().await;
+            let mut last_platform_contact = tokio::time::Instant::now();
+            let mut keepalive_failures = 0u32;
+
+            // Inner loop: serve the connection until it drops (or
+            // shutdown), then re-dial.
+            let rx = self.stream_rx.clone().expect("stream rx installed");
+            let connection_alive = loop {
+                tokio::select! {
+                    msg = async { rx.lock().await.recv().await } => {
+                        match msg {
+                            Some(msg) => {
+                                if msg.status_code.is_some() {
+                                    last_platform_contact = tokio::time::Instant::now();
+                                }
+                                if let Err(e) = self
+                                    .handle_message(
+                                        &msg,
+                                        platform_sip_addr,
+                                        &mut sip_client,
+                                        platform_sip_addr,
+                                        &mut keepalive_failures,
+                                    )
+                                    .await
+                                {
+                                    log::error!("gb28181: stream message handling error: {e}");
+                                }
+                            }
+                            None => {
+                                log::warn!("gb28181: platform connection dropped — re-dialing");
+                                break false;
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(SILENCE_CHECK_INTERVAL_SECS)) => {
+                        let elapsed = last_platform_contact.elapsed().as_secs();
+                        if platform_silent(
+                            elapsed,
+                            self.config.heartbeat_interval_secs,
+                            self.config.heartbeat_timeout_count,
+                        ) {
+                            log::warn!(
+                                "gb28181: platform silent for {elapsed}s over stream — dropping the connection"
+                            );
+                            self.metrics.keepalive_fail();
+                            break false; // re-dial heals a half-dead stream
+                        }
+                    }
+                    _ = re_register_interval.tick() => {
+                        let mut sd = shutdown.clone();
+                        tokio::select! {
+                            _ = sd.changed() => {
+                                if matches!(*sd.borrow_and_update(), ShutdownMode::Deregister) && registered {
+                                    self.perform_deregister(&mut sip_client, platform_sip_addr).await;
+                                }
+                                break true;
+                            }
+                            result = self.perform_register(&mut sip_client, platform_sip_addr) => {
+                                if registered {
+                                    if let Err(e) = result {
+                                        log::warn!(
+                                            "gb28181: registration refresh failed: {e} — dropping the connection for a fresh dial"
+                                        );
+                                        break false;
+                                    }
+                                    log::info!(
+                                        "gb28181: registration refreshed with platform {}",
+                                        platform_sip_addr
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    _ = shutdown.changed() => {
+                        if matches!(*shutdown.borrow_and_update(), ShutdownMode::Deregister) && registered {
+                            self.perform_deregister(&mut sip_client, platform_sip_addr).await;
+                        }
+                        break true;
+                    }
+                }
+            };
+
+            self.notifier.unbind_tcp(&notify_tx);
+            let _ = notify_closed_tx.send(());
+            if let Some(stop) = self.conn_stop.take() {
+                let _ = stop.send(ShutdownMode::Fast);
+            }
+            if connection_alive {
+                // shutdown requested — stop entirely
+                return self.shutdown_cleanup();
+            }
+            // dropped: the outer loop re-dials (the dial loop selects on
+            // shutdown, so a stop request is honored immediately).
+        }
     }
 
     async fn spawn_tcp(self) -> Result<ServerHandle> {
@@ -1029,7 +1449,7 @@ impl Gb28181Server {
             let keepalive_metrics = Arc::clone(&self.metrics);
             tokio::spawn(async move {
                 if let Err(e) = run_keepalive(
-                    sip_socket_for_keepalive,
+                    KeepaliveSink::Udp(sip_socket_for_keepalive, platform_sip_addr),
                     platform_sip_addr,
                     &keepalive_device_id,
                     &keepalive_domain,
@@ -1185,7 +1605,10 @@ impl Gb28181Server {
                                 let keepalive_metrics = Arc::clone(&self.metrics);
                                 tokio::spawn(async move {
                                     if let Err(e) = run_keepalive(
-                                        sip_socket_for_keepalive,
+                                        KeepaliveSink::Udp(
+                                            sip_socket_for_keepalive,
+                                            platform_sip_addr,
+                                        ),
                                         platform_sip_addr,
                                         &keepalive_device_id,
                                         &keepalive_domain,
@@ -3019,6 +3442,18 @@ impl Gb28181Server {
 
     /// Receive a SIP message with timeout.
     async fn receive_with_timeout(&self, timeout: Duration) -> Result<SipMessage> {
+        // Stream mode: pop from the connection pump.
+        if let Some(rx) = self.stream_rx.as_ref() {
+            let msg = tokio::time::timeout(timeout, async {
+                let mut guard = rx.lock().await;
+                guard.recv().await
+            })
+            .await
+            .context("gb28181: receive timeout")?
+            .context("gb28181: platform connection closed")?;
+            return Ok(msg);
+        }
+
         let socket = self
             .sip_socket
             .as_ref()
@@ -3426,9 +3861,17 @@ fn build_error_response(request: &SipMessage, code: u16, reason: &str) -> SipMes
 
 /// Run the keepalive task (stops when `shutdown` fires).
 #[allow(clippy::too_many_arguments)]
+/// The keepalive send path: the shared UDP socket (UDP transport) or
+/// the outbound stream writer (`tcp-out`/`tls`).
+enum KeepaliveSink {
+    Udp(Arc<UdpSocket>, SocketAddr),
+    Stream(SharedSipWriter),
+}
+
+#[allow(clippy::too_many_arguments)] // one arg per keepalive context; predates the sink split
 async fn run_keepalive(
-    sip_socket: Arc<UdpSocket>,
-    platform_addr: SocketAddr,
+    sink: KeepaliveSink,
+    _platform_addr: SocketAddr,
     device_id: &str,
     domain: &str,
     local_ip: &str,
@@ -3469,7 +3912,23 @@ async fn run_keepalive(
                 }
 
                 let data = serialize_wire(&notify);
-                if let Err(e) = sip_socket.send_to(&data, platform_addr).await {
+                let sent = match &sink {
+                    KeepaliveSink::Udp(socket, addr) => socket
+                        .send_to(&data, *addr)
+                        .await
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    KeepaliveSink::Stream(writer) => async {
+                        let mut guard = writer.lock().await;
+                        guard
+                            .write_all(&data)
+                            .await
+                            .map(|_| ())
+                            .map_err(|e| e.to_string())
+                    }
+                    .await,
+                };
+                if let Err(e) = sent {
                     metrics.keepalive_fail();
                     log::error!("gb28181: keepalive send failed: {e}");
                 }
@@ -3681,7 +4140,11 @@ async fn handle_tcp_connection(
         au_hub,
         metrics: seams.metrics,
         sip_socket: Some(placeholder_udp),
-        tcp_conn: Some(Arc::new(tokio::sync::Mutex::new(write_half))),
+        tcp_conn: Some(Arc::new(tokio::sync::Mutex::new(
+            Box::new(write_half) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>
+        ))),
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -4390,6 +4853,8 @@ async fn test_recordinfo_pagination() {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -4490,6 +4955,8 @@ async fn test_recordinfo_dispatch_with_source() {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -4589,6 +5056,8 @@ async fn test_subscribe_books_and_echoes_expires() {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -4693,6 +5162,8 @@ async fn test_gb2022_information_queries_dispatch() {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -4801,6 +5272,8 @@ async fn test_deviceconfig_and_configdownload_dispatch() {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5025,6 +5498,8 @@ async fn test_recordinfo_dispatch_without_source() {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5102,6 +5577,8 @@ async fn test_playback_invite_empty_range_returns_488() {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5207,6 +5684,8 @@ async fn test_playback_invite_returns_200_with_playback_sdp() {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5309,6 +5788,8 @@ async fn live_invite_server() -> (Gb28181Server, UdpSocket, SocketAddr) {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5471,6 +5952,8 @@ async fn test_info_playback_control_live_session_noop() {
         metrics: Arc::new(crate::metrics::NoopMetrics),
         sip_socket: Some(sip_socket),
         tcp_conn: None,
+        stream_rx: None,
+        conn_stop: None,
         media_socket: None,
         media_tcp_conn: None,
         media_task: None,
@@ -5576,6 +6059,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -5717,6 +6202,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -5810,6 +6297,8 @@ mod tcp_media_tests {
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -5921,6 +6410,8 @@ mod tcp_media_tests {
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6027,6 +6518,8 @@ mod tcp_media_tests {
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6127,6 +6620,8 @@ mod tcp_media_tests {
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6233,6 +6728,8 @@ mod tcp_media_tests {
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6306,6 +6803,8 @@ mod tcp_media_tests {
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6378,6 +6877,8 @@ mod tcp_media_tests {
             au_hub: Arc::new(crate::mock::MockFrameHub::new()),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6570,6 +7071,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6692,6 +7195,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6787,6 +7292,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6861,6 +7368,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -6948,6 +7457,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7020,6 +7531,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7161,6 +7674,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7377,6 +7892,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(Arc::clone(&sip_socket)),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7603,6 +8120,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,
@@ -7768,6 +8287,8 @@ mod tcp_media_tests {
             metrics: Arc::new(crate::metrics::NoopMetrics),
             sip_socket: Some(sip_socket),
             tcp_conn: None,
+            stream_rx: None,
+            conn_stop: None,
             media_socket: None,
             media_tcp_conn: None,
             media_task: None,

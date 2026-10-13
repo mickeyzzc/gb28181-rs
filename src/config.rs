@@ -19,7 +19,16 @@ use serde::{Deserialize, Serialize};
 pub enum Transport {
     #[default]
     Udp,
+    /// Inbound TCP listener (the platform connects to us).
     Tcp,
+    /// Outbound plain TCP: the device dials the platform and runs the
+    /// full REGISTER/keepalive lifecycle over the connection — the mode
+    /// real deployments use behind NAT.
+    #[serde(rename = "tcp-out")]
+    TcpOut,
+    /// Outbound SIPS (TLS, GB/T 28181-2022 A-level): like [`Transport::TcpOut`]
+    /// over TLS; platform trust anchors come from the TLS config fields.
+    Tls,
 }
 
 /// GB28181 SIP device settings.
@@ -57,6 +66,21 @@ pub struct Gb28181Config {
     pub strict_example_defaults: bool,
     #[serde(default)]
     pub transport: Transport,
+    /// TLS trust anchor for [`Transport::Tls`]: PEM file of the CA (or
+    /// the platform's self-signed certificate — the GB convention is a
+    /// self-signed CA whose serial is the entity ID) used to verify the
+    /// platform.
+    #[serde(default)]
+    pub tls_ca_file: String,
+    /// Optional TLS client certificate pair (mutual auth), PEM files.
+    #[serde(default)]
+    pub tls_cert_file: String,
+    #[serde(default)]
+    pub tls_key_file: String,
+    /// Accept any platform certificate (lab only; requires no
+    /// `tls_ca_file`).
+    #[serde(default)]
+    pub tls_insecure_skip_verify: bool,
     /// Device-side failure behavior for incoming Note verification on
     /// platform→device requests (GB 35114 §9.4; issue #41). Only active
     /// when a `RegisterAuthenticator` overrides `verify_incoming_note`
@@ -249,6 +273,10 @@ impl Default for Gb28181Config {
             heartbeat_timeout_count: default_gb28181_heartbeat_timeout_count(),
             strict_example_defaults: false,
             transport: Transport::default(),
+            tls_ca_file: String::new(),
+            tls_cert_file: String::new(),
+            tls_key_file: String::new(),
+            tls_insecure_skip_verify: false,
             incoming_note_policy: crate::authenticator::IncomingNotePolicy::default(),
             user_agent: None,
             protocol_version: None,
