@@ -2591,17 +2591,6 @@ impl Gb28181Server {
             invite_info.ssrc
         );
 
-        // TCP media where the platform dials the device (a=setup:active in
-        // the offer) is not supported — this device has no media listener.
-        // Refuse with 488 instead of answering a mismatched transport and
-        // streaming into a black hole (issue #14).
-        if invite_info.media_transport == MediaTransport::TcpListen {
-            log::warn!("gb28181: TCP media with setup:active unsupported — 488");
-            let resp = build_error_response(msg, 488, "Not Acceptable Here");
-            self.send_sip_message(&resp, peer_addr).await?;
-            return Ok(());
-        }
-
         // Audio-only offer = talkback receive (GB/T 28181-2022 §9.2): the
         // platform streams G.711 to us instead of us pushing PS video.
         if invite_info.media_kind == MediaKind::Audio {
@@ -2659,10 +2648,32 @@ impl Gb28181Server {
 
         // The answer's m= transport mirrors the offer (RFC 3264): TCP media
         // is offered via TCP/RTP/AVP in the SDP regardless of the SIP
-        // signaling transport (issue #14).
-        let media_is_tcp = invite_info.media_transport == MediaTransport::TcpConnect;
+        // signaling transport (issue #14). a=setup:active offers flip the
+        // roles: the device listens and the platform dials (passive answer).
+        let media_is_tcp = matches!(
+            invite_info.media_transport,
+            MediaTransport::TcpConnect | MediaTransport::TcpListen
+        );
+        let media_tcp_listener = if invite_info.media_transport == MediaTransport::TcpListen {
+            let listener = TcpListener::bind("0.0.0.0:0")
+                .await
+                .context("gb28181: failed to bind passive TCP media listener")?;
+            log::info!(
+                "gb28181: passive TCP media — listening on {}",
+                listener.local_addr()?
+            );
+            Some(Arc::new(listener))
+        } else {
+            None
+        };
+        // The advertised media port is the listener's for the passive
+        // answer (the platform dials it), the UDP socket's otherwise.
+        let advertised_port = match media_tcp_listener.as_ref() {
+            Some(l) => l.local_addr()?.port(),
+            None => media_port,
+        };
         let sdp = build_device_sdp_answer(
-            media_port,
+            advertised_port,
             invite_info.ssrc,
             &device_ip,
             if media_is_tcp {
@@ -2671,6 +2682,7 @@ impl Gb28181Server {
                 Transport::Udp
             },
             invite_info.session_type,
+            media_tcp_listener.is_some(),
         );
         let response = build_invite_response(
             msg,
@@ -2687,14 +2699,16 @@ impl Gb28181Server {
         // For TCP media (offer said TCP/RTP/AVP with setup:passive/actpass),
         // actively connect to the platform's media port — the device is the
         // active side per GB/T 28181 Annex C / RFC 4145 (issue #14).
-        let media_tcp_conn = if media_is_tcp {
-            let conn = TcpStream::connect(media_dest)
-                .await
-                .context("gb28181: failed to connect to TCP media port")?;
-            log::info!("gb28181: connected to TCP media port {media_dest}");
-            Some(Arc::new(Mutex::new(conn)))
-        } else {
-            None
+        let media_tcp_endpoint = match invite_info.media_transport {
+            MediaTransport::TcpConnect => {
+                let conn = TcpStream::connect(media_dest)
+                    .await
+                    .context("gb28181: failed to connect to TCP media port")?;
+                log::info!("gb28181: connected to TCP media port {media_dest}");
+                Some(MediaTcpEndpoint::Connected(Arc::new(Mutex::new(conn))))
+            }
+            MediaTransport::TcpListen => media_tcp_listener.map(MediaTcpEndpoint::Listening),
+            MediaTransport::Udp => None,
         };
 
         // Store dialog info
@@ -2729,7 +2743,7 @@ impl Gb28181Server {
         let media_task = match playback {
             Some((source, segments, start_ms, end_ms)) => {
                 let paced = invite_info.session_type == SessionType::Playback;
-                let media_task_conn = media_tcp_conn.clone();
+                let media_task_conn = media_tcp_endpoint.clone();
                 // §9.4.2 media-end notify (issue #60): on natural
                 // completion the task sends the in-dialog MediaStatus
                 // INFO itself. UDP SIP only — over TCP-SIP the dialog's
@@ -2814,7 +2828,7 @@ impl Gb28181Server {
                 log::info!("gb28181: subscribed to AuHub (subscriber_id={subscriber_id})");
                 self.subscriber_id = Some(subscriber_id);
 
-                let media_task_conn = media_tcp_conn.clone();
+                let media_task_conn = media_tcp_endpoint.clone();
                 let media_metrics = Arc::clone(&self.metrics);
                 tokio::spawn(async move {
                     if let Err(e) = run_media_task(
@@ -2835,7 +2849,10 @@ impl Gb28181Server {
         };
 
         self.media_socket = Some(media_socket);
-        self.media_tcp_conn = media_tcp_conn;
+        self.media_tcp_conn = match media_tcp_endpoint.as_ref() {
+            Some(MediaTcpEndpoint::Connected(conn)) => Some(Arc::clone(conn)),
+            Some(MediaTcpEndpoint::Listening(_)) | None => None,
+        };
         self.media_task = Some(media_task);
 
         log::info!("gb28181: media stream started on port {media_port}");
@@ -3485,6 +3502,16 @@ impl Gb28181Server {
     }
 }
 
+/// The TCP media endpoint of an INVITE-driven session (Annex C.2):
+/// already connected (the device dialed the platform — a=setup:passive or
+/// actpass offer) or listening for the platform's dial (a=setup:active
+/// offer — the device answers passively, issue #14 follow-up).
+#[derive(Clone)]
+pub enum MediaTcpEndpoint {
+    Connected(Arc<Mutex<TcpStream>>),
+    Listening(Arc<TcpListener>),
+}
+
 /// Registration refresh deadline: half the negotiated expiry, never below 1s
 /// (RFC 3261 §10.2 — clients commonly refresh at 50% of the expiry window).
 fn registration_refresh_interval_secs(expires_secs: u64) -> u64 {
@@ -3560,6 +3587,7 @@ fn build_device_sdp_answer(
     device_ip: &str,
     transport: Transport,
     session_type: SessionType,
+    setup_passive: bool,
 ) -> String {
     let session_name = match session_type {
         SessionType::Play => "Play",
@@ -3567,8 +3595,12 @@ fn build_device_sdp_answer(
         SessionType::Download => "Download",
     };
     if transport == Transport::Tcp {
-        // TCP/RTP/AVP with $-framing (GB/T 28181 Annex C.2), device is
-        // the active side that connects to the platform's media port.
+        // TCP/RTP/AVP with $-framing (GB/T 28181 Annex C.2). The setup
+        // role mirrors the offer: active = the device connects to the
+        // platform's media port (a=setup:passive/actpass offer);
+        // passive = the device listens and the platform dials us (an
+        // a=setup:active offer, issue #14 follow-up).
+        let setup = if setup_passive { "passive" } else { "active" };
         format!(
             "v=0\r\n\
              o=- 0 0 IN IP4 {}\r\n\
@@ -3576,7 +3608,7 @@ fn build_device_sdp_answer(
              c=IN IP4 {}\r\n\
              t=0 0\r\n\
              m=video {} TCP/RTP/AVP 96\r\n\
-             a=setup:active\r\n\
+             a=setup:{setup}\r\n\
              a=connection:new\r\n\
              a=rtpmap:96 PS/90000\r\n\
              y={}\r\n",
@@ -3965,7 +3997,7 @@ async fn run_keepalive(
 async fn run_media_task(
     mut rx: mpsc::Receiver<AccessUnit>,
     media_socket: Arc<UdpSocket>,
-    media_tcp_conn: Option<Arc<Mutex<TcpStream>>>,
+    media_tcp_endpoint: Option<MediaTcpEndpoint>,
     ssrc: u32,
     device_id: &str,
     remote_addr: SocketAddr,
@@ -3979,6 +4011,35 @@ async fn run_media_task(
         }
     }
     let _media_stop = StopOnDrop(Arc::clone(&metrics));
+
+    // Passive answer (a=setup:active offer): wait for the platform's
+    // dial before any frame flows. Pre-connection frames are dropped
+    // (nothing to send them on); a channel close (BYE/teardown) aborts
+    // the wait so the task never lingers on a dead listener.
+    let media_tcp_conn = match media_tcp_endpoint {
+        Some(MediaTcpEndpoint::Connected(conn)) => Some(conn),
+        Some(MediaTcpEndpoint::Listening(listener)) => {
+            let conn = loop {
+                tokio::select! {
+                    accepted = listener.accept() => break accepted
+                        .context("gb28181: passive TCP media accept failed")?
+                        .0,
+                    frame = rx.recv() => {
+                        if frame.is_none() {
+                            return Ok(()); // channel closed (BYE/teardown)
+                        }
+                    }
+                }
+            };
+            log::info!(
+                "gb28181: platform connected to passive TCP media port {}",
+                conn.local_addr()?.port()
+            );
+            Some(Arc::new(Mutex::new(conn)))
+        }
+        None => None,
+    };
+
     let mut rtp_pusher = RtpPusher::new(remote_addr, ssrc, PS_PAYLOAD_TYPE);
     let mut pts = 0u64;
     // Capture timestamp of the previous access unit — PTS deltas derive from
@@ -4582,6 +4643,7 @@ mod tests {
             "192.168.1.100",
             Transport::Udp,
             SessionType::Play,
+            false,
         );
         assert!(sdp.contains("m=video 5004 RTP/AVP 96"));
         assert!(sdp.contains("a=rtpmap:96 PS/90000"));
@@ -4634,6 +4696,7 @@ mod tests {
             "192.168.1.100",
             Transport::Tcp,
             SessionType::Play,
+            false,
         );
         assert!(sdp.contains("m=video 5004 TCP/RTP/AVP 96"));
         assert!(sdp.contains("a=setup:active"));
@@ -4656,6 +4719,7 @@ mod tests {
             "192.168.1.100",
             Transport::Udp,
             SessionType::Playback,
+            false,
         );
         assert!(sdp.contains("s=Playback\r\n"));
         assert!(sdp.contains("m=video 5004 RTP/AVP 96"));
@@ -4671,6 +4735,7 @@ mod tests {
             "192.168.1.100",
             Transport::Udp,
             SessionType::Download,
+            false,
         );
         assert!(sdp.contains("s=Download\r\n"));
         assert!(sdp.contains("m=video 5004 RTP/AVP 96"));
@@ -4686,6 +4751,7 @@ mod tests {
             "192.168.1.100",
             Transport::Tcp,
             SessionType::Playback,
+            false,
         );
         assert!(sdp.contains("s=Playback\r\n"));
         assert!(sdp.contains("m=video 5004 TCP/RTP/AVP 96"));
@@ -6193,7 +6259,7 @@ mod tcp_media_tests {
     /// setup:active offers (platform dials the device) are refused with 488
     /// instead of silently answering a mismatched transport. Issue #14.
     #[tokio::test]
-    async fn test_invite_tcp_setup_active_returns_488() {
+    async fn test_invite_tcp_setup_active_answers_passive() {
         let config = Gb28181Config {
             enabled: true,
             platform_sip_address: "127.0.0.1".to_string(),
@@ -6277,11 +6343,39 @@ mod tcp_media_tests {
         let mut buf = vec![0u8; 65535];
         let (len, _) = tokio::time::timeout(Duration::from_secs(2), peer.recv_from(&mut buf))
             .await
-            .expect("timed out waiting for 488")
+            .expect("timed out waiting for the answer")
             .expect("recv failed");
         let resp = SipMessage::parse(std::str::from_utf8(&buf[..len]).expect("utf8"))
             .expect("parse response");
-        assert!(resp.start_line.contains("488"), "got {}", resp.start_line);
+        assert_eq!(
+            resp.status_code,
+            Some(SipStatusCode::Ok),
+            "passive answer is 200"
+        );
+        assert!(
+            resp.body.contains("a=setup:passive"),
+            "answer setup role must be passive: {}",
+            resp.body
+        );
+        assert!(
+            resp.body.contains("TCP/RTP/AVP 96"),
+            "answer m= line stays TCP: {}",
+            resp.body
+        );
+        // The advertised m= port is a real listening port (not 9): extract
+        // it and confirm the platform can dial it.
+        let port: u16 = resp
+            .body
+            .lines()
+            .find(|l| l.starts_with("m=video "))
+            .and_then(|l| l.split_whitespace().nth(1))
+            .and_then(|p| p.parse().ok())
+            .expect("m= port");
+        assert_ne!(port, 9, "must advertise the listener's port");
+        let dial = TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("platform dials the passive media listener");
+        drop(dial);
     }
 
     /// Stale responses from a previous register cycle (late 200 OK / old-nonce

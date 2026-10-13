@@ -5,6 +5,7 @@
 //! of AuHub. `Playback` paces frames to wall-clock time relative to the
 //! requested range start; `Download` sends as fast as possible.
 
+use anyhow::Context;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -12,7 +13,7 @@ use std::time::Duration;
 use anyhow::Result;
 use serde::Deserialize;
 use tokio::io::AsyncWriteExt;
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
 
 use crate::manscdp::{empty_string_as_none, parse_gb_time_ms};
@@ -256,7 +257,7 @@ pub async fn run_playback_task(
     start_ms: u64,
     end_ms: u64,
     media_socket: Arc<UdpSocket>,
-    media_tcp_conn: Option<Arc<Mutex<TcpStream>>>,
+    media_tcp_endpoint: Option<crate::server::MediaTcpEndpoint>,
     ssrc: u32,
     device_id: &str,
     remote_addr: SocketAddr,
@@ -264,6 +265,33 @@ pub async fn run_playback_task(
     mut ctl: mpsc::Receiver<PlaybackControl>,
     end_info: Option<MediaEndInfo>,
 ) -> Result<()> {
+    // Passive answer (a=setup:active offer): wait for the platform's
+    // dial before streaming; a control-channel close (BYE) aborts.
+    let media_tcp_conn = match media_tcp_endpoint {
+        Some(crate::server::MediaTcpEndpoint::Connected(conn)) => Some(conn),
+        Some(crate::server::MediaTcpEndpoint::Listening(listener)) => {
+            let conn = loop {
+                tokio::select! {
+                    accepted = listener.accept() => break accepted
+                        .context("gb28181: passive TCP media accept failed")?
+                        .0,
+                    c = ctl.recv() => {
+                        if c.is_none() {
+                            return Ok(()); // channel closed (BYE/teardown)
+                        }
+                        // Pre-connection control (pause/seek): noted, not
+                        // applied — the stream has not started.
+                    }
+                }
+            };
+            log::info!(
+                "gb28181: platform connected to passive TCP media port {}",
+                conn.local_addr()?.port()
+            );
+            Some(Arc::new(Mutex::new(conn)))
+        }
+        None => None,
+    };
     let mut rtp_pusher = RtpPusher::new(remote_addr, ssrc, PS_PAYLOAD_TYPE);
     let mut state = PlaybackState {
         frames: build_frames(source.as_ref(), &segments, start_ms, end_ms),
