@@ -11,6 +11,13 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **inbound SIPS listener** (`transport: "tls-listen"`,
+  `tls` feature): the platform dials the device over TLS — the device's
+  own certificate pair (`tls_cert_file` + `tls_key_file`, required)
+  identifies it; TLS-wrapped connections flow through the same
+  per-connection handler as plain inbound TCP (every host seam,
+  subscriptions, connection-scoped NOTIFYs).
+
 - `feat(server)` **host data for the 2022 five information queries**
   (A.2.4.10-14 → A.2.6.12-16): a new `InfoQueryProvider` seam
   (`with_info_query_provider`; types in `info_query`) fills the answers
