@@ -11,6 +11,17 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **host data for the 2022 five information queries**
+  (A.2.4.10-14 → A.2.6.12-16): a new `InfoQueryProvider` seam
+  (`with_info_query_provider`; types in `info_query`) fills the answers
+  with real hardware state — HomePosition (Enabled/ResetTime/
+  PresetIndex), CruiseTrackList, CruiseTrack (CruisePointList of
+  PresetIndex/StayTime/Speed), PTZPosition (Pan/Tilt/Zoom + field
+  angles + view distance, None fields omitted) and SDCardStatus
+  (≤ 8 items of ID/HddName/Status/FormatProgress?/Capacity/FreeSpace).
+  Without a provider the answers stay byte-identical minimal; wire
+  shapes verified against the standard text.
+
 - `feat(server)` **multi-channel catalog** (A.2.1):
   `Gb28181Config::extra_channels` (`CatalogChannel`: device_id/name +
   optional manufacturer/model/status) lists additional channels after

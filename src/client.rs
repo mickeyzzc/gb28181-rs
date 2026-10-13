@@ -1013,6 +1013,264 @@ pub fn build_recordinfo_response_page(
 /// CruiseTrackQuery track index is echoed via `number`.
 // Same SIP-wrapping parameter set as the sibling response builders.
 #[allow(clippy::too_many_arguments)]
+/// A.2.6.12 HomePositionQuery answer with provider data (None keeps
+/// the minimal empty answer).
+pub fn build_home_position_query_response(
+    sn: &str,
+    device_id: &str,
+    info: Option<&crate::info_query::HomePositionInfo>,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+) -> Result<SipMessage> {
+    let mut body = format!(
+        "<Response CmdType=\"HomePositionQuery\" SN=\"{}\"><DeviceID>{}</DeviceID>",
+        xml_escape(sn),
+        xml_escape(device_id),
+    );
+    if let Some(hp) = info {
+        body.push_str(&format!("<HomePosition><Enabled>{}</Enabled>", hp.enabled));
+        if let Some(t) = hp.reset_time_secs {
+            body.push_str(&format!("<ResetTime>{t}</ResetTime>"));
+        }
+        if let Some(p) = hp.preset_index {
+            body.push_str(&format!("<PresetIndex>{p}</PresetIndex>"));
+        }
+        body.push_str("</HomePosition>");
+    }
+    body.push_str("</Response>");
+    build_manscdp_message_response(
+        body,
+        domain,
+        local_ip,
+        local_port,
+        cseq,
+        device_id,
+        "homeposition",
+    )
+}
+
+/// A.2.6.13 CruiseTrackListQuery answer (None keeps the minimal
+/// SumNum=0 answer).
+pub fn build_cruise_track_list_response(
+    sn: &str,
+    device_id: &str,
+    tracks: Option<&[crate::info_query::CruiseTrackInfo]>,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+) -> Result<SipMessage> {
+    let mut body = format!(
+        "<Response CmdType=\"CruiseTrackListQuery\" SN=\"{}\"><DeviceID>{}</DeviceID>",
+        xml_escape(sn),
+        xml_escape(device_id),
+    );
+    match tracks {
+        Some(list) => {
+            body.push_str(&format!("<SumNum>{}</SumNum>", list.len()));
+            body.push_str(&format!("<CruiseTrackList Num=\"{}\">", list.len()));
+            for t in list {
+                body.push_str(&format!(
+                    "<CruiseTrack><Number>{}</Number><Name>{}</Name></CruiseTrack>",
+                    t.number,
+                    xml_escape(&t.name)
+                ));
+            }
+            body.push_str("</CruiseTrackList>");
+        }
+        None => body.push_str("<SumNum>0</SumNum>"),
+    }
+    body.push_str("</Response>");
+    build_manscdp_message_response(
+        body,
+        domain,
+        local_ip,
+        local_port,
+        cseq,
+        device_id,
+        "cruiselist",
+    )
+}
+
+/// A.2.6.14 CruiseTrackQuery answer (None keeps the minimal
+/// Number-echo answer).
+pub fn build_cruise_track_response(
+    sn: &str,
+    device_id: &str,
+    detail: Option<&crate::info_query::CruiseTrackDetail>,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+) -> Result<SipMessage> {
+    let mut body = format!(
+        "<Response CmdType=\"CruiseTrackQuery\" SN=\"{}\"><DeviceID>{}</DeviceID>",
+        xml_escape(sn),
+        xml_escape(device_id),
+    );
+    match detail {
+        Some(d) => {
+            body.push_str(&format!("<Number>{}</Number>", d.number));
+            if !d.name.is_empty() {
+                body.push_str(&format!("<Name>{}</Name>", xml_escape(&d.name)));
+            }
+            body.push_str(&format!("<SumNum>{}</SumNum>", d.points.len()));
+            body.push_str(&format!("<CruisePointList Num=\"{}\">", d.points.len()));
+            for p in &d.points {
+                body.push_str(&format!(
+                    "<CruisePoint><PresetIndex>{}</PresetIndex><StayTime>{}</StayTime><Speed>{}</Speed></CruisePoint>",
+                    p.preset_index, p.stay_time_secs, p.speed
+                ));
+            }
+            body.push_str("</CruisePointList>");
+        }
+        None => body.push_str("<SumNum>0</SumNum>"),
+    }
+    body.push_str("</Response>");
+    build_manscdp_message_response(
+        body,
+        domain,
+        local_ip,
+        local_port,
+        cseq,
+        device_id,
+        "cruisetrack",
+    )
+}
+
+/// A.2.6.15 PTZPosition answer (None keeps the minimal empty answer).
+pub fn build_ptz_position_response(
+    sn: &str,
+    device_id: &str,
+    pos: Option<&crate::info_query::PtzPositionInfo>,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+) -> Result<SipMessage> {
+    let mut body = format!(
+        "<Response CmdType=\"PTZPosition\" SN=\"{}\"><DeviceID>{}</DeviceID>",
+        xml_escape(sn),
+        xml_escape(device_id),
+    );
+    if let Some(p) = pos {
+        let opt = |tag: &str, v: &Option<f64>| {
+            v.map(|x| format!("<{tag}>{x}</{tag}>")).unwrap_or_default()
+        };
+        body.push_str(&opt("Pan", &p.pan));
+        body.push_str(&opt("Tilt", &p.tilt));
+        body.push_str(&opt("Zoom", &p.zoom));
+        body.push_str(&opt("HorizontalFieldAngle", &p.horizontal_field_angle));
+        body.push_str(&opt("VerticalFieldAngle", &p.vertical_field_angle));
+        body.push_str(&opt("MaxViewDistance", &p.max_view_distance));
+    }
+    body.push_str("</Response>");
+    build_manscdp_message_response(
+        body,
+        domain,
+        local_ip,
+        local_port,
+        cseq,
+        device_id,
+        "ptzposition",
+    )
+}
+
+/// A.2.6.16 SDCardStatus answer (None keeps the minimal SumNum=0
+/// answer; the schema caps the list at 8 items).
+pub fn build_sd_card_status_response(
+    sn: &str,
+    device_id: &str,
+    cards: Option<&[crate::info_query::SdCardInfo]>,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+) -> Result<SipMessage> {
+    let mut body = format!(
+        "<Response CmdType=\"SDCardStatus\" SN=\"{}\"><DeviceID>{}</DeviceID>",
+        xml_escape(sn),
+        xml_escape(device_id),
+    );
+    match cards {
+        Some(list) => {
+            let n = list.len().min(8);
+            body.push_str(&format!("<SumNum>{n}</SumNum>"));
+            body.push_str(&format!("<SDCardStatusInfo Num=\"{n}\">"));
+            for c in &list[..n] {
+                body.push_str(&format!(
+                    "<Item><ID>{}</ID><HddName>{}</HddName><Status>{}</Status>",
+                    c.id,
+                    xml_escape(&c.hdd_name),
+                    xml_escape(&c.status)
+                ));
+                if let Some(fp) = c.format_progress {
+                    body.push_str(&format!("<FormatProgress>{fp}</FormatProgress>"));
+                }
+                body.push_str(&format!(
+                    "<Capacity>{}</Capacity><FreeSpace>{}</FreeSpace></Item>",
+                    c.capacity_mb, c.free_space_mb
+                ));
+            }
+            body.push_str("</SDCardStatusInfo>");
+        }
+        None => body.push_str("<SumNum>0</SumNum>"),
+    }
+    body.push_str("</Response>");
+    build_manscdp_message_response(
+        body, domain, local_ip, local_port, cseq, device_id, "sdcard",
+    )
+}
+
+/// The shared MESSAGE envelope for the information-query answers
+/// (same header shape as `build_gb2022_query_response`).
+fn build_manscdp_message_response(
+    body: String,
+    domain: &str,
+    local_ip: &str,
+    local_port: u16,
+    cseq: u32,
+    device_id: &str,
+    kind: &str,
+) -> Result<SipMessage> {
+    let mut headers = Vec::new();
+    headers.push((
+        "Via".to_string(),
+        format!(
+            "SIP/2.0/UDP {}:{};rport;branch={}",
+            local_ip,
+            local_port,
+            super::sip::random_branch()
+        ),
+    ));
+    headers.push((
+        "From".to_string(),
+        format!("<sip:{}@{}>;tag={}", device_id, domain, random_tag()),
+    ));
+    headers.push(("To".to_string(), format!("<sip:{}@{}>", domain, domain)));
+    headers.push(("Call-ID".to_string(), format!("{device_id}-{kind}-{cseq}")));
+    headers.push(("CSeq".to_string(), format!("{cseq} MESSAGE")));
+    headers.push(("Max-Forwards".to_string(), "70".to_string()));
+    headers.push((
+        "Content-Type".to_string(),
+        "Application/MANSCDP+xml".to_string(),
+    ));
+    headers.push(("Content-Length".to_string(), body.len().to_string()));
+
+    Ok(SipMessage {
+        start_line: format!("MESSAGE sip:{domain} SIP/2.0"),
+        method: Some(SipMethod::Message),
+        status_code: None,
+        uri: Some(format!("sip:{device_id}@{domain}")),
+        version: "SIP/2.0".to_string(),
+        headers,
+        body,
+    })
+}
+
+#[allow(clippy::too_many_arguments)] // mirrors the response-builder family
 pub fn build_gb2022_query_response(
     cmd_type: &str,
     sn: &str,
