@@ -11,6 +11,31 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **outbound stream transports — the full lifecycle over
+  a dialed connection** (`transport: "tcp-out"` and, with the opt-in
+  `tls` feature, `transport: "tls"` / SIPS,
+  GB/T 28181-2022 A-level): the device dials the platform and runs
+  REGISTER (digest dance included), keepalive, re-registration, silence
+  detection and graceful deregister over the one connection; inbound
+  requests (INVITE/SUBSCRIBE/queries) arrive on the same stream and
+  dispatch with every host seam; subscriptions' NOTIFYs ride it (the
+  shared-notifier TCP binding). A dropped connection re-dials (the
+  per-connection keepalive is cancelled so a re-dial never stacks
+  tasks). Via/Contact carry the stream's real local address. The
+  architecture: a pump task feeds every framed message into one
+  channel — the run loop or an in-flight REGISTER exchange
+  (`receive_with_timeout` grew the channel branch, no signature churn);
+  `tcp_conn` generalizes to `SharedSipWriter` (Box<dyn AsyncWrite>) so
+  every send path is transport-agnostic.
+  TLS config mirrors the Go twin: `tls_ca_file` pins the platform
+  (self-signed cert whose serial is the entity ID — the GB convention),
+  `tls_cert_file`/`tls_key_file` enable mutual auth,
+  `tls_insecure_skip_verify` is the explicit lab-only opt-out; ring
+  crypto (no aws-lc build chain — keeps plain cross builds working).
+  `"tcp"` keeps its inbound-listener meaning; TLS is opt-in
+  (`--features tls`) — ring builds C code, which the crate's
+  cross-check matrix cannot compile.
+
 - `feat(server)` **subscriptions and NOTIFYs over TCP dialogs** (audit
   follow-up): a SUBSCRIBE arriving on a TCP connection books on the
   shared host-facing notifier (previously answered 200 but never

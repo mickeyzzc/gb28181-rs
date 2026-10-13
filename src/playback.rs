@@ -216,7 +216,7 @@ pub enum MediaEndChannel {
         socket: Arc<UdpSocket>,
         addr: SocketAddr,
     },
-    Tcp(Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>),
+    Tcp(crate::server::SharedSipWriter),
 }
 
 /// §9.4.2 media-end notification context: a naturally finished
@@ -1124,7 +1124,9 @@ mod tests {
         let (mut server_side, _) = listener.accept().await.unwrap();
 
         let end = MediaEndInfo {
-            channel: MediaEndChannel::Tcp(Arc::new(tokio::sync::Mutex::new(write_half))),
+            channel: MediaEndChannel::Tcp(Arc::new(tokio::sync::Mutex::new(
+                Box::new(write_half) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>
+            ))),
             info: crate::sip::SipMessage {
                 start_line: "INFO sip:dev@domain SIP/2.0".to_string(),
                 method: Some(crate::sip::SipMethod::Info),

@@ -90,6 +90,8 @@ pub mod server;
 pub mod sip;
 pub mod snapshot;
 pub mod subscribe;
+#[cfg(feature = "tls")]
+mod tls;
 pub mod upgrade;
 
 pub use client::{
