@@ -11,6 +11,17 @@ released out of band.
 
 ## [Unreleased]
 
+- `feat(server)` **passive TCP media** (Annex C.2, issue #14
+  follow-up): an `a=setup:active` offer (the platform dials the
+  device's media port) is answered `a=setup:passive` with a real
+  listening port instead of 488 — the live and playback tasks accept
+  the platform's dial before streaming ($-framing as before);
+  pre-connection frames drop, a BYE-driven channel close aborts the
+  wait so the task never lingers on a dead listener. The
+  `MediaTcpEndpoint::{Connected,Listening}` enum replaces the bare
+  `Option<TcpStream>` plumbing; `build_device_sdp_answer` gains the
+  setup role.
+
 - `feat(server)` **async snapshot/upgrade/broadcast exchanges on any
   live transport**: the A.2.5.7 / A.2.5.9 completion notifies and the
   §9.12.1 broadcast flow ride the stream writer when one is live
