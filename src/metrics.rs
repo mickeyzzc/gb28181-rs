@@ -36,6 +36,10 @@ pub trait MetricsHooks: Send + Sync + 'static {
     fn ps_bytes_out(&self, _bytes: u64) {}
     /// RTP packets sent (media + playback).
     fn rtp_packets_out(&self, _packets: u64) {}
+    /// RTP packets the media path failed to send (unreachable peer etc.).
+    /// Counted per failed access unit; a later teardown or recovery
+    /// summary logs the totals.
+    fn invite_send_failures(&self, _packets: u64) {}
 }
 
 /// The default no-op hooks used when none are configured.
