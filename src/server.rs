@@ -4296,6 +4296,54 @@ async fn run_keepalive(
 ///
 /// Receives H.264 AccessUnits from AuHub, multiplexes to PS,
 /// and sends as RTP packets to the platform.
+/// Consecutive access units with zero successful packets that trigger a
+/// media-session teardown (#100) — roughly one second of video at 25 fps.
+const MEDIA_TEARDOWN_FAILED_AUS: u32 = 25;
+
+enum MediaSendAction {
+    KeepGoing,
+    TearDown,
+}
+
+/// Per-session bookkeeping for the unreachable-peer policy (#100): a
+/// streak of consecutive failed access units (any delivered access unit
+/// resets it), a once-only "failures began" report, and lifetime totals
+/// for the teardown/recovery summaries. Pure state, unit-tested below.
+#[derive(Default)]
+struct MediaSendPolicy {
+    consecutive_failed_aus: u32,
+    total_failed_packets: u64,
+    reported_first: bool,
+}
+
+impl MediaSendPolicy {
+    /// Whether this is the first failure (worth a log line). Once-only.
+    fn first_failure_reported(&mut self) -> bool {
+        if self.reported_first {
+            return false;
+        }
+        self.reported_first = true;
+        true
+    }
+
+    fn record_failure(&mut self, failed_packets: u64) -> MediaSendAction {
+        self.consecutive_failed_aus += 1;
+        self.total_failed_packets += failed_packets;
+        if self.consecutive_failed_aus >= MEDIA_TEARDOWN_FAILED_AUS {
+            MediaSendAction::TearDown
+        } else {
+            MediaSendAction::KeepGoing
+        }
+    }
+
+    /// Returns the failed-access-unit streak that just ended, if any.
+    fn record_success(&mut self) -> Option<u32> {
+        let streak = self.consecutive_failed_aus;
+        self.consecutive_failed_aus = 0;
+        (streak > 0).then_some(streak)
+    }
+}
+
 async fn run_media_task(
     mut rx: mpsc::Receiver<AccessUnit>,
     media_socket: Arc<UdpSocket>,
@@ -4344,6 +4392,7 @@ async fn run_media_task(
 
     let mut rtp_pusher = RtpPusher::new(remote_addr, ssrc, PS_PAYLOAD_TYPE);
     let mut pts = 0u64;
+    let mut send_policy = MediaSendPolicy::default();
     // Capture timestamp of the previous access unit — PTS deltas derive from
     // real capture time (90 kHz), so 25 fps streams no longer play at 30 fps.
     let mut last_capture: Option<std::time::Instant> = None;
@@ -4381,6 +4430,13 @@ async fn run_media_task(
         metrics.rtp_packets_out(1); // one RTP packet per chunk below
         let chunk_count = ps_data.len().div_ceil(MAX_RTP_PAYLOAD);
 
+        // Unreachable-peer policy (#100): instead of an ERROR per packet,
+        // the first failure logs once, and a peer failing for
+        // MEDIA_TEARDOWN_FAILED_AUS consecutive access units loses the
+        // session — the platform re-INVITEs once it is reachable again.
+        let mut send_error: Option<String> = None;
+        let mut failed_at_index: Option<usize> = None;
+
         for (i, chunk) in ps_data.chunks(MAX_RTP_PAYLOAD).enumerate() {
             let is_last = i == chunk_count - 1;
             let rtp_packet = build_rtp_packet_raw(
@@ -4398,19 +4454,60 @@ async fn run_media_task(
                 let mut conn = conn.lock().await;
                 let frame = frame_rtp_over_tcp(&rtp_packet);
                 if let Err(e) = conn.write_all(&frame).await {
-                    log::error!("gb28181: failed to send RTP packet over TCP: {e}");
+                    send_error = Some(format!("TCP: {e}"));
+                    failed_at_index = Some(i);
                     break;
                 }
             } else if let Err(e) = media_socket.send_to(&rtp_packet, remote_addr).await {
-                log::error!("gb28181: failed to send RTP packet: {e}");
+                send_error = Some(format!("{e}"));
+                failed_at_index = Some(i);
                 break;
             }
+        }
+
+        if let (Some(err), Some(idx)) = (send_error, failed_at_index) {
+            let failed_packets = (chunk_count - idx) as u64;
+            metrics.invite_send_failures(failed_packets);
+            if send_policy.first_failure_reported() {
+                log::warn!(
+                    "gb28181: media send to {remote_addr} failing ({err}); \
+                     the session tears down after {MEDIA_TEARDOWN_FAILED_AUS} \
+                     consecutive failed access units"
+                );
+            }
+            if matches!(
+                send_policy.record_failure(failed_packets),
+                MediaSendAction::TearDown
+            ) {
+                log::warn!(
+                    "gb28181: media session for device {device_id} torn down after \
+                     {} consecutive failed access units ({} packets this session) — \
+                     peer {remote_addr} unreachable; the platform may re-INVITE",
+                    send_policy.consecutive_failed_aus,
+                    send_policy.total_failed_packets
+                );
+                return Ok(());
+            }
+        } else if let Some(streak) = send_policy.record_success() {
+            log::info!(
+                "gb28181: media sends to {remote_addr} recovered after {streak} \
+                 failed access units ({} packets lost this session)",
+                send_policy.total_failed_packets
+            );
         }
 
         rtp_pusher.increment_timestamp(delta_ticks);
     }
 
-    log::info!("gb28181: media task ended for device {device_id}");
+    if send_policy.total_failed_packets > 0 {
+        log::info!(
+            "gb28181: media task ended for device {device_id} \
+             ({} send-failed packets across the session)",
+            send_policy.total_failed_packets
+        );
+    } else {
+        log::info!("gb28181: media task ended for device {device_id}");
+    }
     Ok(())
 }
 
@@ -9104,5 +9201,116 @@ mod tcp_media_tests {
     async fn test_set_multicast_ttl() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.expect("bind");
         set_multicast_ttl(&socket, 4).expect("ttl");
+    }
+
+    #[test]
+    fn media_send_policy_counts_streak_and_tears_down_at_threshold() {
+        let mut p = super::MediaSendPolicy::default();
+        assert!(p.first_failure_reported());
+        assert!(!p.first_failure_reported(), "failure report is once-only");
+        for i in 1..super::MEDIA_TEARDOWN_FAILED_AUS {
+            assert!(
+                matches!(p.record_failure(3), super::MediaSendAction::KeepGoing),
+                "tore down too early (after {i} failures)"
+            );
+        }
+        assert!(matches!(
+            p.record_failure(3),
+            super::MediaSendAction::TearDown
+        ));
+        assert_eq!(
+            p.total_failed_packets,
+            u64::from(super::MEDIA_TEARDOWN_FAILED_AUS) * 3
+        );
+    }
+
+    #[test]
+    fn media_send_policy_success_resets_streak_and_reports_recovery() {
+        let mut p = super::MediaSendPolicy::default();
+        for _ in 0..10 {
+            assert!(matches!(
+                p.record_failure(1),
+                super::MediaSendAction::KeepGoing
+            ));
+        }
+        assert_eq!(p.record_success(), Some(10));
+        assert_eq!(p.record_success(), None);
+        // The streak restarts from zero after a recovery.
+        for _ in 0..(super::MEDIA_TEARDOWN_FAILED_AUS - 1) {
+            assert!(matches!(
+                p.record_failure(1),
+                super::MediaSendAction::KeepGoing
+            ));
+        }
+        assert!(matches!(
+            p.record_failure(1),
+            super::MediaSendAction::TearDown
+        ));
+        assert_eq!(
+            p.total_failed_packets,
+            10 + u64::from(super::MEDIA_TEARDOWN_FAILED_AUS)
+        );
+    }
+
+    /// #100: a peer that never receives must end the session via the
+    /// teardown policy instead of erroring per packet forever — the
+    /// platform re-INVITEs once it is reachable again.
+    #[tokio::test]
+    async fn media_task_tears_down_on_unreachable_peer() {
+        use crate::frame::{AccessUnit, Nalu};
+
+        #[derive(Default)]
+        struct Counting {
+            failures: std::sync::Mutex<u64>,
+        }
+        impl crate::metrics::MetricsHooks for Counting {
+            fn invite_send_failures(&self, packets: u64) {
+                *self.failures.lock().expect("count lock") += packets;
+            }
+        }
+
+        let media = Arc::new(UdpSocket::bind("127.0.0.1:0").await.expect("bind"));
+        // Deterministic failure injection: sending to the broadcast address
+        // without SO_BROADCAST fails synchronously with EACCES on every
+        // packet (an unconnected UDP socket would swallow ICMP errors, so a
+        // closed loopback port is NOT a reliable ECONNREFUSED source).
+        let dead: SocketAddr = "255.255.255.255:1".parse().expect("addr");
+        let (tx, rx) = tokio::sync::mpsc::channel(4);
+        let metrics = Arc::new(Counting::default());
+        let task_metrics = Arc::clone(&metrics) as Arc<dyn crate::metrics::MetricsHooks>;
+        let device = "34020000001320000001".to_string();
+        let task = tokio::spawn(async move {
+            super::run_media_task(rx, media, None, 1, &device, dead, task_metrics).await
+        });
+
+        let nalu = Nalu {
+            nalu_type: 5,
+            data: vec![0x65, 0x88, 0x84, 0x21, 0xa0],
+            is_idr: true,
+            is_sps: false,
+            is_pps: false,
+            is_aud: false,
+        };
+        // The sender stays open: only the teardown policy may end the
+        // task (channel close would too, so it must not be the cause).
+        for _ in 0..100 {
+            let au = AccessUnit {
+                nalus: vec![nalu.clone()],
+                timestamp: std::time::Instant::now(),
+                is_key_frame: true,
+            };
+            if tx.send(au).await.is_err() {
+                break; // task already tore down — the timeout below decides
+            }
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(10), task)
+            .await
+            .expect("media task ended via teardown")
+            .expect("join")
+            .expect("media task ok");
+        assert!(
+            *metrics.failures.lock().expect("count lock") > 0,
+            "teardown must ride the failure policy, not an unrelated end"
+        );
     }
 }
