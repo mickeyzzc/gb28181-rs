@@ -52,6 +52,10 @@ pub struct CatalogChannel {
     /// `ON`/`OFF` — defaults to `ON`.
     #[serde(default)]
     pub status: String,
+    /// GB/T 28181-2016 §5.4.12 PTZ capability code (3 = pan/tilt/zoom);
+    /// `None` omits the element from the catalog response.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ptz_type: Option<u8>,
 }
 
 impl CatalogChannel {
@@ -163,6 +167,12 @@ pub struct Gb28181Config {
     /// DeviceInfo `Firmware` version string. `None` → the crate version.
     #[serde(default)]
     pub firmware: Option<String>,
+    /// PTZ capability code advertised for the device's own catalog entry
+    /// (GB/T 28181-2016 §5.4.12; 3 = pan/tilt/zoom). Hosts steering an
+    /// external PTZ head set this so platforms dispatch PTZCmd; `None`
+    /// omits the element (no PTZ).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ptz_type: Option<u8>,
 }
 
 impl Gb28181Config {
@@ -331,6 +341,7 @@ impl Default for Gb28181Config {
             firmware: None,
             video_param_opt_download_speed: String::new(),
             video_param_opt_resolution: String::new(),
+            ptz_type: None,
         }
     }
 }

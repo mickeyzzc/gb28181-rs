@@ -161,6 +161,11 @@ pub struct ChannelItem {
     pub longitude: f64,
     #[serde(rename = "Latitude")]
     pub latitude: f64,
+    /// GB/T 28181-2016 §5.4.12 PTZ capability code (3 = pan/tilt/zoom);
+    /// platforms gate PTZCmd dispatch on a non-zero value. `None` omits
+    /// the element — historical deployments stay byte-identical.
+    #[serde(rename = "PTZType", default, skip_serializing_if = "Option::is_none")]
+    pub ptz_type: Option<u8>,
 }
 
 /// DeviceItem — for DeviceInfo response
@@ -2339,11 +2344,51 @@ mod tests {
             port: 5060,
             longitude: 121.4737,
             latitude: 31.2304,
+            ptz_type: None,
         };
 
         let xml = serde_xml_rs::to_string(&item).unwrap();
         assert!(xml.contains("<DeviceID>"));
         assert!(xml.contains("31011500991320000001"));
+    }
+
+    /// PTZType (GB/T 28181-2016 §5.4.12): Some emits the element, None
+    /// omits it — platforms gate PTZCmd dispatch on a non-zero value and
+    /// historical deployments must stay byte-identical.
+    #[test]
+    fn test_channel_item_ptz_type() {
+        let base = ChannelItem {
+            device_id: "31011500991320000001".to_string(),
+            name: "Camera 1".to_string(),
+            manufacturer: "MiBee".to_string(),
+            model: "Mibee-Cam-01".to_string(),
+            owner: "Admin".to_string(),
+            civil_code: "310115".to_string(),
+            address: "Test Location".to_string(),
+            parental: 0,
+            parent_id: "31011500991320000000".to_string(),
+            safety_way: 0,
+            register_way: 1,
+            secrecy: 0,
+            status: "ON".to_string(),
+            ip_address: "192.168.1.100".to_string(),
+            port: 5060,
+            longitude: 121.4737,
+            latitude: 31.2304,
+            ptz_type: None,
+        };
+
+        let none_xml = serde_xml_rs::to_string(&base).unwrap();
+        assert!(!none_xml.contains("PTZType"), "{none_xml}");
+
+        let mut with_ptz = base.clone();
+        with_ptz.ptz_type = Some(3);
+        let some_xml = serde_xml_rs::to_string(&with_ptz).unwrap();
+        assert!(some_xml.contains("<PTZType>3</PTZType>"), "{some_xml}");
+
+        // Round-trip: the element parses back into the field.
+        let parsed: ChannelItem = serde_xml_rs::from_str(&some_xml).unwrap();
+        assert_eq!(parsed.ptz_type, Some(3));
     }
 
     #[test]
