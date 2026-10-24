@@ -151,13 +151,11 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 ## Documentation
 
-Topic guides now live in the MiBee documentation hub — the single
-source of truth for library manuals, bilingual:
-
-> **https://www.mlsbs.top/docs/mibeelibs**
-
-Manual changes go there by PR (review flow in the hub repo's GOVERNANCE).
-[`docs/README.md`](docs/README.md) keeps the redirect.
+Topic guides live **in this repository**, bilingual:
+[`docs/README.md`](docs/README.md) is the index (`docs/en-US/` and
+`docs/zh-CN/` hold the pages — quickstart, architecture, protocol
+concepts, CLI manuals, testing). Fixes and new pages land
+here by PR.
 ## Library hygiene (v0.6.0 hardening)
 
 v0.6.0 made the crate safe to embed as a neutral foundation library. The regression tests in [`tests/library_hygiene.rs`](tests/library_hygiene.rs) pin each guarantee:

@@ -1,23 +1,27 @@
-# Documentation has moved
+# Documentation / 文档
 
-The topic manuals that previously lived under `docs/en/` and `docs/zh/`
-(configuration, live streaming, recording & playback, PS muxing & RTP, MANSCDP & charsets, server lifecycle, logging & tracing) now live in the MiBee documentation hub — the single source
-of truth for library manuals:
+All topic guides live **in this repository**, bilingual — this
+directory is the source of truth.
 
-> **https://www.mlsbs.top/docs/mibeelibs**
+**English (GB/T 28181 device side — Rust)**
 
-To change a manual, open a PR against the hub repo's `mibeelibs/`
-collection (review flow in its GOVERNANCE). This directory keeps only
-this redirect page.
+- [Configuration reference](en-US/gb28181-rs-configuration.md)
+- [Live streaming: the FrameSource seam](en-US/gb28181-rs-live-streaming.md)
+- [MANSCDP messages, charsets, and device IDs](en-US/gb28181-rs-manscdp.md)
+- [PS muxing and RTP, standalone](en-US/gb28181-rs-psmux.md)
+- [Quick start: a minimal compilable device](en-US/gb28181-rs-quickstart.md)
+- [Recording, RecordInfo, and playback](en-US/gb28181-rs-recording-playback.md)
+- [Server lifecycle: start, shutdown, transports](en-US/gb28181-rs-server.md)
 
----
+**中文**
 
-# 文档已迁移
+- [配置参考](zh-CN/gb28181-rs-configuration.md)
+- [直播推流：FrameSource 接缝](zh-CN/gb28181-rs-live-streaming.md)
+- [MANSCDP 消息、字符集与设备 ID](zh-CN/gb28181-rs-manscdp.md)
+- [PS 封装与 RTP：独立使用](zh-CN/gb28181-rs-psmux.md)
+- [快速开始：最小可编译设备](zh-CN/gb28181-rs-quickstart.md)
+- [录像、录像查询与回放](zh-CN/gb28181-rs-recording-playback.md)
+- [服务器生命周期：启动、停机与传输层](zh-CN/gb28181-rs-server.md)
 
-原 `docs/en/` 与 `docs/zh/` 下的分主题手册（配置、直播推流、录像与回放、PS 封装与 RTP、MANSCDP 与字符集、服务器生命周期、日志）已迁移至
-MiBee 文档中心——库手册唯一真源：
-
-> **https://www.mlsbs.top/docs/mibeelibs**
-
-修改手册请向文档中心仓库的 `mibeelibs/` 集合提 PR（流程见该仓
-GOVERNANCE）。本目录仅保留此引导页。
+Cross-repository guide links point at the other repositories' own
+`docs/` directories on GitHub.

@@ -150,11 +150,10 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 ## 文档
 
-专题手册已迁移至 MiBee 文档中心——库手册唯一真源（双语）：
-
-> **https://www.mlsbs.top/docs/mibeelibs**
-
-手册修改向文档中心提 PR（流程见该仓 GOVERNANCE）。本仓 [`docs/README.md`](docs/README.md) 保留引导页。
+主题手册**就在本仓库内**，双语：
+[`docs/README.md`](docs/README.md) 是索引（`docs/en-US/` 与
+`docs/zh-CN/` 存放各页——快速开始、架构、协议概念、CLI 手册、测试）。
+修订与新页以 PR 落本仓。
 ## 库卫生（v0.6.0 加固）
 
 v0.6.0 把本 crate 打磨为可放心嵌入的中性基础库。[`tests/library_hygiene.rs`](tests/library_hygiene.rs) 中的回归测试逐条锁定以下保证：
