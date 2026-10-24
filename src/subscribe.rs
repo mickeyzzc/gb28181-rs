@@ -568,6 +568,7 @@ mod tests {
             port: 5060,
             longitude: 0.0,
             latitude: 0.0,
+            ptz_type: None,
         };
         assert!(n.send_catalog_change(&[item]));
         let text = recv_text(&platform);

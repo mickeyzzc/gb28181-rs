@@ -2105,6 +2105,7 @@ mod tests {
             port: 5060,
             longitude: 121.4737,
             latitude: 31.2304,
+            ptz_type: None,
         }];
 
         // Note: serde-xml-rs has limitations with Response containing None fields
@@ -2300,6 +2301,7 @@ mod tests {
             port: 5060,
             longitude: 0.0,
             latitude: 0.0,
+            ptz_type: None,
         }];
         let msg = build_catalog_response(
             "5",

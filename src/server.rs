@@ -2470,6 +2470,7 @@ impl Gb28181Server {
                     port: self.config.local_sip_port,
                     longitude: 0.0,
                     latitude: 0.0,
+                    ptz_type: self.config.ptz_type,
                 }];
                 for extra in &self.config.extra_channels {
                     channels.push(ChannelItem {
@@ -2490,6 +2491,7 @@ impl Gb28181Server {
                         port: self.config.local_sip_port,
                         longitude: 0.0,
                         latitude: 0.0,
+                        ptz_type: extra.ptz_type,
                     });
                 }
                 // One page per RESPONSE_PAGE_ITEMS items, SumNum = total.
@@ -8912,6 +8914,7 @@ mod tcp_media_tests {
                 manufacturer: String::new(),
                 model: String::new(),
                 status: String::new(),
+                ptz_type: None,
             });
         }
         let config = Gb28181Config {
