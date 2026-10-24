@@ -11,6 +11,18 @@ released out of band.
 
 ## [Unreleased]
 
+## [0.13.1] — 2026-10-24
+
+### Fixed
+
+- **Media sessions tear down on an unreachable peer (#101).** A network
+  blink left the INVITE session erroring at ~100 ms/packet for minutes
+  (500+ error lines per incident); the session now tears itself down
+  after 25 consecutive failed access units — first failure warns, the
+  teardown line summarizes, and the platform can re-INVITE to rebuild.
+  `MetricsHooks::invite_send_failures` counts the drops (reported as
+  mibee-eye-hub #2).
+
 ## [v0.13.0] — 2026-10-14
 
 The transport-parity package, twin of gb28181-go v0.12.0 — TCP and
