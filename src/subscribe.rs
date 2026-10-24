@@ -331,7 +331,7 @@ impl DeviceNotifier {
                      <Model>{}</Model><Owner>{}</Owner><CivilCode>{}</CivilCode><Address>{}</Address>\
                      <Parental>{}</Parental><ParentID>{}</ParentID><SafetyWay>{}</SafetyWay>\
                      <RegisterWay>{}</RegisterWay><Secrecy>{}</Secrecy><Status>{}</Status>\
-                     <IPAddress>{}</IPAddress><Port>{}</Port><Longitude>{}</Longitude><Latitude>{}</Latitude></Item>",
+                     <IPAddress>{}</IPAddress><Port>{}</Port><Longitude>{}</Longitude><Latitude>{}</Latitude>{}</Item>",
                     crate::client::xml_escape(&it.device_id),
                     crate::client::xml_escape(&it.name),
                     crate::client::xml_escape(&it.manufacturer),
@@ -349,6 +349,9 @@ impl DeviceNotifier {
                     it.port,
                     it.longitude,
                     it.latitude,
+                    it.ptz_type
+                        .map(|v| format!("<PTZType>{v}</PTZType>"))
+                        .unwrap_or_default(),
                 )
             })
             .collect::<String>();

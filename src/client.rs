@@ -569,12 +569,15 @@ pub fn build_catalog_response_page(
         items
             .iter()
             .map(|item| format!(
-                "<Item><DeviceID>{}</DeviceID><Name>{}</Name><Manufacturer>{}</Manufacturer><Model>{}</Model><Status>{}</Status></Item>",
+                "<Item><DeviceID>{}</DeviceID><Name>{}</Name><Manufacturer>{}</Manufacturer><Model>{}</Model><Status>{}</Status>{}</Item>",
                 xml_escape(&item.device_id),
                 xml_escape(&item.name),
                 xml_escape(&item.manufacturer),
                 xml_escape(&item.model),
-                xml_escape(&item.status)
+                xml_escape(&item.status),
+                item.ptz_type
+                    .map(|v| format!("<PTZType>{v}</PTZType>"))
+                    .unwrap_or_default()
             ))
             .collect::<String>()
     );
@@ -2323,6 +2326,61 @@ mod tests {
         assert!(
             super::super::manscdp::parse_query_dual(&msg.body).is_none()
                 || msg.body.matches('<').count() >= msg.body.matches('&').count()
+        );
+    }
+
+    /// The catalog answer body is hand-assembled (format!), NOT serde —
+    /// so ChannelItem.ptz_type must be threaded through the template
+    /// explicitly (hub#7: a serde-only field never reached the wire).
+    #[test]
+    fn test_catalog_response_ptz_type_on_wire() {
+        let mk = |ptz: Option<u8>| crate::manscdp::ChannelItem {
+            device_id: "34020000001320000001".to_string(),
+            name: "Cam".to_string(),
+            manufacturer: "Mfr".to_string(),
+            model: "M1".to_string(),
+            owner: String::new(),
+            civil_code: String::new(),
+            address: String::new(),
+            parental: 0,
+            parent_id: String::new(),
+            safety_way: 0,
+            register_way: 1,
+            secrecy: 0,
+            status: "ON".to_string(),
+            ip_address: String::new(),
+            port: 5060,
+            longitude: 0.0,
+            latitude: 0.0,
+            ptz_type: ptz,
+        };
+        let args = (
+            "5",
+            "34020000001320000001",
+            "3402000000",
+            "192.168.62.104",
+            5060u16,
+            42u32,
+        );
+        let plain =
+            build_catalog_response(args.0, args.1, args.2, args.3, args.4, args.5, &[mk(None)])
+                .expect("build");
+        assert!(!plain.body.contains("PTZType"), "{}", plain.body);
+
+        let with_ptz = build_catalog_response(
+            args.0,
+            args.1,
+            args.2,
+            args.3,
+            args.4,
+            args.5,
+            &[mk(Some(3))],
+        )
+        .expect("build");
+        assert!(
+            with_ptz.body.contains("<PTZType>3</PTZType>"),
+            "{}",
+            with_ptz.body
         );
     }
 
