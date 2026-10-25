@@ -7,7 +7,7 @@
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
 ![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen.svg)
 
-GB/T 28181-2016/2022 **device-side (UAC)** library for Rust — register a camera or media source with a GB28181 SIP platform and stream to it.
+GB/T 28181-2011/2016/2022 **device-side (UAC)** library for Rust — register a camera or media source with a GB28181 SIP platform and stream to it. 2011-era platforms interoperate as-is: their signaling is a strict subset of what the device answers (per the GB/T 28181-2016 foreword's change list), GB2312-declared MANSCDP bodies — the 2011 signaling charset — parse on every route, and the INVITE answer SDP carries no 2016+ extensions (`f=`, TCP media); pinned by tests.
 
 Hand-written SIP (no SIP framework), MANSCDP XML codec, RTP/PS media push, and a full device server with live streaming, playback, and download. Extracted from the production implementation in [mibee-eye-raspi-rs](https://github.com/Mi-Bee-Studio), hardened against real GB28181 platforms (digest-auth URI matching, Via branch uniqueness, local-IP detection, MANSCDP attribute/element dual forms, TCP transport, playback control).
 

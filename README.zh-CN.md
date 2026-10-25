@@ -7,7 +7,7 @@
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
 ![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen.svg)
 
-**GB/T 28181-2016/2022 设备端（UAC）Rust 库** —— 让摄像头或媒体源以国标方式注册到 SIP 平台并向其推流。
+**GB/T 28181-2011/2016/2022 设备端（UAC）Rust 库** —— 让摄像头或媒体源以国标方式注册到 SIP 平台并向其推流。2011 世代平台即插即用：其信令是设备应答集的严格子集（据 GB/T 28181-2016 前言官方变化清单），GB2312 声明的 MANSCDP 报文（2011 信令字符集）在全部路由可解析，INVITE 应答 SDP 不带任何 2016+ 扩展（`f=`、TCP 媒体）——均有测试钉板。
 
 手写 SIP（不依赖任何 SIP 框架）、MANSCDP XML 编解码、RTP/PS 媒体推送，以及完整的设备服务端：直播、回放、下载。代码从 [mibee-eye-raspi-rs](https://github.com/Mi-Bee-Studio) 的生产实现抽取，经真实国标平台打磨（摘要认证 URI 匹配、Via branch 唯一性、本机 IP 探测、MANSCDP 属性/元素双形式、TCP 传输、回放控制）。
 

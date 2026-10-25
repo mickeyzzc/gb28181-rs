@@ -11,6 +11,30 @@ released out of band.
 
 ## [Unreleased]
 
+### Fixed
+
+- **GB2312-declared MANSCDP bodies were refused by every parser route** —
+  a real GB/T 28181-2011 interop gap: the 2011 signaling charset is
+  GB2312 (§9.4.1), 2011-era platforms declare it on every body, and
+  serde-xml-rs (xml-rs) refuses a non-UTF-8 declared document exactly
+  like Go's encoding/xml does without a CharsetReader — a GB2312-declared
+  Catalog/DeviceInfo query drew silence. All production parse routes
+  (Query/Notify dual forms, DeviceControl, DeviceConfig, ConfigSnapShot,
+  BroadcastNotify) now normalize through a `strip_xml_decl` helper before
+  the parser, mirroring the Go twin's `manscdp.UTF8Body`; the transport
+  layer's `charset::decode_wire_body` already transcoded genuine GB2312
+  bytes. Pinned by `gb2011_gb2312_declared_query_parses`.
+- **`DeviceItem` parsed the device-name element as `<Name>`** — the
+  DeviceInfo-response schema (A.2.6.5) says `DeviceName`; `<Name>` is the
+  BasicParam config element. The exported struct now reads the standard
+  element (both twins' builders already emit `DeviceName`), pinned by a
+  parse test of the exact A.2.6.5 bytes.
+- The UDP INVITE answer SDP is pinned 2011-shaped: `y=` present, and the
+  2016+ extensions (`f=` media parameters, `a=setup`/`a=connection`/TCP
+  media) asserted absent — the claim that 2011-era platforms interoperate
+  as-is now has teeth in CI (headline of both READMEs says
+  2011/2016/2022).
+
 ## [0.13.1] — 2026-10-24
 
 ### Fixed
