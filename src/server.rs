@@ -5054,6 +5054,14 @@ mod tests {
         assert!(sdp.contains("a=rtpmap:96 PS/90000"));
         assert!(sdp.contains("y=12345"));
         assert!(sdp.contains("c=IN IP4 192.168.1.100"));
+        // 2011-shape guard: the UDP answer must not carry the 2016+
+        // extensions — the f= media-parameter line or TCP media's
+        // a=setup/a=connection (a 2011 platform's parser reads neither;
+        // TCP answers only ever appear when the offer asked for TCP).
+        assert!(!sdp.contains("\rf=") && !sdp.contains("\nf="));
+        assert!(!sdp.contains("a=setup"));
+        assert!(!sdp.contains("a=connection"));
+        assert!(!sdp.contains("TCP/RTP/AVP"));
     }
 
     /// Talkback SDP answer golden (GB/T 28181-2022 §9.2): m=audio mirrors

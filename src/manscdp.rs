@@ -168,12 +168,14 @@ pub struct ChannelItem {
     pub ptz_type: Option<u8>,
 }
 
-/// DeviceItem — for DeviceInfo response
+/// DeviceItem — for DeviceInfo response. The name element is DeviceName
+/// per the response schema (GB/T 28181-2022 A.2.6.5) — <Name> belongs to
+/// the BasicParam config schema; both twins' builders emit DeviceName.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeviceItem {
     #[serde(rename = "DeviceID")]
     pub device_id: String,
-    #[serde(rename = "Name")]
+    #[serde(rename = "DeviceName")]
     pub name: String,
     #[serde(rename = "Manufacturer")]
     pub manufacturer: String,
@@ -213,18 +215,37 @@ pub struct NotifyAttr {
     pub keepalive: Option<String>,
 }
 
+/// Strips an `<?xml …?>` prolog so serde-xml-rs accepts documents whose
+/// declaration names a non-UTF-8 charset: GB/T 28181 §9.4.1 mandates
+/// `encoding="GB2312"`, and 2011-era platforms declare it on every
+/// MANSCDP body — xml-rs refuses such documents exactly like Go's
+/// encoding/xml does without a CharsetReader (both twins normalize
+/// before parsing: this mirrors the Go twin's `manscdp.UTF8Body`).
+/// Bodies without a declaration pass through unchanged.
+fn strip_xml_decl(body: &str) -> &str {
+    let trimmed = body.trim_start();
+    let rest = match trimmed.strip_prefix("<?xml") {
+        Some(rest) => rest,
+        None => return body,
+    };
+    match rest.find("?>") {
+        Some(end) => rest[end + 2..].trim_start(),
+        None => body,
+    }
+}
+
 /// Parses a `<Query>` body in either child-element (live MiBee NVR) or
 /// attribute (older platforms) format, normalizing into [`Query`].
 #[allow(dead_code)] // wired in R2 (dispatch from client.rs)
 pub(crate) fn parse_query_dual(body: &str) -> Option<Query> {
     // Try child-element format first (matches live MiBee NVR).
-    if let Ok(q) = serde_xml_rs::from_str::<Query>(body) {
+    if let Ok(q) = serde_xml_rs::from_str::<Query>(strip_xml_decl(body)) {
         if !q.cmd_type.is_empty() {
             return Some(q);
         }
     }
     // Fallback: try attribute format.
-    if let Ok(qa) = serde_xml_rs::from_str::<QueryAttr>(body) {
+    if let Ok(qa) = serde_xml_rs::from_str::<QueryAttr>(strip_xml_decl(body)) {
         if !qa.cmd_type.is_empty() {
             return Some(Query {
                 cmd_type: qa.cmd_type,
@@ -463,7 +484,7 @@ impl UploadSnapShotFinished {
 /// Parses an inbound DeviceControl snapshot body; `None` when the body is
 /// not a snapshot control.
 pub fn parse_config_snapshot(body: &str) -> Option<ConfigSnapShot> {
-    let c = serde_xml_rs::from_str::<ConfigSnapShot>(body).ok()?;
+    let c = serde_xml_rs::from_str::<ConfigSnapShot>(strip_xml_decl(body)).ok()?;
     (c.cmd_type == "DeviceConfig").then_some(c)
 }
 
@@ -937,7 +958,7 @@ struct DeviceUpgradeBody {
 /// DeviceControl or carries no recognized sub-command (the caller keeps
 /// its control-reject behavior for those).
 pub fn parse_device_control(body: &str) -> Option<DeviceControl> {
-    let c: DeviceControlBody = serde_xml_rs::from_str(body).ok()?;
+    let c: DeviceControlBody = serde_xml_rs::from_str(strip_xml_decl(body)).ok()?;
     if c.cmd_type != "DeviceControl" {
         return None;
     }
@@ -1402,7 +1423,7 @@ fn parse_num<T: std::str::FromStr>(s: &str) -> Option<T> {
 /// DeviceConfig or carries no recognized sub-command (the caller keeps
 /// the reject behavior for those).
 pub fn parse_device_config(body: &str) -> Option<DeviceConfig> {
-    let c: DeviceConfigBody = serde_xml_rs::from_str(body).ok()?;
+    let c: DeviceConfigBody = serde_xml_rs::from_str(strip_xml_decl(body)).ok()?;
     if c.cmd_type != "DeviceConfig" {
         return None;
     }
@@ -1542,13 +1563,13 @@ pub fn parse_device_config(body: &str) -> Option<DeviceConfig> {
 // wired in R2 (dispatch from client.rs)
 pub(crate) fn parse_notify_dual(body: &str) -> Option<Notify> {
     // Try child-element format first (matches live MiBee NVR).
-    if let Ok(n) = serde_xml_rs::from_str::<Notify>(body) {
+    if let Ok(n) = serde_xml_rs::from_str::<Notify>(strip_xml_decl(body)) {
         if !n.cmd_type.is_empty() {
             return Some(n);
         }
     }
     // Fallback: try attribute format.
-    if let Ok(na) = serde_xml_rs::from_str::<NotifyAttr>(body) {
+    if let Ok(na) = serde_xml_rs::from_str::<NotifyAttr>(strip_xml_decl(body)) {
         if !na.cmd_type.is_empty() {
             return Some(Notify {
                 cmd_type: na.cmd_type,
@@ -2653,7 +2674,7 @@ pub fn parse_broadcast_notify(body: &str) -> Option<BroadcastNotify> {
         #[serde(rename = "TargetID")]
         target_id: String,
     }
-    if let Ok(v) = serde_xml_rs::from_str::<Child>(body) {
+    if let Ok(v) = serde_xml_rs::from_str::<Child>(strip_xml_decl(body)) {
         if v.cmd_type == "Broadcast" {
             let sn = v.sn.parse().ok()?;
             return Some(BroadcastNotify {
@@ -2680,7 +2701,7 @@ pub fn parse_broadcast_notify(body: &str) -> Option<BroadcastNotify> {
         #[serde(rename = "TargetID")]
         child_target: Option<String>,
     }
-    let v = serde_xml_rs::from_str::<Attr>(body).ok()?;
+    let v = serde_xml_rs::from_str::<Attr>(strip_xml_decl(body)).ok()?;
     if v.cmd_type != "Broadcast" {
         return None;
     }
@@ -2740,5 +2761,44 @@ mod broadcast_tests {
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\r\n<Response>\r\n<CmdType>Broadcast</CmdType>\r\n<SN>42</SN>\r\n<DeviceID>34020000001320000002</DeviceID>\r\n<Result>OK</Result>\r\n</Response>\r\n"
         );
         assert!(build_broadcast_response(1, "d", false).contains("<Result>ERROR</Result>"));
+    }
+
+    // GB/T 28181-2011 device-side compatibility: a 2011-era platform is a
+    // strict subset of 2016/2022 on every exchange this device answers
+    // (the GB/T 28181-2016 foreword's official change list), so "2011
+    // compatibility" is a wire-shape claim. Pin the shapes a 2011
+    // platform actually exercises so they cannot regress silently —
+    // starting with the §9.4.1 GB2312 declaration on inbound queries.
+
+    /// The 2011 wire form: child-element Query under a GB2312 declaration
+    /// with CRLF line endings. The bytes are pure ASCII (queries carry
+    /// CmdType/SN/DeviceID only), but the declared charset must not stop
+    /// the parse — Go's encoding/xml refuses such documents without a
+    /// CharsetReader, and xml-rs may behave the same; either way the
+    /// normalization belongs before the parser, mirroring the Go twin's
+    /// `manscdp.UTF8Body`.
+    #[test]
+    fn gb2011_gb2312_declared_query_parses() {
+        let body = "<?xml version=\"1.0\" encoding=\"GB2312\"?>\r\n<Query><CmdType>Catalog</CmdType><SN>101</SN><DeviceID>34020000012000000001</DeviceID></Query>";
+        let q = parse_query_dual(body).expect("GB2312-declared 2011 query must parse");
+        assert_eq!(q.cmd_type, "Catalog");
+        assert_eq!(q.sn, "101");
+        assert_eq!(q.device_id, "34020000012000000001");
+    }
+
+    /// A.2.6.5: the DeviceInfo response's identity fields are direct
+    /// children of Response and the name element is DeviceName — the
+    /// exact bytes both twins' builders emit. The exported DeviceItem
+    /// must parse them.
+    #[test]
+    fn deviceinfo_response_parses_devicename() {
+        let body = "<Response CmdType=\"DeviceInfo\" SN=\"1\"><DeviceID>34020000012000000001</DeviceID><Result>OK</Result><DeviceName>Conformance Cam</DeviceName><Manufacturer>MiBee</Manufacturer><Model>loopback</Model><Firmware>1.0</Firmware></Response>";
+        let info: DeviceItem = serde_xml_rs::from_str(strip_xml_decl(body))
+            .expect("flat A.2.6.5 DeviceInfo response must parse");
+        assert_eq!(info.device_id, "34020000012000000001");
+        assert_eq!(info.name, "Conformance Cam");
+        assert_eq!(info.manufacturer, "MiBee");
+        assert_eq!(info.model, "loopback");
+        assert_eq!(info.firmware, "1.0");
     }
 }
