@@ -11,7 +11,23 @@ released out of band.
 
 ## [Unreleased]
 
+### Added
+
+- **Catalog items can advertise PTZ capability** — `ChannelItem.ptz_type`
+  and the `Gb28181Config.ptz_type` / `CatalogChannel.ptz_type` feeds emit
+  the optional `<PTZType>` element (GB/T 28181-2016 §5.4.12; 3 =
+  pan/tilt/zoom). Platforms gate PTZCmd dispatch on a non-zero value, so
+  hosts steering an external PTZ head are now visible to them (#104).
+  `None` (the default) omits the element — historical wire format
+  byte-identical.
+
 ### Fixed
+
+- **`<PTZType>` now actually reaches the wire** — both XML builders
+  assemble items with `format!`, not serde, so the #104 field never
+  appeared in catalog responses nor catalog-change NOTIFYs until the
+  template paths threaded it through (#105); pinned by tests on the
+  hand-assembled body itself.
 
 - **GB2312-declared MANSCDP bodies were refused by every parser route** —
   a real GB/T 28181-2011 interop gap: the 2011 signaling charset is
