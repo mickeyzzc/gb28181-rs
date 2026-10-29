@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-259%20passing-brightgreen.svg)
 
 GB/T 28181-2011/2016/2022 **device-side (UAC)** library for Rust — register a camera or media source with a GB28181 SIP platform and stream to it. 2011-era platforms interoperate as-is: their signaling is a strict subset of what the device answers (per the GB/T 28181-2016 foreword's change list), GB2312-declared MANSCDP bodies — the 2011 signaling charset — parse on every route, and the INVITE answer SDP carries no 2016+ extensions (`f=`, TCP media); pinned by tests.
 
@@ -30,14 +30,14 @@ Hand-written SIP (no SIP framework), MANSCDP XML codec, RTP/PS media push, and a
 - **GB 35114 A-level security, both sides** *(opt-in, `gb35114` feature)* — device-side SM2-certificate mutual authentication over the REGISTER flow (`with_register_authenticator`) and platform-side challenge/verify/Note state machine (`security35114::Platform`); VKEK negotiation inside the `cryptkey` SM2 DER envelope, keyed-SM3 `Note`-header integrity; golden fixtures shared with the Go twin prove cross-implementation interop
 - **Reference segment format** — bare Annex-B H.264 + `.ts.jsonl` per-frame timestamp sidecar ([`segment`](src/segment.rs))
 
-Not included (by design): platform/UAS role, SIP over WebSocket, GB 35114 B/C levels (those require SVAC hardware media per GB/T 25724).
+Not included (by design): platform/UAS role, SIP over WebSocket, GB 35114 levels B/C (the [Go twin](https://github.com/mickeyzzc/gb28181-go) covers B/C in its PS-over-RTP software form — per-AU SM2 signatures and SM4-OFB media encryption; this crate stays at the A level; SVAC-native GB/T 25724 streams remain hardware territory either way).
 
 ## Usage
 
 ```toml
 [dependencies]
-gb28181-rs = "0.6.0"
-# git alternative: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.6.0" }
+gb28181-rs = "0.14"
+# git alternative: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.14.0" }
 ```
 
 The crate is transport- and storage-agnostic. Your host injects two seams:
@@ -101,11 +101,11 @@ Identity fields (all optional, all neutral by default — this library never adv
 
 ## GB35114 A-level security (v0.8.0 device / v0.9.0 platform, opt-in)
 
-[GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) layers SM2-certificate security on top of GB/T 28181. This crate implements **A-level** only — levels B/C additionally require SVAC media (GB/T 25724, a hardware codec), which is out of scope by design. Enable with the `gb35114` feature (needs Rust ≥ 1.85; the crate's MSRV stays 1.80 without it):
+[GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) layers SM2-certificate security on top of GB/T 28181. This crate implements **A-level**; the [Go twin](https://github.com/mickeyzzc/gb28181-go) additionally covers levels B/C in its PS-over-RTP software form (per-AU SM2 signatures, SM4-OFB media encryption). SVAC-native (GB/T 25724 hardware-codec) streams are out of scope for both. Enable with the `gb35114` feature (needs Rust ≥ 1.85; the crate's MSRV stays 1.80 without it):
 
 ```toml
 [dependencies]
-gb28181-rs = { version = "0.9", features = ["gb35114"] }
+gb28181-rs = { version = "0.14", features = ["gb35114"] }
 ```
 
 ```rust
@@ -153,9 +153,13 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 Topic guides live **in this repository**, bilingual:
 [`docs/README.md`](docs/README.md) is the index (`docs/en-US/` and
-`docs/zh-CN/` hold the pages — quickstart, architecture, protocol
-concepts, CLI manuals, testing). Fixes and new pages land
-here by PR.
+`docs/zh-CN/` hold the pages — quickstart, configuration reference,
+MANSCDP codec, PS muxing, live-streaming seam, recording/playback,
+server lifecycle). Fixes and new pages land here by PR. This crate
+ships no CLI — the [Go twin's](https://github.com/mickeyzzc/gb28181-go)
+`gb28181` CLI covers cross-language interop (its device-register
+subcommand speaks to any compliant platform, including this one's
+reference flows).
 ## Library hygiene (v0.6.0 hardening)
 
 v0.6.0 made the crate safe to embed as a neutral foundation library. The regression tests in [`tests/library_hygiene.rs`](tests/library_hygiene.rs) pin each guarantee:
@@ -206,7 +210,7 @@ cargo run --example manscdp_demo
 
 ## Development
 
-This project follows strict **TDD** — see [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `rustfmt`, `clippy -D warnings` (which also compiles the examples), and the full test suite (133 tests); `main` is protected (PR-only merges, CI required).
+This project follows strict **TDD** — see [CONTRIBUTING.md](CONTRIBUTING.md). CI enforces `rustfmt`, `clippy -D warnings` (which also compiles the examples), and the full test suite (259 tests); `main` is protected (PR-only merges, CI required).
 
 ## Status
 

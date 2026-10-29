@@ -60,6 +60,8 @@ let mut handle = Gb28181Server::start(config, au_hub, None).await?;
 `spawn()` 按 `config.transport` 分流：
 - **UDP**（默认）——bind `0.0.0.0:<local_sip_port>` UDP。
 - **TCP**——同端口起 TCP listener，逐连接处理带帧 SIP。
+- **tcp-out**——主动外拨平台，全注册生命周期走该出向连接，断线重拨（无监听）。
+- **tls / tls-listen**（`tls` feature）——SIPS：出向 TLS 拨接或同端口 TLS 监听；材料经 `tls_*` 配置项。
 
 ## 服务器在跑什么
 

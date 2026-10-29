@@ -11,6 +11,8 @@ released out of band.
 
 ## [Unreleased]
 
+## [v0.14.0] — 2026-10-27
+
 ### Added
 
 - **Catalog items can advertise PTZ capability** — `ChannelItem.ptz_type`
