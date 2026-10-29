@@ -538,7 +538,7 @@ dependencies = [
 
 [[package]]
 name = "gb28181-rs"
-version = "0.13.1"
+version = "0.14.0"
 dependencies = [
  "anyhow",
  "base64",

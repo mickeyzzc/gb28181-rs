@@ -61,6 +61,10 @@ let mut handle = Gb28181Server::start(config, au_hub, None).await?;
 - **UDP** (default) — binds `0.0.0.0:<local_sip_port>` UDP.
 - **TCP** — binds a TCP listener on the same port and handles framed SIP
   per connection.
+- **tcp-out** — dials the platform with the full REGISTER lifecycle over
+  the outbound connection and re-dials on drop (no listener).
+- **tls** / **tls-listen** (`tls` feature) — SIPS: outbound TLS dial or a
+  TLS listener on the same port; material via the `tls_*` config fields.
 
 ## What the server runs
 

@@ -31,17 +31,27 @@ config.transport = Transport::Tcp;
 | `device_id` | `String` | `"34020000001320000001"` | 20 位国标设备 ID（规范文档示例值）。 |
 | `channel_id` | `String` | `"34020000001320000001"` | 目录中上报的 20 位通道 ID。 |
 | `sip_domain` | `String` | `"3402000000"` | SIP 域（通常是平台中心编码）。 |
-| `password` | `String` | `"mibeecam2026"` | 与平台约定的 SIP 摘要认证密码。 |
+| `password` | `String` | `""` (empty) | 与平台约定的 SIP 摘要认证密码。 |
 | `local_sip_port` | `u16` | `5060` | 本地 SIP 监听端口（UDP socket 或 TCP listener）。 |
 | `register_interval_secs` | `u64` | `60` | REGISTER 刷新间隔。 |
 | `heartbeat_interval_secs` | `u64` | `60` | 保活（MESSAGE）间隔。 |
 | `heartbeat_timeout_count` | `u32` | `3` | 平台侧判定离线的连续丢保活次数。 |
-| `transport` | `Transport` | `Udp` | `udp` 或 `tcp`（serde 小写；未知值直接解析报错）。 |
+| `transport` | `Transport` | `Udp` | `udp` / `tcp` / `tcp-out` / `tls` / `tls-listen` 五选一（serde 小写；`tls` 系需要 `tls` feature；未知值解析报错）。 |
 | `user_agent` | `Option<String>` | `None` | SIP `User-Agent`；`None` → 中性 `gb28181-rs/<版本>`。 |
 | `device_name` | `Option<String>` | `None` | 目录/DeviceInfo 名称；`None` → `Camera <设备ID>`。 |
 | `manufacturer` | `Option<String>` | `None` | `None` → `Unknown`。 |
 | `model` | `Option<String>` | `None` | `None` → `Unknown`。 |
 | `firmware` | `Option<String>` | `None` | `None` → crate 版本号。 |
+| `ptz_type` | `Option<u8>` | `None` | GB/T 28181-2016 §5.4.12 云台能力码（3=水平/垂直/变焦），作为通道 `<PTZType>` 发射；`None` 省略该元素。 |
+| `extra_channels` | `Vec<CatalogChannel>` | `[]` | 额外目录通道（A.2.1）——设备自身条目排首；大列表自动分页。 |
+| `multicast_ttl` | `u32` | `1` | 组播媒体发送的 IP TTL（`c=` 为组地址时）。 |
+| `protocol_version` | `Option<String>` | `None` | X-GB-Ver 协议版本标识（附录 I；如 2022 填 "3.0"）。`None` 不带头。 |
+| `incoming_note_policy` | `IncomingNotePolicy` | `Reject` | GB35114 下行 `Note` 验证姿态：`Reject`（坏签名 403）/ `Warn` / `Off`。 |
+| `video_param_opt_download_speed` | `String` | `""` | ConfigDownload `VideoParamOpt` 块："/" 分隔的下载倍速。 |
+| `video_param_opt_resolution` | `String` | `""` | ConfigDownload `VideoParamOpt` 块："/" 分隔的支持分辨率。 |
+| `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `String` | `""` | TLS 传输材料（`tls`/`tls-listen`）；空=按 tls 指南的缺省。 |
+| `tls_insecure_skip_verify` | `bool` | `false` | 跳过服务器证书校验（联调/排障用）。 |
+| `strict_example_defaults` | `bool` | `false` | 把示例值警告升级为硬错误。 |
 
 等价的 TOML 配置节：
 

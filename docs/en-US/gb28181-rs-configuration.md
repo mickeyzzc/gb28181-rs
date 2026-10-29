@@ -32,17 +32,27 @@ config.transport = Transport::Tcp;
 | `device_id` | `String` | `"34020000001320000001"` | 20-digit GB/T 28181 device ID (spec-example default). |
 | `channel_id` | `String` | `"34020000001320000001"` | 20-digit channel ID reported in the catalog. |
 | `sip_domain` | `String` | `"3402000000"` | SIP domain (usually the platform's center code). |
-| `password` | `String` | `"mibeecam2026"` | SIP digest-auth password shared with the platform. |
+| `password` | `String` | `""` (empty) | SIP digest-auth password shared with the platform. |
 | `local_sip_port` | `u16` | `5060` | Local SIP listening port (UDP socket or TCP listener). |
 | `register_interval_secs` | `u64` | `60` | REGISTER refresh interval. |
 | `heartbeat_interval_secs` | `u64` | `60` | Keepalive (MESSAGE) interval. |
 | `heartbeat_timeout_count` | `u32` | `3` | Missed keepalives before the platform declares timeout. |
-| `transport` | `Transport` | `Udp` | `udp` or `tcp` (serde is lowercase; unknown values are parse errors). |
+| `transport` | `Transport` | `Udp` | one of `udp` / `tcp` / `tcp-out` / `tls` / `tls-listen` (serde lowercase; the `tls` variants need the `tls` feature; unknown values are parse errors). |
 | `user_agent` | `Option<String>` | `None` | SIP `User-Agent`; `None` → neutral `gb28181-rs/<version>`. |
 | `device_name` | `Option<String>` | `None` | Catalog/DeviceInfo name; `None` → `Camera <device_id>`. |
 | `manufacturer` | `Option<String>` | `None` | `None` → `Unknown`. |
 | `model` | `Option<String>` | `None` | `None` → `Unknown`. |
 | `firmware` | `Option<String>` | `None` | `None` → the crate version. |
+| `ptz_type` | `Option<u8>` | `None` | GB/T 28181-2016 §5.4.12 PTZ capability code (3 = pan/tilt/zoom) emitted as the channel's `<PTZType>`; `None` omits the element. |
+| `extra_channels` | `Vec<CatalogChannel>` | `[]` | Additional catalog channels (A.2.1) — the device's own entry rides first; large lists page across MESSAGEs. |
+| `multicast_ttl` | `u32` | `1` | IP TTL for multicast media sends (group-address `c=` destinations). |
+| `protocol_version` | `Option<String>` | `None` | X-GB-Ver protocol-version identification (Annex I; e.g. "3.0" for 2022). `None` omits the header. |
+| `incoming_note_policy` | `IncomingNotePolicy` | `Reject` | GB35114 downstream `Note` verification posture: `Reject` (403 on bad signature), `Warn`, `Off`. |
+| `video_param_opt_download_speed` | `String` | `""` | ConfigDownload `VideoParamOpt` block: "/"-joined download speeds. |
+| `video_param_opt_resolution` | `String` | `""` | ConfigDownload `VideoParamOpt` block: "/"-joined supported resolutions. |
+| `tls_ca_file` / `tls_cert_file` / `tls_key_file` | `String` | `""` | TLS transport material (`tls`/`tls-listen`); empty = defaults per the tls guide. |
+| `tls_insecure_skip_verify` | `bool` | `false` | Skip server-certificate verification (interop/debug only). |
+| `strict_example_defaults` | `bool` | `false` | Turn the example-defaults warning into a hard error. |
 
 An equivalent TOML section:
 

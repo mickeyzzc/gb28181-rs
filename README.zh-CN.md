@@ -5,7 +5,7 @@
 [![CI](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/mickeyzzc/gb28181-rs/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Language: Rust](https://img.shields.io/badge/language-Rust-dea584.svg)
-![Tests](https://img.shields.io/badge/tests-133%20passing-brightgreen.svg)
+![Tests](https://img.shields.io/badge/tests-259%20passing-brightgreen.svg)
 
 **GB/T 28181-2011/2016/2022 设备端（UAC）Rust 库** —— 让摄像头或媒体源以国标方式注册到 SIP 平台并向其推流。2011 世代平台即插即用：其信令是设备应答集的严格子集（据 GB/T 28181-2016 前言官方变化清单），GB2312 声明的 MANSCDP 报文（2011 信令字符集）在全部路由可解析，INVITE 应答 SDP 不带任何 2016+ 扩展（`f=`、TCP 媒体）——均有测试钉板。
 
@@ -29,14 +29,14 @@
 - **GB 35114 A 级安全，设备/平台两侧**（可选，`gb35114` feature）—— 设备侧基于 SM2 数字证书的 REGISTER 双向认证（`with_register_authenticator`）+ 平台侧挑战/验签/Note 校验状态机（`security35114::Platform`）；`cryptkey` SM2 DER 信封内的 VKEK 协商、keyed-SM3 `Note` 头完整性；与 Go 孪生库共享 golden 夹具，证明跨实现互通
 - **参考录像段格式** —— 裸 Annex-B H.264 + 每帧 `.ts.jsonl` 时间戳 sidecar（见 [`segment`](src/segment.rs)）
 
-设计上不包含：平台端（UAS）角色、SIP over TLS/WebSocket、GB 35114 B/C 级（依赖 GB/T 25724 SVAC 硬件媒体）。
+设计上不包含：平台端（UAS）角色、SIP over WebSocket、GB 35114 B/C 级（[Go 孪生库](https://github.com/mickeyzzc/gb28181-go) 以 PS-over-RTP 软件形态覆盖 B/C——逐 AU SM2 签名与 SM4-OFB 媒体加密；本库保持 A 级；SVAC 原生 GB/T 25724 流两侧均属硬件领域）。
 
 ## 使用
 
 ```toml
 [dependencies]
-gb28181-rs = "0.6.0"
-# git 替代方式: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.6.0" }
+gb28181-rs = "0.14"
+# git 替代方式: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.14.0" }
 ```
 
 本 crate 与采集、存储实现解耦，宿主注入两个接缝：
@@ -100,11 +100,11 @@ async fn main() -> anyhow::Result<()> {
 
 ## GB35114 A 级安全（v0.8.0 设备侧 / v0.9.0 平台侧，可选）
 
-[GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) 在 GB/T 28181 之上叠加基于 SM2 数字证书的安全层。本库只实现 **A级** —— B/C 级额外依赖 SVAC 媒体（GB/T 25724，硬件编解码器），设计上不在范围内。通过 `gb35114` feature 开启（需要 Rust ≥ 1.85；不开 feature 时 crate 的 MSRV 仍为 1.80）：
+[GB 35114-2017](https://openstd.samr.gov.cn/bzgk/std/newGbInfo?hcno=B7F5589329EF98B32F0EB8ACEC341C81) 在 GB/T 28181 之上叠加基于 SM2 数字证书的安全层。本库实现 **A级**；[Go 孪生库](https://github.com/mickeyzzc/gb28181-go) 另以 PS-over-RTP 软件形态覆盖 B/C 级（逐 AU SM2 签名、SM4-OFB 媒体加密）。SVAC 原生（GB/T 25724 硬件编码器）流两侧均不在范围。通过 `gb35114` feature 开启（需要 Rust ≥ 1.85；不开 feature 时 crate 的 MSRV 仍为 1.80）：
 
 ```toml
 [dependencies]
-gb28181-rs = { version = "0.9", features = ["gb35114"] }
+gb28181-rs = { version = "0.14", features = ["gb35114"] }
 ```
 
 ```rust
@@ -152,8 +152,11 @@ platform.verify_note(&device_id, &note, "MESSAGE", &from, &to, &call_id, &date, 
 
 主题手册**就在本仓库内**，双语：
 [`docs/README.md`](docs/README.md) 是索引（`docs/en-US/` 与
-`docs/zh-CN/` 存放各页——快速开始、架构、协议概念、CLI 手册、测试）。
-修订与新页以 PR 落本仓。
+`docs/zh-CN/` 存放各页——快速开始、配置参考、MANSCDP 编解码、PS 封装、
+直播接缝、录像回放、服务器生命周期）。修订与新页以 PR 落本仓。本 crate
+不附带 CLI——跨语言互操作用 [Go 孪生库](https://github.com/mickeyzzc/gb28181-go)
+的 `gb28181` CLI（其 device-register 子命令可对接任何合规平台，含本库的
+参考流程）。
 ## 库卫生（v0.6.0 加固）
 
 v0.6.0 把本 crate 打磨为可放心嵌入的中性基础库。[`tests/library_hygiene.rs`](tests/library_hygiene.rs) 中的回归测试逐条锁定以下保证：
@@ -207,7 +210,7 @@ cargo run --example manscdp_demo
 
 ## 状态
 
-v0.6.0 —— API 面（`FrameSource`、`RecordingSource`、配置）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 国标平台生产验证。
+v0.14.0 —— API 面（`FrameSource`、`RecordingSource`、配置）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 国标平台生产验证。
 
 ## 许可
 
