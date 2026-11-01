@@ -166,6 +166,18 @@ pub struct ChannelItem {
     /// the element — historical deployments stay byte-identical.
     #[serde(rename = "PTZType", default, skip_serializing_if = "Option::is_none")]
     pub ptz_type: Option<u8>,
+    /// GB/T 28181-2022 光电成像类型 marking: 1 = visible light, 2 = thermal
+    /// imaging — dual-spectrum devices (thermal + visible-light lenses, one
+    /// SIP device) mark their thermal channel so a platform can tell it
+    /// from the visible-light sibling without probing. Values reserved by
+    /// the standard pass through verbatim (no enum validation); `None`
+    /// omits the element — pre-2022 wire bytes stay unchanged.
+    #[serde(
+        rename = "PhotoelectricImagingType",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub photoelectric_imaging_type: Option<u8>,
 }
 
 /// DeviceItem — for DeviceInfo response. The name element is DeviceName
@@ -2366,6 +2378,7 @@ mod tests {
             longitude: 121.4737,
             latitude: 31.2304,
             ptz_type: None,
+            photoelectric_imaging_type: None,
         };
 
         let xml = serde_xml_rs::to_string(&item).unwrap();
@@ -2397,6 +2410,7 @@ mod tests {
             longitude: 121.4737,
             latitude: 31.2304,
             ptz_type: None,
+            photoelectric_imaging_type: None,
         };
 
         let none_xml = serde_xml_rs::to_string(&base).unwrap();
@@ -2410,6 +2424,62 @@ mod tests {
         // Round-trip: the element parses back into the field.
         let parsed: ChannelItem = serde_xml_rs::from_str(&some_xml).unwrap();
         assert_eq!(parsed.ptz_type, Some(3));
+    }
+
+    /// PhotoelectricImagingType (GB/T 28181-2022 光电成像类型):
+    /// 1 = visible light, 2 = thermal imaging — dual-spectrum devices
+    /// mark their thermal channel so a platform can tell it from the
+    /// visible-light sibling without probing. Values reserved by the
+    /// standard pass through verbatim; `None` omits the element so
+    /// pre-2022 wire bytes stay unchanged (twin: gb28181-go #162).
+    #[test]
+    fn test_channel_item_photoelectric_imaging_type() {
+        let mut base = ChannelItem {
+            device_id: "31011500991320000001".to_string(),
+            name: "thermal".to_string(),
+            manufacturer: "MiBee".to_string(),
+            model: "Mibee-Cam-01".to_string(),
+            owner: "Admin".to_string(),
+            civil_code: "310115".to_string(),
+            address: "Test Location".to_string(),
+            parental: 0,
+            parent_id: "31011500991320000000".to_string(),
+            safety_way: 0,
+            register_way: 1,
+            secrecy: 0,
+            status: "ON".to_string(),
+            ip_address: "192.168.1.100".to_string(),
+            port: 5060,
+            longitude: 121.4737,
+            latitude: 31.2304,
+            ptz_type: None,
+            photoelectric_imaging_type: None,
+        };
+
+        // None omits the element — unmarked items stay byte-identical.
+        let none_xml = serde_xml_rs::to_string(&base).unwrap();
+        assert!(!none_xml.contains("PhotoelectricImagingType"), "{none_xml}");
+
+        // The marking rides after PTZType (element-order contract).
+        base.ptz_type = Some(3);
+        base.photoelectric_imaging_type = Some(2);
+        let some_xml = serde_xml_rs::to_string(&base).unwrap();
+        assert!(
+            some_xml.contains(
+                "<PTZType>3</PTZType><PhotoelectricImagingType>2</PhotoelectricImagingType>"
+            ),
+            "{some_xml}"
+        );
+
+        // Round-trip + reserved values pass through verbatim (no enum
+        // validation — 9 is not defined by the standard but must parse).
+        let parsed: ChannelItem = serde_xml_rs::from_str(&some_xml).unwrap();
+        assert_eq!(parsed.photoelectric_imaging_type, Some(2));
+        let mut reserved = base.clone();
+        reserved.photoelectric_imaging_type = Some(9);
+        let reserved_xml = serde_xml_rs::to_string(&reserved).unwrap();
+        let parsed9: ChannelItem = serde_xml_rs::from_str(&reserved_xml).unwrap();
+        assert_eq!(parsed9.photoelectric_imaging_type, Some(9));
     }
 
     #[test]

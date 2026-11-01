@@ -2471,6 +2471,7 @@ impl Gb28181Server {
                     longitude: 0.0,
                     latitude: 0.0,
                     ptz_type: self.config.ptz_type,
+                    photoelectric_imaging_type: self.config.photoelectric_imaging_type,
                 }];
                 for extra in &self.config.extra_channels {
                     channels.push(ChannelItem {
@@ -2492,6 +2493,7 @@ impl Gb28181Server {
                         longitude: 0.0,
                         latitude: 0.0,
                         ptz_type: extra.ptz_type,
+                        photoelectric_imaging_type: extra.photoelectric_imaging_type,
                     });
                 }
                 // One page per RESPONSE_PAGE_ITEMS items, SumNum = total.
@@ -8923,6 +8925,7 @@ mod tcp_media_tests {
                 model: String::new(),
                 status: String::new(),
                 ptz_type: None,
+                photoelectric_imaging_type: None,
             });
         }
         let config = Gb28181Config {

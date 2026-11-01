@@ -56,6 +56,11 @@ pub struct CatalogChannel {
     /// `None` omits the element from the catalog response.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ptz_type: Option<u8>,
+    /// GB/T 28181-2022 光电成像类型 marking: 1 = visible light, 2 = thermal
+    /// imaging — set 2 on a thermal channel so platforms can tell it from
+    /// the visible-light sibling without probing. `None` omits the element.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photoelectric_imaging_type: Option<u8>,
 }
 
 impl CatalogChannel {
@@ -173,6 +178,12 @@ pub struct Gb28181Config {
     /// omits the element (no PTZ).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ptz_type: Option<u8>,
+    /// 光电成像类型 advertised for the device's own catalog entry
+    /// (GB/T 28181-2022: 1 = visible light, 2 = thermal imaging).
+    /// Dual-spectrum hosts set 2 when the device itself is the thermal
+    /// channel; `None` omits the element.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub photoelectric_imaging_type: Option<u8>,
 }
 
 impl Gb28181Config {
@@ -342,6 +353,7 @@ impl Default for Gb28181Config {
             video_param_opt_download_speed: String::new(),
             video_param_opt_resolution: String::new(),
             ptz_type: None,
+            photoelectric_imaging_type: None,
         }
     }
 }
@@ -408,6 +420,36 @@ mod tests {
         assert_eq!(d.manufacturer, None);
         assert_eq!(d.model, None);
         assert_eq!(d.firmware, None);
+    }
+
+    /// PhotoelectricImagingType (GB/T 28181-2022) parses from TOML on both
+    /// the device's own entry and the extra channels; unset omits the
+    /// catalog element (twin: gb28181-go #162).
+    #[test]
+    fn photoelectric_imaging_type_parses() {
+        let cfg: Gb28181Config = toml::from_str(
+            r#"
+photoelectric_imaging_type = 2
+
+[[extra_channels]]
+device_id = "34020000001320000002"
+name = "thermal-ch2"
+photoelectric_imaging_type = 2
+
+[[extra_channels]]
+device_id = "34020000001320000003"
+name = "visible-ch3"
+photoelectric_imaging_type = 1
+"#,
+        )
+        .expect("parse");
+        assert_eq!(cfg.photoelectric_imaging_type, Some(2));
+        assert_eq!(cfg.extra_channels[0].photoelectric_imaging_type, Some(2));
+        assert_eq!(cfg.extra_channels[1].photoelectric_imaging_type, Some(1));
+
+        // Absent keys default to None (element omitted on the wire).
+        let bare: Gb28181Config = toml::from_str("").expect("bare");
+        assert_eq!(bare.photoelectric_imaging_type, None);
     }
 
     /// The SIP password must NOT default to a credential: an unset
