@@ -331,7 +331,7 @@ impl DeviceNotifier {
                      <Model>{}</Model><Owner>{}</Owner><CivilCode>{}</CivilCode><Address>{}</Address>\
                      <Parental>{}</Parental><ParentID>{}</ParentID><SafetyWay>{}</SafetyWay>\
                      <RegisterWay>{}</RegisterWay><Secrecy>{}</Secrecy><Status>{}</Status>\
-                     <IPAddress>{}</IPAddress><Port>{}</Port><Longitude>{}</Longitude><Latitude>{}</Latitude>{}</Item>",
+                     <IPAddress>{}</IPAddress><Port>{}</Port><Longitude>{}</Longitude><Latitude>{}</Latitude>{}{}</Item>",
                     crate::client::xml_escape(&it.device_id),
                     crate::client::xml_escape(&it.name),
                     crate::client::xml_escape(&it.manufacturer),
@@ -351,6 +351,9 @@ impl DeviceNotifier {
                     it.latitude,
                     it.ptz_type
                         .map(|v| format!("<PTZType>{v}</PTZType>"))
+                        .unwrap_or_default(),
+                    it.photoelectric_imaging_type
+                        .map(|v| format!("<PhotoelectricImagingType>{v}</PhotoelectricImagingType>"))
                         .unwrap_or_default(),
                 )
             })
@@ -572,6 +575,7 @@ mod tests {
             longitude: 0.0,
             latitude: 0.0,
             ptz_type: None,
+            photoelectric_imaging_type: None,
         };
         assert!(n.send_catalog_change(&[item]));
         let text = recv_text(&platform);
@@ -583,6 +587,50 @@ mod tests {
         assert!(
             text.contains("<DeviceID>34020000001320000001</DeviceID><Name>cam</Name>"),
             "{text}"
+        );
+    }
+
+    /// PhotoelectricImagingType (GB/T 28181-2022) rides the catalog-change
+    /// NOTIFY item after PTZType and stays absent when unset — unmarked
+    /// channels keep pre-2022 wire bytes unchanged (twin: gb28181-go #162).
+    #[test]
+    fn catalog_change_notify_photoelectric_marking() {
+        let (n, _sip, platform, peer) = bound_notifier();
+        book(&n, SubscribeEvent::Catalog, 3600, peer);
+        let mut item = crate::manscdp::ChannelItem {
+            device_id: "34020000001320000002".to_string(),
+            name: "thermal".to_string(),
+            manufacturer: "MiBee".to_string(),
+            model: "X".to_string(),
+            owner: String::new(),
+            civil_code: String::new(),
+            address: String::new(),
+            parental: 0,
+            parent_id: "34020000002000000001".to_string(),
+            safety_way: 0,
+            register_way: 1,
+            secrecy: 0,
+            status: "ON".to_string(),
+            ip_address: "127.0.0.1".to_string(),
+            port: 5060,
+            longitude: 0.0,
+            latitude: 0.0,
+            ptz_type: None,
+            photoelectric_imaging_type: None,
+        };
+        assert!(n.send_catalog_change(&[item.clone()]));
+        let plain = recv_text(&platform);
+        assert!(!plain.contains("PhotoelectricImagingType"), "{plain}");
+
+        item.ptz_type = Some(3);
+        item.photoelectric_imaging_type = Some(2);
+        assert!(n.send_catalog_change(&[item]));
+        let marked = recv_text(&platform);
+        assert!(
+            marked.contains(
+                "<PTZType>3</PTZType><PhotoelectricImagingType>2</PhotoelectricImagingType>"
+            ),
+            "{marked}"
         );
     }
 

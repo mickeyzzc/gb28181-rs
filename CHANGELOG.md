@@ -11,6 +11,20 @@ released out of band.
 
 ## [Unreleased]
 
+### Added
+
+- **Catalog items can carry the 2022 光电成像类型 marking** —
+  `ChannelItem.photoelectric_imaging_type` and the
+  `Gb28181Config.photoelectric_imaging_type` /
+  `CatalogChannel.photoelectric_imaging_type` feeds emit the optional
+  `<PhotoelectricImagingType>` element (GB/T 28181-2022: 1 = visible
+  light, 2 = thermal imaging). Dual-spectrum devices (thermal +
+  visible-light lenses, one SIP device) mark their thermal channel so a
+  platform can tell it from the visible-light sibling without probing;
+  values reserved by the standard pass through verbatim (no enum
+  validation). `None` (the default) omits the element — pre-2022 wire
+  bytes unchanged. Twin of gb28181-go #162 (issue #161).
+
 ## [v0.14.0] — 2026-10-27
 
 ### Added
