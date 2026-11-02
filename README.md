@@ -37,7 +37,7 @@ Not included (by design): platform/UAS role, SIP over WebSocket, GB 35114 levels
 ```toml
 [dependencies]
 gb28181-rs = "0.14"
-# git alternative: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.14.0" }
+# git alternative: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.14.1" }
 ```
 
 The crate is transport- and storage-agnostic. Your host injects two seams:

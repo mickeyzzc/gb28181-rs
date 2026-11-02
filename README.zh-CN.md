@@ -36,7 +36,7 @@
 ```toml
 [dependencies]
 gb28181-rs = "0.14"
-# git 替代方式: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.14.0" }
+# git 替代方式: gb28181-rs = { git = "https://github.com/mickeyzzc/gb28181-rs.git", tag = "v0.14.1" }
 ```
 
 本 crate 与采集、存储实现解耦，宿主注入两个接缝：
@@ -210,7 +210,7 @@ cargo run --example manscdp_demo
 
 ## 状态
 
-v0.14.0 —— API 面（`FrameSource`、`RecordingSource`、配置）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 国标平台生产验证。
+v0.14.1 —— API 面（`FrameSource`、`RecordingSource`、配置）趋于稳定但尚未冻结。在 [Mi-Bee Studio](https://github.com/Mi-Bee-Studio) 每日对 MiBee NVR 国标平台生产验证。
 
 ## 许可
 
