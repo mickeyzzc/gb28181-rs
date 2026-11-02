@@ -11,6 +11,8 @@ released out of band.
 
 ## [Unreleased]
 
+## [v0.14.1] — 2026-11-02
+
 ### Added
 
 - **Catalog items can carry the 2022 光电成像类型 marking** —
