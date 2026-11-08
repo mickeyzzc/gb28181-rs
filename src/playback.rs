@@ -489,7 +489,7 @@ mod tests {
     }
 
     fn has_psm(packet: &[u8]) -> bool {
-        packet.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xBB])
+        packet.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xBC])
     }
 
     fn has_nalu(packet: &[u8], nalu: &[u8]) -> bool {

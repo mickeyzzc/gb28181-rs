@@ -36,7 +36,7 @@ fn golden_keyframe_matches_go_twin() {
     let idr: Vec<u8> = vec![0x65, 0x88, 0x84, 0x00, 0x4B, 0x00, 0x01, 0x00];
     let ps = mux_h264_to_ps(&[&sps, &pps, &idr], true, 90_000, 90_000);
 
-    const GOLDEN: &str = "000001ba440016fc8401009c43f8000001bb000b01000000041be000000000000001e0002bc00a310005bf21110005bf21000000000167428028da01e00800000168ce3c80000001658884004b000100";
+    const GOLDEN: &str = "000001ba440016fc8401009c43f8000001bc000ee0ff000000041be0000032141109000001e0002b80c00a310005bf21110005bf210000000167428028da01e00800000168ce3c80000001658884004b000100";
     assert_eq!(hex(&ps), GOLDEN);
 }
 
@@ -46,13 +46,14 @@ fn golden_pframe_matches_go_twin() {
     let idr: Vec<u8> = vec![0x65, 0x88, 0x84, 0x00, 0x4B, 0x00, 0x01, 0x00];
     let ps = mux_h264_to_ps(&[&idr], false, 180_000, 180_000);
 
-    const GOLDEN: &str = "000001ba44002df90401009c43f8000001e00019c00a31000b7e4111000b7e410000000001658884004b000100";
+    const GOLDEN: &str = "000001ba44002df90401009c43f8000001e0001980c00a31000b7e4111000b7e4100000001658884004b000100";
     assert_eq!(hex(&ps), GOLDEN);
 }
 
 /// Large (200KB) access unit — the split structure must match the Go twin:
 /// total length, the declared PES_packet_length of every chunk, and the
-/// continuation-PES header shape (no timestamps, zero hdrlen, gap byte).
+/// continuation-PES header shape (no timestamps, zero hdrlen, standard
+/// 3-byte header).
 #[test]
 fn golden_large_au_split_matches_go_twin() {
     let mut idr = vec![0x65u8];
@@ -83,19 +84,19 @@ fn golden_large_au_split_matches_go_twin() {
         "per-chunk PES_packet_length"
     );
 
-    // First PES carries PTS+DTS: flags 0xC0, hdrlen 0x0A, PTS prefix 0x31.
+    // First PES carries PTS+DTS: '10' byte 0x80, flags 0xC0, hdrlen 0x0A,
+    // PTS prefix 0x31.
     assert_eq!(
         chunks[0].1,
-        [0x00, 0x00, 0x01, 0xE0, 0xFD, 0xF5, 0xC0, 0x0A, 0x31]
+        [0x00, 0x00, 0x01, 0xE0, 0xFD, 0xF5, 0x80, 0xC0, 0x0A]
     );
-    // Continuation PES: flags 0x00, hdrlen 0x00, gap 0x00 (zero hdrlen also
-    // reads correctly at the standard byte-8 position).
+    // Continuation PES: '10' byte 0x80, flags 0x00, hdrlen 0x00.
     for c in &chunks[1..3] {
-        assert_eq!(c.1, [0x00, 0x00, 0x01, 0xE0, 0xFD, 0xEB, 0x00, 0x00, 0x00]);
+        assert_eq!(c.1, [0x00, 0x00, 0x01, 0xE0, 0xFD, 0xEB, 0x80, 0x00, 0x00]);
     }
     assert_eq!(
         chunks[3].1,
-        [0x00, 0x00, 0x01, 0xE0, 0x13, 0x8F, 0x00, 0x00, 0x00]
+        [0x00, 0x00, 0x01, 0xE0, 0x13, 0x8F, 0x80, 0x00, 0x00]
     );
 }
 
