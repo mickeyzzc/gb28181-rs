@@ -152,13 +152,19 @@ pub fn parse_pes_packet(data: &[u8]) -> Result<(PesPacket, usize)> {
 
     if (0xC0..=0xEF).contains(&stream_id) {
         // Audio (0xC0-0xDF) or Video (0xE0-0xEF) stream
-        if offset + 2 > data.len() {
+        //
+        // Standard header layout (§2.4.3.6): byte 6 is the '10' flags byte
+        // (scrambling/alignment/copyright), byte 7 carries PTS_DTS_flags in
+        // its top bits, byte 8 is PES_header_data_length. The pre-#111 reader
+        // took flags/hdrlen from bytes 6/7 — the muxer's legacy layout — and
+        // misparsed every standard stream (real cameras, psmux output).
+        if offset + 3 > data.len() {
             bail!("PES packet truncated at optional header fields");
         }
 
-        let pes_header_flags = data[offset];
-        let pes_header_length = data[offset + 1] as usize;
-        offset += 2;
+        let pes_header_flags = data[offset + 1];
+        let pes_header_length = data[offset + 2] as usize;
+        offset += 3;
 
         if offset + pes_header_length > data.len() {
             bail!("PES packet truncated: optional header length exceeds data");
@@ -417,16 +423,17 @@ pub fn build_ps_pack_header(scr: u64, mux_rate: u32) -> Vec<u8> {
 
 /// Build a Program Stream Map (PSM).
 ///
-/// Returns the PSM bytes including the program_stream_map_start_code (0x00 0x00 0x01 0xBB).
+/// Returns the PSM bytes including the program_stream_map_start_code (0x00 0x00 0x01 0xBC).
 ///
 /// # Format
-/// - Start code: 0x00 0x00 0x01 0xBB
-/// - Length: 2 bytes (total length after start code)
-/// - Version: 1 byte (current_next_indicator + version)
+/// - Start code: 0x00 0x00 0x01 0xBC
+/// - Length: 2 bytes (bytes after the length field)
+/// - Version: 2 bytes (current_next_indicator+reserved+version = 0xE0, then
+///   reserved+marker = 0xFF)
 /// - program_stream_info_length: 2 bytes (0 for no program stream info)
 /// - elementary_stream_map_length: 2 bytes
 /// - Stream entry: 4 bytes (stream_type + elementary_stream_id + es_info_length)
-/// - CRC: 2 bytes (CRC32 truncated to 16 bits; GB28181 platforms tolerate it)
+/// - CRC_32: 4 bytes (CRC-32/MPEG-2 over everything after the length field)
 ///
 /// Reference: ISO/IEC 13818-1 §2.5.3.5
 pub fn build_program_stream_map() -> Vec<u8> {
@@ -434,33 +441,50 @@ pub fn build_program_stream_map() -> Vec<u8> {
 }
 
 /// Build a Program Stream Map declaring the given elementary-stream type.
-/// `STREAM_TYPE_H264` (0x1B) keeps the historical wire bytes; H.265 devices
-/// declare `STREAM_TYPE_H265` (0x24, GB/T 28181-2022).
+/// `STREAM_TYPE_H264` (0x1B); H.265 devices declare `STREAM_TYPE_H265`
+/// (0x24, GB/T 28181-2022).
 pub fn build_program_stream_map_for(stream_type: u8) -> Vec<u8> {
-    let mut psm = vec![0x00, 0x00, 0x01, 0xBB]; // program_stream_map_start_code
-
-    // Length = bytes after the length field: version(1) + program_stream_info_length(2)
-    // + elementary_stream_map_length(2) + stream entry(4) + truncated CRC(2)
-    let length: u16 = 11;
-
-    psm.extend_from_slice(&length.to_be_bytes());
-    psm.push(0x01); // current_next_indicator = 1, version = 0
+    let mut body = Vec::with_capacity(14);
+    // current_next_indicator(1)=1 + reserved(2)=11 + version(5)=00000 → 0xE0,
+    // then reserved(7)=1111111 + marker(1)=1 → 0xFF (§2.5.3.5).
+    body.extend_from_slice(&[0xE0, 0xFF]);
 
     // program_stream_info_length = 0 (no program stream info)
-    psm.extend_from_slice(&0x00u16.to_be_bytes());
+    body.extend_from_slice(&0x00u16.to_be_bytes());
 
     // elementary_stream_map_length = 4 (one stream entry: stream_type(1) + stream_id(1) + es_info_length(2) = 4)
-    psm.extend_from_slice(&4u16.to_be_bytes());
+    body.extend_from_slice(&4u16.to_be_bytes());
 
-    // Stream entry: H.264 video
-    psm.push(stream_type); // stream_type: H.264 (0x1B) / H.265 (0x24)
-    psm.push(0xE0); // elementary_stream_id: video
-    psm.extend_from_slice(&0x00u16.to_be_bytes()); // es_info_length = 0
+    // Stream entry: video
+    body.push(stream_type); // stream_type: H.264 (0x1B) / H.265 (0x24)
+    body.push(0xE0); // elementary_stream_id: video
+    body.extend_from_slice(&0x00u16.to_be_bytes()); // es_info_length = 0
 
-    // CRC32 truncated to 16 bits (GB28181 platforms tolerate a truncated CRC)
-    psm.extend_from_slice(&[0x00, 0x00]);
+    // CRC_32 over everything after the length field (§2.5.3.5, Annex A)
+    body.extend_from_slice(&crc32_mpeg2(&body).to_be_bytes());
 
+    let mut psm = vec![0x00, 0x00, 0x01, 0xBC]; // program_stream_map_start_code
+    psm.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    psm.extend_from_slice(&body);
     psm
+}
+
+/// CRC-32/MPEG-2 (poly 0x04C11DB7, init all-ones, no reflection, no final
+/// xor) — the algorithm the PSM CRC_32 field specifies (ISO/IEC 13818-1
+/// Annex A).
+fn crc32_mpeg2(data: &[u8]) -> u32 {
+    let mut crc: u32 = 0xFFFF_FFFF;
+    for &byte in data {
+        crc ^= u32::from(byte) << 24;
+        for _ in 0..8 {
+            crc = if crc & 0x8000_0000 != 0 {
+                (crc << 1) ^ 0x04C1_1DB7
+            } else {
+                crc << 1
+            };
+        }
+    }
+    crc
 }
 
 /// Encode PTS or DTS into 5 bytes per ISO/IEC 13818-1 2.4.3.7.
@@ -491,7 +515,8 @@ fn encode_pts_dts(value: u64, prefix: u8) -> [u8; 5] {
 /// - Start code prefix: 0x00 0x00 0x01
 /// - Stream ID: 1 byte (0xE0 for video)
 /// - Packet length: 2 bytes (0 if unbounded)
-/// - Header: 2 bytes (flags + header_data_length) + optional PTS/DTS
+/// - Header: 3 bytes ('10' flags byte 0x80 + PTS_DTS_flags +
+///   header_data_length) + optional PTS/DTS, payload at 9+header_data_length
 /// - Payload: NAL units with Annex-B start codes
 ///
 /// Reference: ISO/IEC 13818-1 §2.4.3.6
@@ -531,9 +556,13 @@ pub fn build_pes_packet(
 
     pes.extend_from_slice(&packet_len.to_be_bytes());
 
-    // PES header flags byte (data[6]).
-    // Bits 7-6: PTS_DTS_flags ('00' none, '10' PTS only, '11' PTS+DTS).
-    // Bits 5-0: zero (no scrambling, no ESCR/ES_rate/DSM/CRC/extension flags).
+    // Standard 3-byte PES header (§2.4.3.6): the '10' flags byte first (no
+    // scrambling, no alignment/copyright/original flags), then PTS_DTS_flags
+    // (bits 7-6: '00' none, '10' PTS only, '11' PTS+DTS), then
+    // PES_header_data_length. The pre-#111 layout wrote the flags one byte
+    // early and compensated with a filler byte after the optional fields —
+    // byte count identical, but strict receivers (ffprobe/ZLMediaKit) read
+    // the header fields at the wrong offsets and reject the packet.
     let pts_dts_flags = match (has_pts, has_dts) {
         (true, true) => 0b11,
         (true, false) => 0b10,
@@ -542,6 +571,7 @@ pub fn build_pes_packet(
     };
     let header_flags = pts_dts_flags << 6;
 
+    pes.push(0x80); // '10' + PES_scrambling_control(00) + no flags set
     pes.push(header_flags);
     pes.push(optional_header_len);
 
@@ -555,12 +585,7 @@ pub fn build_pes_packet(
         pes.extend_from_slice(&encode_pts_dts(dts_value, 0x1));
     }
 
-    // One padding byte between the optional header and the payload. The local
-    // parser starts the payload at 6 + 3 + header_data_length, i.e. it expects
-    // a single filler byte right after the PTS/DTS fields.
-    pes.push(0x00);
-
-    // Add payload
+    // Add payload — at 9 + PES_header_data_length, the standard position.
     pes.extend_from_slice(payload);
 
     pes
@@ -690,13 +715,30 @@ mod tests {
     fn test_program_stream_map_format() {
         let psm = build_program_stream_map();
 
-        // Check start code
-        assert_eq!(&psm[0..4], &[0x00, 0x00, 0x01, 0xBB]);
+        // Check start code — 0xBC is the program_stream_map_start_code; the
+        // pre-#111 bytes used 0xBB (the system header's code) and no strict
+        // receiver recognized the section.
+        assert_eq!(&psm[0..4], &[0x00, 0x00, 0x01, 0xBC]);
+        // Two-byte version field per §2.5.3.5: current_next+reserved+version,
+        // then reserved+marker.
+        assert_eq!(&psm[6..8], &[0xE0, 0xFF]);
         // Check stream_type is H.264 (0x1B)
-        let stream_type_pos = 4 + 2 + 1 + 2 + 2; // start_code(4) + length(2) + version(1) + program_stream_info_length(2) + elementary_stream_map_length(2)
+        let stream_type_pos = 4 + 2 + 2 + 2 + 2; // start_code(4) + length(2) + version(2) + program_stream_info_length(2) + elementary_stream_map_length(2)
         assert_eq!(psm[stream_type_pos], 0x1B);
-        // 4 (start code) + 2 (length) + version(1) + psi_len(2) + esm_len(2) + entry(4) + truncated CRC(2)
-        assert_eq!(psm.len(), 17);
+        // 4 (start code) + 2 (length) + version(2) + psi_len(2) + esm_len(2) + entry(4) + CRC_32(4)
+        assert_eq!(psm.len(), 20);
+        // Declared length must cover exactly the body after the length field.
+        let declared = ((psm[4] as usize) << 8) | psm[5] as usize;
+        assert_eq!(declared, psm.len() - 6);
+        // The trailing CRC_32 is CRC-32/MPEG-2 over that body and validates.
+        let body = &psm[6..];
+        let crc = u32::from_be_bytes([
+            body[body.len() - 4],
+            body[body.len() - 3],
+            body[body.len() - 2],
+            body[body.len() - 1],
+        ]);
+        assert_eq!(crc, crc32_mpeg2(&body[..body.len() - 4]));
     }
 
     #[test]
@@ -776,8 +818,10 @@ mod tests {
                 offset: pos,
                 declared,
                 actual: ps.len() - pos - 6,
-                has_ts: ps[pos + 6] & 0xC0 != 0,
-                header_len: ps[pos + 7] as usize,
+                // Standard layout: byte 6 is the '10' flags byte, byte 7
+                // carries PTS_DTS_flags, byte 8 is header_data_length.
+                has_ts: ps[pos + 7] & 0xC0 != 0,
+                header_len: ps[pos + 8] as usize,
             };
             if declared == 0 {
                 panic!(
@@ -799,8 +843,9 @@ mod tests {
     }
 
     /// PES_packet_length must equal the bytes actually written after it — the
-    /// gap byte makes the timestamped layout balance (contract pin; the Go
-    /// twin's pre-fix off-by-one is the cautionary tale, mibee-eye-raspi #15).
+    /// standard 3-byte header makes the timestamped layout balance (contract
+    /// pin; the Go twin's pre-fix off-by-one is the cautionary tale,
+    /// mibee-eye-raspi #15).
     #[test]
     fn test_pes_packet_length_balanced() {
         let payload = [0x00u8, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84];
@@ -850,7 +895,7 @@ mod tests {
                     "continuation PES {i} must not carry timestamps"
                 );
             }
-            let start = pkt.offset + 9 + pkt.header_len; // prefix(6)+flags(1)+hdrlen(1)+gap(1)+optional
+            let start = pkt.offset + 9 + pkt.header_len; // prefix(6)+3 header bytes+optional fields
             let end = pkt.offset + 6 + pkt.declared;
             es.extend_from_slice(&ps_data[start..end]);
         }
@@ -867,9 +912,9 @@ mod tests {
         assert_eq!(es, want_es, "split ES content must match byte-for-byte");
     }
 
-    /// A continuation PES has no optional fields: flags 0x00, header_data_length
-    /// 0x00, then the gap byte — so a standard-layout receiver reads
-    /// PES_header_data_length 0 at byte 8 and locates the payload at 9.
+    /// A continuation PES has no optional fields: the '10' flags byte 0x80,
+    /// then PTS_DTS_flags 0x00 and header_data_length 0x00 — the payload sits
+    /// at byte 9, the standard position (issue #111 pinned the missing 0x80).
     #[test]
     fn test_mux_continuation_pes_shape() {
         let idr = nal(0x65, 70_000); // 70000-byte ES → 65000 + 5000
@@ -881,9 +926,9 @@ mod tests {
         let second = &pkts[1];
         // ES = 4-byte start code + 70000 = 70004; chunk 2 = 5004 payload bytes
         // → PES_packet_length = 3 + 0 + 5004 = 0x138F.
-        // 00 00 01 E0 | 13 8F | 00 00 00 | payload...
+        // 00 00 01 E0 | 13 8F | 80 00 00 | payload...
         let head = &ps_data[second.offset..second.offset + 9];
-        let want = [0x00, 0x00, 0x01, 0xE0, 0x13, 0x8F, 0x00, 0x00, 0x00];
+        let want = [0x00, 0x00, 0x01, 0xE0, 0x13, 0x8F, 0x80, 0x00, 0x00];
         assert_eq!(head, want, "continuation PES header shape");
         // ...and its payload continues the ES mid-NAL, exactly where chunk 1
         // ended: ES = start code(4) + idr, chunk 2 starts at ES byte 65000 →
@@ -899,9 +944,9 @@ mod tests {
     #[test]
     fn test_h265_psm_declares_stream_type_0x24() {
         let psm = build_program_stream_map_for(STREAM_TYPE_H265);
-        let stream_type_pos = 4 + 2 + 1 + 2 + 2;
+        let stream_type_pos = 4 + 2 + 2 + 2 + 2;
         assert_eq!(psm[stream_type_pos], 0x24);
-        assert_eq!(psm[3], 0xBB, "PSM start code unchanged");
+        assert_eq!(psm[3], 0xBC, "PSM start code unchanged");
 
         let h264 = build_program_stream_map();
         assert_eq!(h264[stream_type_pos], 0x1B, "H.264 PSM contract unchanged");
@@ -923,13 +968,13 @@ mod tests {
         // PSM present on keyframe with 0x24
         let psm_at = ps
             .windows(4)
-            .position(|w| w == [0x00, 0x00, 0x01, 0xBB])
+            .position(|w| w == [0x00, 0x00, 0x01, 0xBC])
             .expect("PSM on keyframe");
-        assert_eq!(ps[psm_at + 11], 0x24);
+        assert_eq!(ps[psm_at + 12], 0x24);
 
         // P-frame: no PSM
         let ps_p = mux_h265_to_ps(&[&idr], false, 180_000, 180_000);
-        assert!(!ps_p.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xBB]));
+        assert!(!ps_p.windows(4).any(|w| w == [0x00, 0x00, 0x01, 0xBC]));
 
         // PES lengths balanced (strict walk over both muxes)
         for data in [&ps, &ps_p] {
@@ -987,5 +1032,31 @@ mod tests {
                 "size {size}: strict walk must consume the full AU"
             );
         }
+    }
+
+    /// A STANDARD external PES — the shape every real camera and the Go
+    /// twin's psmux emit — must demux (issue #111): '10' flags byte 0x80 at
+    /// byte 6, PTS_DTS_flags at byte 7, header_data_length at byte 8. The
+    /// pre-fix reader took its header fields from bytes 6/7 (the legacy
+    /// muxer layout) and misparsed every standard stream.
+    #[test]
+    fn test_parse_pes_packet_standard_external_layout() {
+        // 00 00 01 E0 | len | 80 80 05 | PTS(5B, '0010' prefix) | payload
+        let payload = [0x00u8, 0x00, 0x00, 0x01, 0x65, 0x11];
+        let pts = encode_pts_dts(90_000, 0x2);
+        let mut pes = vec![0x00, 0x00, 0x01, 0xE0];
+        let declared: u16 = 3 + 5 + payload.len() as u16;
+        pes.extend_from_slice(&declared.to_be_bytes());
+        pes.push(0x80);
+        pes.push(0x80); // PTS_DTS_flags '10' (PTS only)
+        pes.push(0x05); // PES_header_data_length
+        pes.extend_from_slice(&pts);
+        pes.extend_from_slice(&payload);
+
+        let (packet, consumed) = parse_pes_packet(&pes).expect("standard PES must parse");
+        assert_eq!(consumed, pes.len());
+        assert_eq!(packet.pts, Some(90_000));
+        assert_eq!(packet.dts, None);
+        assert_eq!(packet.data, payload);
     }
 }

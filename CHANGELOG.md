@@ -11,6 +11,23 @@ released out of band.
 
 ## [Unreleased]
 
+### Fixed
+
+- **PS muxer wire conformance (#111, twin gb28181-go #167)**: `MuxH264ToPS` / the
+  PSM and PES builders now emit ISO/IEC 13818-1-conformant bytes — PSM start
+  code `00 00 01 BC` (was the system header's `BB`), the two-byte version
+  field (`E0 FF`) plus a real CRC-32/MPEG-2 (was a truncated two-byte
+  placeholder), and the standard 3-byte PES header (`0x80` flags byte +
+  PTS_DTS_flags + header_data_length; the legacy filler byte after the
+  optional fields is gone). Pre-fix output was rejected by strict receivers
+  (ffprobe `Invalid data found when processing input`, ZLMediaKit
+  judged-to-be-PS-but-no-frames) while lenient GB28181 platforms tolerated
+  it. The demux side reads the standard layout (real cameras always emitted
+  it); the NVR receive path is dual-layout tolerant, so deployed legacy
+  devices and the corrected bytes coexist. Wire-golden change — a breaking
+  change for consumers pinning the old bytes; verified end to end by
+  ffprobe-decoding a real libx264 stream muxed through the fixed muxer.
+
 ## [v0.14.1] — 2026-11-02
 
 ### Added
